@@ -1,7 +1,6 @@
 services:
   fnos-emby-bridge:
-# 把 OWNER/REPO 换成你的 GitHub 仓库路径
-    image: ghcr.io/OWNER/REPO:latest
+    image: ghcr.io/ssabv/fnos-emby-bridge:latest
     container_name: fnos-emby-bridge
     restart: unless-stopped
     ports:
