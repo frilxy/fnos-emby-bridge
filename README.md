@@ -1,16 +1,13 @@
-# 飞牛 Emby 桥接
+# 飞牛 Emby 桥接中间件
 
 > 本项目不再维护。欢迎自行 Fork、提交 PR，或基于它开新项目。
 
-License: GPL-3.0
-
-把飞牛影视伪装成 Emby 服务端，让 Emby 客户端直接连接飞牛影视媒体库。
+把飞牛影视伪装成 Emby 服务端，让 Emby 播放器直接连接飞牛影视媒体库。
 
 ## 镜像
 
 ```text
 ghcr.io/ssabv/fnos-emby-bridge:latest
-ghcr.io/ssabv/fnos-emby-bridge:v1.0.0
 ```
 
 ## Docker 部署
