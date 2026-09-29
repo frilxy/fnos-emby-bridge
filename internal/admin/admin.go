@@ -276,11 +276,12 @@ func (s *Store) uploadImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 配置指向本地路径（客户端 302 到桥接自身）
-	if err := s.SetLibraryImage(guid, "/admin/images/"+guid+ext); err != nil {
+	imageURL := s.AdminPath() + "/images/" + guid + ext
+	if err := s.SetLibraryImage(guid, imageURL); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, map[string]any{"ok": true, "url": "/admin/images/" + guid + ext})
+	writeJSON(w, map[string]any{"ok": true, "url": imageURL})
 }
 
 // Handler 返回 /admin 页面 + API。listLibs 由 main 注入（依赖 fn 客户端列库）。
