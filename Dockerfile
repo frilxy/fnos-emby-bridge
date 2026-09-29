@@ -17,6 +17,5 @@ RUN apk add --no-cache ca-certificates tzdata \
     && addgroup -S fnos && adduser -S fnos -G fnos
 WORKDIR /opt/fnos-emby-bridge
 COPY --from=build /out/fnos-emby-bridge /opt/fnos-emby-bridge/fnos-emby-bridge
-USER fnos
 EXPOSE 8096
 ENTRYPOINT ["/opt/fnos-emby-bridge/fnos-emby-bridge"]
