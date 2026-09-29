@@ -6,7 +6,6 @@
 
 ```text
 ghcr.io/ssabv/fnos-emby-bridge:latest
-ghcr.io/ssabv/fnos-emby-bridge:v1.0.0
 ```
 
 ## Docker 部署
