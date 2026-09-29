@@ -1,29 +1,15 @@
 # 飞牛 Emby 桥接
 
-一个面向 NAS / Docker 的飞牛影视 Emby 协议桥接工具。
-
-把飞牛影视伪装成 Emby 服务端，让 Emby 客户端可以直接连接、浏览和播放飞牛影视媒体库。
-
-## 项目特点
-
-- Emby 客户端直连飞牛影视
-- 支持多版本播放
-- 支持多音轨和字幕信息
-- 支持本地文件和云盘直链
-- 支持进度、收藏和已看状态
-- 支持后台账号密码登录
-- 支持自定义后台安全路径
-- 支持 Docker 一键部署
+把飞牛影视伪装成 Emby 服务端，让 Emby 客户端直接连接飞牛影视媒体库。
 
 ## 镜像
 
-GHCR：
-
 ```text
 ghcr.io/ssabv/fnos-emby-bridge:latest
+ghcr.io/ssabv/fnos-emby-bridge:v1.0.0
 ```
 
-## 部署
+## Docker 部署
 
 ### Docker Run
 
@@ -59,6 +45,8 @@ services:
       - ./data:/data
 ```
 
+启动：
+
 ```bash
 docker compose up -d
 ```
@@ -73,7 +61,9 @@ docker compose up -d
 | `CONFIG_PATH` | 配置文件路径 |
 | `/data` | 持久化配置目录 |
 
-## 后台使用
+飞牛地址、飞牛账号、飞牛密码、媒体库海报和后台安全路径，都在后台填写。
+
+## 后台
 
 访问：
 
@@ -88,19 +78,9 @@ admin
 admin123
 ```
 
-登录后可以填写：
-
-- 飞牛影视地址
-- 飞牛影视账号
-- 飞牛影视密码
-- 媒体库海报
-- 后台安全路径
-
-保存后立即生效。
-
 ## Emby 客户端连接
 
-在 Emby 客户端添加服务器：
+服务器地址：
 
 ```text
 http://你的NAS_IP:8096
@@ -112,7 +92,7 @@ http://你的NAS_IP:8096
 
 ### 后台路径改错怎么办？
 
-修改容器挂载目录里的 `bridge-config.json`，把 `admin_path` 改回：
+修改 `data/bridge-config.json`：
 
 ```json
 {
@@ -124,17 +104,4 @@ http://你的NAS_IP:8096
 
 ### 播放器连不上？
 
-如果播放器和服务不在同一台机器，不要使用 `127.0.0.1`。  
-建议使用 NAS 局域网 IP。
-
-### 支持转码吗？
-
-不支持。桥接使用直连播放，不提供 Emby 转码。
-
-## 版本
-
-使用指定版本镜像：
-
-```text
-ghcr.io/ssabv/fnos-emby-bridge:v1.0.0
-```
+不要使用 `127.0.0.1`，建议使用 NAS 局域网 IP。
