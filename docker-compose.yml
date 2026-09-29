@@ -1,0 +1,19 @@
+services:
+  fnos-emby-bridge:
+# 把 OWNER/REPO 换成你的 GitHub 仓库路径
+    image: ghcr.io/OWNER/REPO:latest
+    container_name: fnos-emby-bridge
+    restart: unless-stopped
+    ports:
+      # 桥接对 Emby 客户端暴露的端口（Emby 客户端连这里）
+      - "8096:8096"
+    environment:
+      # 连接和媒体库都可在后台填
+      PORT: "8096"
+      ADMIN_USER: "admin"
+      ADMIN_PASS: "admin123"
+      CONFIG_PATH: "/data/bridge-config.json"
+    volumes:
+      - ./data:/data
+    # 用 host 网络可省掉 HOST 配置（自动用本机 IP），但 Docker 网络隔离会更松
+    # network_mode: host
