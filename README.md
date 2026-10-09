@@ -101,6 +101,16 @@ GET .../Items?ParentId=<库>&IncludeItemTypes=Video         → 95 条
 | `/Library/VirtualFolders` | ✅ 实现 | ⚠️ 返回 QueryResult 对象（应为数组） |
 | `/Items/Counts` | ✅ 实现 | ⚠️ 返回 QueryResult 对象（应为 `ItemCounts` 对象） |
 | `/Users/{uid}/GroupingOptions` | ✅ 实现 | ⚠️ 返回对象（应为数组） |
+| `/Items/{id}/Images` | ✅ 实现 | ⚠️ 返回 QueryResult 对象（应为 `ImageInfo[]` 数组） |
+| `/Videos/{id}/AdditionalParts` | ✅ 实现 | ⚠️ 返回对象（应为数组） |
+| `/Localization/Options` 等 | — | ⚠️ 返回对象（应为数组） |
+
+**形状不符比 404 更隐蔽**：状态码是 `200`，客户端连报错都没有，只是把响应塞进
+"数组"类型去反序列化然后失败——表现就是**界面一直转圈**。
+
+> 定位手段：用一个落日志的反向代理把小幻影视的流量录下来。实测它请求
+> `/Items/{id}/Images` 拿到的却是 `{"Items":[],...}`（49 字节），而 Emby 该端点
+> 返回的是 `ImageInfo[]`。
 
 `/Items/Filters` 是 Emby 标准端点，**客户端打开媒体库时会调用它**，404 直接导致媒体库页打不开。
 
@@ -225,7 +235,7 @@ cd .. && fnpack build --directory ./fpk/fnos-emby-bridge
 
 ## 与上游的差异
 
-见 [`fixes.patch`](fixes.patch)：6 个文件、**+828 / −38 行**，`patch -p1` 可干净应用到上游 `main`。
+见 [`fixes.patch`](fixes.patch)：6 个文件、**+905 / −38 行**，`patch -p1` 可干净应用到上游 `main`。
 
 ---
 

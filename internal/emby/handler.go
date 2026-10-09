@@ -209,6 +209,27 @@ func (h *Handler) Routes() *http.ServeMux {
 	// Logo 等落兜底变 1x1 透明图 → "剧的 logo 没有"
 	mux.HandleFunc("GET /Items/{id}/Images/{imgType}", h.handleItemImage)
 	mux.HandleFunc("GET /Items/{id}/Images/{imgType}/{imgIndex}", h.handleItemImage)
+
+	// fork 新增：Emby 里返回**数组**的端点。
+	//
+	// 这些路径此前未注册 → 落到兜底 handler，返回 QueryResult 对象
+	// {"Items":[],"StartIndex":0,"TotalRecordCount":0}。客户端按数组反序列化会直接
+	// 失败 —— 实测小幻影视（Rodel Player）请求 /Items/{id}/Images 拿到对象后，
+	// 详情页一直加载。形状对不上的响应比 404 更隐蔽：状态码是 200，客户端也不报错。
+	mux.HandleFunc("GET /Items/{id}/Images", h.handleItemImages)
+	mux.HandleFunc("GET /Users/{uid}/Items/{id}/Images", h.handleItemImages)
+	mux.HandleFunc("GET /Videos/{id}/AdditionalParts", h.handleEmptyArray)
+	mux.HandleFunc("GET /Videos/{id}/LocalTrailers", h.handleEmptyArray)
+	mux.HandleFunc("GET /Items/{id}/LocalTrailers", h.handleEmptyArray)
+	mux.HandleFunc("GET /Users/{uid}/Items/{id}/LocalTrailers", h.handleEmptyArray)
+	mux.HandleFunc("GET /Items/{id}/Ancestors", h.handleEmptyArray)
+	mux.HandleFunc("GET /Users/{uid}/Items/{id}/Ancestors", h.handleEmptyArray)
+	mux.HandleFunc("GET /Items/{id}/CriticReviews", h.handleEmptyArray)
+	mux.HandleFunc("GET /Users/{uid}/Items/{id}/CriticReviews", h.handleEmptyArray)
+	// Localization 三个端点官方都是数组；Options 至少要给 "Auto"（跟随客户端语言）
+	mux.HandleFunc("GET /Localization/Options", h.handleLocalizationOptions)
+	mux.HandleFunc("GET /Localization/Countries", h.handleEmptyArray)
+	mux.HandleFunc("GET /Localization/ParentalRatings", h.handleEmptyArray)
 	// 播放前片头询问（返回空列表，避免客户端异常）
 	mux.HandleFunc("GET /Items/{id}/Intros", h.handleEmptyList)
 	// /Sessions 官方返回纯数组（不是 QueryResult）——Yamby Kotlin 反序列化遇到
@@ -337,6 +358,9 @@ var routeSegmentCase = map[string]string{
 	"userviews": "UserViews", "filters": "Filters", "plugins": "Plugins",
 	"groupingoptions": "GroupingOptions", "virtualfolders": "VirtualFolders",
 	"library": "Library", "counts": "Counts",
+	"localization": "Localization", "options": "Options",
+	"additionalparts": "AdditionalParts", "localtrailers": "LocalTrailers",
+	"ancestors": "Ancestors", "criticreviews": "CriticReviews",
 }
 
 // normalizePathCase 把路径中命中已知路由段的段重写为规范大小写，
@@ -2542,6 +2566,38 @@ func (h *Handler) handleProgress(w http.ResponseWriter, r *http.Request) {
 
 // handleItemImage 实现 GET /Items/{id}/Images/{type}[/{index}]：Emby 标准取图路径。
 // 客户端会请求任意 ImageType（Primary/Logo/Thumb/Backdrop/Banner/Art...）；
+// 飞牛只有海报资源：Primary 用竖版海报，其余类型优先取宽>高的横版海报（更接近
+// Logo/Backdrop 用途），都没有时回退同一张海报。0.9.8 真机契约：海报走
+// GET {base}/v/api/v1/sys/img{poster_path}?w=400，只需 Cookie（无需 authx）。
+// 任何失败都回 1x1 透明 PNG（200），避免客户端破图。
+// handleItemImages 实现 GET /Items/{id}/Images 与 /Users/{uid}/Items/{id}/Images。
+//
+// Emby 返回 ImageInfo[]（**数组**）。此前该路径未注册 → 落到兜底 handler 返回
+// QueryResult 对象，客户端按数组反序列化会失败——实测小幻影视（Rodel Player）
+// 请求它之后详情页一直加载。列表与详情里的 ImageTags 保持一致，
+// 避免出现「列表里有但取不到」或反之。
+func (h *Handler) handleItemImages(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	out := []map[string]any{}
+	if it, err := h.fnOf(r.Context()).ItemDetail(r.Context(), id); err == nil && it != nil {
+		tags := imageTags(*it)
+		for _, t := range []string{"Primary", "Logo", "Thumb", "Backdrop", "Banner", "Art"} {
+			if _, ok := tags[t]; ok {
+				out = append(out, map[string]any{"ImageType": t, "ImageIndex": 0})
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleLocalizationOptions 实现 GET /Localization/Options。
+// Emby 返回语言代码数组（"Auto" = 跟随客户端设置），不是 QueryResult。
+func (h *Handler) handleLocalizationOptions(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, []string{"Auto"})
+}
+
+// handleItemImage 实现 GET /Items/{id}/Images/{imgType}[/{imgIndex}]。
+//
 // 飞牛只有海报资源：Primary 用竖版海报，其余类型优先取宽>高的横版海报（更接近
 // Logo/Backdrop 用途），都没有时回退同一张海报。0.9.8 真机契约：海报走
 // GET {base}/v/api/v1/sys/img{poster_path}?w=400，只需 Cookie（无需 authx）。

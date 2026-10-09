@@ -361,6 +361,32 @@ func TestClientCompatEndpoints(t *testing.T) {
 	if _, ok := counts["Items"]; ok {
 		t.Fatalf("/Items/Counts 不应返回 QueryResult：%s", body)
 	}
+
+	// 6) Emby 里返回**数组**的端点：给 QueryResult 对象会让客户端按数组反序列化失败。
+	//    实测小幻影视请求 /Items/{id}/Images 拿到对象后，详情页一直加载。
+	for _, p := range []string{
+		"/Items/fv_001/Images",
+		"/Videos/fv_001/AdditionalParts",
+		"/Items/fv_001/LocalTrailers",
+		"/Items/fv_001/Ancestors",
+		"/Items/fv_001/CriticReviews",
+		"/Localization/Options",
+		"/Localization/Countries",
+		"/Localization/ParentalRatings",
+	} {
+		body = getJSON(t, bridge.URL+p+"?api_key=k")
+		if !strings.HasPrefix(strings.TrimSpace(string(body)), "[") {
+			t.Fatalf("%s 应返回纯数组（Emby 用数组，给对象客户端会解析失败）：%s", p, body)
+		}
+	}
+
+	// 7) /Items/{id}/Images 必须是真实的 ImageInfo 列表，不能只是空数组
+	body = getJSON(t, bridge.URL+"/Items/fv_001/Images")
+	var imgs []map[string]any
+	_ = json.Unmarshal(body, &imgs)
+	if len(imgs) == 0 || imgs[0]["ImageType"] == nil {
+		t.Fatalf("/Items/{id}/Images 应返回含 ImageType 的 ImageInfo[]：%s", body)
+	}
 }
 
 // 云盘直链路径：mock 返回夸克直链，桥接应直连 mock CDN（ChunkedProxy），透传字节。
