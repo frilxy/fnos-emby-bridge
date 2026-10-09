@@ -1,8 +1,9 @@
 name: Release
 
-# push 一个 v* tag 就自动发版，并把对应的 fpk 附到 Release 上。
-# 也可以在 Actions 页面手动触发（Run workflow），填一个已存在的 tag。
+# push 一个 v* tag 就自动：构建 fpk → 发布 Release 并附上产物。
+# 也可以在 Actions 页面手动触发（Run workflow），填一个已存在的 tag 补发。
 #
+# fpk 由本工作流现构建（./build.sh），仓库里不再存构建产物；
 # 用仓库内置的 github.token，不需要任何人提供 PAT。
 
 on:
@@ -12,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '要发布为 Release 的已有 tag（如 v1.0.8）'
+        description: '要发布为 Release 的已有 tag（如 v1.0.9）'
         required: true
         type: string
 
@@ -27,6 +28,28 @@ jobs:
         with:
           fetch-depth: 0
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 构建 fpk
+        run: ./build.sh
+
+      - name: 校验 tag 与 manifest 版本一致
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-$REF_NAME}"
+          VER="$(sed -n 's/^version[[:space:]]*=[[:space:]]*//p' fpk/fnos-emby-bridge/manifest | head -1)"
+          echo "tag=${TAG}  manifest version=${VER}"
+          if [ "v${VER}" != "${TAG}" ]; then
+            echo "::error::tag ${TAG} 与 manifest 里的版本 v${VER} 不一致——请先改 manifest 再打 tag"
+            exit 1
+          fi
+
       - name: 发布 Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -35,23 +58,12 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${INPUT_TAG:-$REF_NAME}"
-          echo "发布 tag: $TAG"
-
           VER="${TAG#v}"
-          ASSETS=()
-          for f in "dist/fnos-emby-bridge-${VER}.fpk" "dist/fnos-emby-bridge.fpk"; do
-            if [ -f "$f" ]; then
-              ASSETS+=("$f")
-            fi
+          ASSETS=("dist/fnos-emby-bridge-${VER}.fpk" "dist/fnos-emby-bridge.fpk")
+          for f in "${ASSETS[@]}"; do
+            [ -f "$f" ] || { echo "::error::缺少构建产物 $f"; exit 1; }
           done
 
-          if [ ${#ASSETS[@]} -eq 0 ]; then
-            echo "::error::dist/ 下没有找到可附加的 fpk"
-            exit 1
-          fi
-          echo "附加文件: ${ASSETS[*]}"
-
-          # 已存在同名 Release 时改为上传/覆盖附件
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "${ASSETS[@]}" --clobber
           else

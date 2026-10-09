@@ -1,7 +1,7 @@
 {
     ".url": {
         "fnos-emby-bridge.Application": {
-            "title": "Emby 桥接",
+            "title": "飞牛影视 Emby 桥接",
             "icon": "images/icon_{0}.png",
             "type": "url",
             "protocol": "http",

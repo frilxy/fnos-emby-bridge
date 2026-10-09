@@ -1,6 +1,125 @@
+diff -ruN a/.github/workflows/build.yml b/.github/workflows/build.yml
+--- a/.github/workflows/build.yml	1970-01-01 08:00:00.000000000 +0800
++++ b/.github/workflows/build.yml	2026-10-09 19:50:43.082534033 +0800
+@@ -0,0 +1,34 @@
++name: Build
++
++on:
++  push:
++    branches: [main]
++  pull_request:
++  workflow_dispatch:
++
++jobs:
++  build:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++
++      - uses: actions/setup-go@v5
++        with:
++          go-version-file: go.mod
++          cache: true
++
++      - name: 校验与测试
++        run: |
++          go vet ./...
++          go test ./...
++
++      - name: 构建 fpk
++        run: ./build.sh
++
++      - name: 上传 fpk 产物
++        uses: actions/upload-artifact@v4
++        with:
++          name: fnos-emby-bridge-fpk
++          path: dist/*.fpk
++          if-no-files-found: error
++          retention-days: 30
+diff -ruN a/.github/workflows/release.yml b/.github/workflows/release.yml
+--- a/.github/workflows/release.yml	1970-01-01 08:00:00.000000000 +0800
++++ b/.github/workflows/release.yml	2026-10-09 19:50:43.082442424 +0800
+@@ -0,0 +1,77 @@
++name: Release
++
++# push 一个 v* tag 就自动：构建 fpk → 发布 Release 并附上产物。
++# 也可以在 Actions 页面手动触发（Run workflow），填一个已存在的 tag 补发。
++#
++# fpk 由本工作流现构建（./build.sh），仓库里不再存构建产物；
++# 用仓库内置的 github.token，不需要任何人提供 PAT。
++
++on:
++  push:
++    tags:
++      - 'v*'
++  workflow_dispatch:
++    inputs:
++      tag:
++        description: '要发布为 Release 的已有 tag（如 v1.0.9）'
++        required: true
++        type: string
++
++permissions:
++  contents: write
++
++jobs:
++  release:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++        with:
++          fetch-depth: 0
++
++      - uses: actions/setup-go@v5
++        with:
++          go-version-file: go.mod
++          cache: true
++
++      - name: 构建 fpk
++        run: ./build.sh
++
++      - name: 校验 tag 与 manifest 版本一致
++        env:
++          INPUT_TAG: ${{ inputs.tag }}
++          REF_NAME: ${{ github.ref_name }}
++        run: |
++          set -euo pipefail
++          TAG="${INPUT_TAG:-$REF_NAME}"
++          VER="$(sed -n 's/^version[[:space:]]*=[[:space:]]*//p' fpk/fnos-emby-bridge/manifest | head -1)"
++          echo "tag=${TAG}  manifest version=${VER}"
++          if [ "v${VER}" != "${TAG}" ]; then
++            echo "::error::tag ${TAG} 与 manifest 里的版本 v${VER} 不一致——请先改 manifest 再打 tag"
++            exit 1
++          fi
++
++      - name: 发布 Release
++        env:
++          GH_TOKEN: ${{ github.token }}
++          INPUT_TAG: ${{ inputs.tag }}
++          REF_NAME: ${{ github.ref_name }}
++        run: |
++          set -euo pipefail
++          TAG="${INPUT_TAG:-$REF_NAME}"
++          VER="${TAG#v}"
++          ASSETS=("dist/fnos-emby-bridge-${VER}.fpk" "dist/fnos-emby-bridge.fpk")
++          for f in "${ASSETS[@]}"; do
++            [ -f "$f" ] || { echo "::error::缺少构建产物 $f"; exit 1; }
++          done
++
++          if gh release view "$TAG" >/dev/null 2>&1; then
++            gh release upload "$TAG" "${ASSETS[@]}" --clobber
++          else
++            gh release create "$TAG" \
++              --title "$TAG" \
++              --generate-notes \
++              "${ASSETS[@]}"
++          fi
++
++          gh release view "$TAG" --json url,assets \
++            --jq '"Release: \(.url)\n附件: \([.assets[].name] | join(", "))"'
 diff -ruN a/cmd/fnos-emby-bridge/main.go b/cmd/fnos-emby-bridge/main.go
---- a/cmd/fnos-emby-bridge/main.go	2026-10-09 19:10:57.500220530 +0800
-+++ b/cmd/fnos-emby-bridge/main.go	2026-10-09 19:10:57.508221179 +0800
+--- a/cmd/fnos-emby-bridge/main.go	2026-10-09 19:50:43.069386923 +0800
++++ b/cmd/fnos-emby-bridge/main.go	2026-10-09 19:50:43.075057850 +0800
 @@ -95,7 +95,7 @@
  		if err := client.Login(ctx, user, fn.SHA256Hex(pass)); err != nil {
  			log.Printf("飞牛登录失败：%v（可在后台修改连接）", err)
@@ -47,9 +166,78 @@ diff -ruN a/cmd/fnos-emby-bridge/main.go b/cmd/fnos-emby-bridge/main.go
  // withCORS 给所有响应加 CORS 头，方便浏览器/网页版 Emby 客户端跨域访问。
  func withCORS(next http.Handler) http.Handler {
  	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+diff -ruN a/internal/admin/admin.go b/internal/admin/admin.go
+--- a/internal/admin/admin.go	2026-10-09 19:50:43.070284771 +0800
++++ b/internal/admin/admin.go	2026-10-09 19:50:43.075599906 +0800
+@@ -390,7 +390,7 @@
+ func (s *Store) page(w http.ResponseWriter, r *http.Request) {
+ 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+ 	w.Header().Set("Cache-Control", "no-store")
+-	_, _ = w.Write([]byte(adminHTML))
++	_, _ = w.Write([]byte(AdminHTML()))
+ }
+ 
+ func (s *Store) login(w http.ResponseWriter, r *http.Request) {
+diff -ruN a/internal/admin/admin_html.go b/internal/admin/admin_html.go
+--- a/internal/admin/admin_html.go	2026-10-09 19:50:43.070493251 +0800
++++ b/internal/admin/admin_html.go	2026-10-09 19:50:43.075746235 +0800
+@@ -1,22 +1,33 @@
+ package admin
+ 
++import "strings"
++
++// iconDataURI 是后台界面用的品牌图标，由 fpk/图标.jpg 派生（见 fpk/make-icons.sh）。
++// 内嵌成 data URI 而不是走静态路由：后台在内网/离线环境也要能正常显示图标。
++const iconDataURI = "data:image/png;base64,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"
++
+ const adminHTML = `<!doctype html>
+ <html lang="zh-CN">
+ <head>
+ <meta charset="utf-8">
+ <meta name="viewport" content="width=device-width,initial-scale=1">
+-<title>飞牛 Emby 桥接后台</title>
++<link rel="icon" type="image/png" href="__ICON__">
++<title>飞牛影视 Emby 桥接 · 后台</title>
+ <style>
+ :root{--glass-bg:rgba(255,255,255,.7);--glass-border:rgba(255,255,255,.8);--glass-shadow:0 8px 32px rgba(31,38,135,.08);--bg-primary:#f5f5f7;--bg-secondary:#fff;--text-primary:#1d1d1f;--text-secondary:#6e6e73;--text-tertiary:#8e8e93;--accent-blue:#0071e3;--accent-green:#34c759;--accent-red:#ff3b30;--input-bg:rgba(255,255,255,.9);--input-border:rgba(0,0,0,.08);--hover-bg:rgba(0,0,0,.03);--log-bg:rgba(245,245,247,.9);--orb-1:rgba(0,113,227,.12);--orb-2:rgba(175,82,222,.1);--orb-3:rgba(52,199,89,.08)}
+ [data-theme=dark]{--glass-bg:rgba(40,40,42,.7);--glass-border:rgba(255,255,255,.1);--glass-shadow:0 8px 32px rgba(0,0,0,.3);--bg-primary:#000;--bg-secondary:#1c1c1e;--text-primary:#f5f5f7;--text-secondary:#aeaeb2;--text-tertiary:#8e8e93;--accent-blue:#0a84ff;--accent-green:#30d158;--accent-red:#ff453a;--input-bg:rgba(58,58,60,.8);--input-border:rgba(255,255,255,.12);--hover-bg:rgba(255,255,255,.05);--log-bg:rgba(58,58,60,.8);--orb-1:rgba(10,132,255,.18);--orb-2:rgba(191,90,242,.15);--orb-3:rgba(48,209,88,.12)}
+ *{margin:0;padding:0;box-sizing:border-box}body{background:var(--bg-primary);color:var(--text-primary);min-height:100vh;overflow-x:hidden;position:relative;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Helvetica Neue","Microsoft YaHei",sans-serif;transition:background .5s,color .5s;-webkit-font-smoothing:antialiased}.bg-orbs{position:fixed;inset:0;pointer-events:none;z-index:0;overflow:hidden}.orb{position:absolute;border-radius:50%;filter:blur(100px);animation:float 25s ease-in-out infinite}.orb-1{width:500px;height:500px;background:var(--orb-1);top:-200px;right:-100px}.orb-2{width:400px;height:400px;background:var(--orb-2);bottom:-150px;left:-100px;animation-delay:-8s}.orb-3{width:350px;height:350px;background:var(--orb-3);top:50%;left:40%;animation-delay:-16s}@keyframes float{0%,100%{transform:translate(0,0) scale(1)}33%{transform:translate(40px,-20px) scale(1.05)}66%{transform:translate(-20px,30px) scale(.95)}}.wrap{max-width:1100px;margin:0 auto;padding:28px 24px 40px;position:relative;z-index:1}.top-nav,.panel{background:var(--glass-bg);border:1px solid var(--glass-border);border-radius:20px;box-shadow:var(--glass-shadow);backdrop-filter:blur(40px) saturate(180%);-webkit-backdrop-filter:blur(40px) saturate(180%)}.top-nav{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;padding:14px 20px}.brand{display:flex;align-items:center;gap:12px}.brand-icon{width:40px;height:40px;background:linear-gradient(135deg,var(--accent-blue),#af52de);border-radius:12px;color:#fff;display:flex;align-items:center;justify-content:center}.brand-icon svg{width:22px;height:22px}.brand-text h1{font-size:19px;font-weight:600;letter-spacing:-.02em}.brand-text .subtitle{font-size:11px;color:var(--text-tertiary);margin-top:1px}.nav-actions{display:flex;align-items:center;gap:10px}.status{padding:5px 12px;font-size:12px;border-radius:999px;background:rgba(120,120,128,.12);color:var(--text-secondary)}.status.ok{background:rgba(52,199,89,.14);color:var(--accent-green)}.status.bad{background:rgba(255,59,48,.14);color:var(--accent-red)}.theme-toggle{width:40px;height:40px;border-radius:12px;border:1px solid var(--input-border);background:var(--input-bg);color:var(--text-primary);cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .3s cubic-bezier(.4,0,.2,1)}.theme-toggle:hover{transform:translateY(-1px)}.theme-toggle svg{width:18px;height:18px;transition:transform .5s cubic-bezier(.4,0,.2,1)}.theme-toggle:hover svg{transform:rotate(180deg)}.panel{padding:20px;margin-bottom:20px}.panel-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}.panel-title{font-size:16px;font-weight:600;letter-spacing:-.01em}.panel-desc{font-size:12px;color:var(--text-tertiary);margin-top:2px}.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.field label{display:block;font-size:12px;font-weight:500;color:var(--text-secondary);margin-bottom:6px}.field input{width:100%;height:40px;padding:0 14px;border-radius:12px;font-size:13px;border:1px solid var(--input-border);background:var(--input-bg);color:var(--text-primary);outline:none;transition:all .25s}.field input:focus{border-color:var(--accent-blue);box-shadow:0 0 0 3px rgba(0,113,227,.14)}.field input::placeholder{color:var(--text-tertiary)}.form-actions{margin-top:14px;display:flex;justify-content:flex-end}.btn{height:40px;padding:0 16px;border:1px solid var(--input-border);border-radius:12px;background:var(--input-bg);color:var(--text-primary);font-size:13px;font-weight:500;cursor:pointer;transition:all .3s cubic-bezier(.4,0,.2,1)}.btn:hover{transform:translateY(-1px);background:var(--hover-bg)}.btn.primary{background:var(--accent-blue);border-color:transparent;color:#fff}.btn.danger{color:var(--accent-red)}.library{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}.library-card{display:flex;align-items:center;gap:14px;padding:14px;border-radius:18px;border:1px solid var(--input-border);background:var(--bg-secondary);transition:all .3s}.library-card:hover{transform:translateY(-2px);box-shadow:0 10px 24px rgba(0,0,0,.08)}.poster{width:74px;height:74px;border-radius:14px;object-fit:cover;flex:none;background:var(--log-bg)}.lib-info{flex:1;min-width:0}.lib-name{font-size:14px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.lib-meta{font-size:12px;color:var(--text-tertiary);margin:3px 0 10px}.lib-actions{display:flex;gap:8px}.lib-actions input{flex:1;min-width:0;height:34px;padding:0 12px;font-size:12px;border:1px solid var(--input-border);border-radius:10px;background:var(--input-bg);color:var(--text-primary);outline:none}.lib-actions .btn{height:34px;padding:0 10px;font-size:12px;border-radius:10px}.empty{padding:48px;text-align:center;color:var(--text-tertiary);font-size:14px}.auth-card{max-width:390px;margin:14vh auto 0;padding:32px}.auth-brand{display:flex;flex-direction:column;align-items:center;text-align:center;margin-bottom:24px}.auth-brand .brand-icon{width:54px;height:54px;border-radius:18px}.auth-brand h1{font-size:22px;margin-top:14px}.auth-brand p{font-size:13px;color:var(--text-secondary);margin-top:5px}.auth-form .field{margin-bottom:14px}.auth-form .form-actions{justify-content:stretch}.auth-form .btn{width:100%;height:44px}.auth-error{min-height:20px;margin-bottom:12px;font-size:13px;color:var(--accent-red);text-align:center}.hidden{display:none!important}.toast{position:fixed;left:50%;bottom:36px;transform:translateX(-50%) translateY(20px);background:var(--log-bg);border:1px solid var(--input-border);color:var(--text-primary);backdrop-filter:blur(20px);font-size:13px;padding:10px 22px;border-radius:999px;opacity:0;pointer-events:none;transition:all .25s;z-index:100}.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}@media(max-width:720px){.wrap{padding:20px 14px 36px}.form-grid{grid-template-columns:1fr}.library{grid-template-columns:1fr}.top-nav{padding:14px}.brand-text .subtitle{display:none}}
++
++/* fork：品牌图标统一由 fpk/图标.jpg 派生（见 fpk/make-icons.sh），不再用内联 SVG */
++.brand-icon{background:none;overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,.16)}
++.brand-icon img{width:100%;height:100%;display:block;object-fit:cover}
+ </style>
+ </head>
+ <body>
+ <div class="bg-orbs"><div class="orb orb-1"></div><div class="orb orb-2"></div><div class="orb orb-3"></div></div>
+ <div id="loginView" class="wrap hidden">
+ <div class="panel auth-card">
+-<div class="auth-brand"><div class="brand-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7h16v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/><path d="M8 7V5a4 4 0 0 1 8 0v2"/></svg></div><h1>管理后台登录</h1><p>访问桥接配置与媒体库设置</p></div>
++<div class="auth-brand"><div class="brand-icon"><img src="__ICON__" alt="飞牛影视 Emby 桥接"></div><h1>飞牛影视 Emby 桥接</h1><p>访问桥接配置与媒体库设置</p></div>
+ <form class="auth-form" id="loginForm">
+ <div class="field"><label>账号</label><input id="authUser" autocomplete="username" placeholder="admin"></div>
+ <div class="field"><label>密码</label><input id="authPass" type="password" autocomplete="current-password" placeholder="请输入密码"></div>
+@@ -27,7 +38,7 @@
+ </div>
+ <div id="adminView" class="wrap hidden">
+ <div class="top-nav">
+-<div class="brand"><div class="brand-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 16V7a3 3 0 0 1 3-3h8a3 3 0 0 1 3 3v9"/><path d="M3 16h18v2a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3z"/></svg></div><div class="brand-text"><h1>飞牛 Emby 桥接后台</h1><div class="subtitle">连接配置 · 媒体库美化 · 保存即时生效</div></div></div>
++<div class="brand"><div class="brand-icon"><img src="__ICON__" alt="飞牛影视 Emby 桥接"></div><div class="brand-text"><h1>飞牛影视 Emby 桥接</h1><div class="subtitle">连接配置 · 媒体库美化 · 保存即时生效</div></div></div>
+ <div class="nav-actions"><span id="connState" class="status"></span><button class="theme-toggle" id="themeToggle" title="切换主题"><svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg></button></div>
+ </div>
+ <div class="panel">
+@@ -55,3 +66,8 @@
+ </script>
+ </body>
+ </html>`
++
++// AdminHTML 返回把 __ICON__ 占位符换成内嵌图标的完整后台页面。
++func AdminHTML() string {
++	return strings.ReplaceAll(adminHTML, "__ICON__", iconDataURI)
++}
 diff -ruN a/internal/emby/bridge_test.go b/internal/emby/bridge_test.go
---- a/internal/emby/bridge_test.go	2026-10-09 19:10:57.504220854 +0800
-+++ b/internal/emby/bridge_test.go	2026-10-09 19:10:57.508221179 +0800
+--- a/internal/emby/bridge_test.go	2026-10-09 19:50:43.070654365 +0800
++++ b/internal/emby/bridge_test.go	2026-10-09 19:50:43.076390966 +0800
 @@ -6,10 +6,12 @@
  	"io"
  	"net/http"
@@ -496,7 +684,7 @@ diff -ruN a/internal/emby/bridge_test.go b/internal/emby/bridge_test.go
  	// CDN 与飞牛同域：先建 mock 飞牛服务，再用其 URL 作为 cdnBase。
 diff -ruN a/internal/emby/fork_util_test.go b/internal/emby/fork_util_test.go
 --- a/internal/emby/fork_util_test.go	1970-01-01 08:00:00.000000000 +0800
-+++ b/internal/emby/fork_util_test.go	2026-10-09 19:10:57.508221179 +0800
++++ b/internal/emby/fork_util_test.go	2026-10-09 19:50:43.076065004 +0800
 @@ -0,0 +1,116 @@
 +package emby
 +
@@ -615,8 +803,8 @@ diff -ruN a/internal/emby/fork_util_test.go b/internal/emby/fork_util_test.go
 +	}
 +}
 diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
---- a/internal/emby/handler.go	2026-10-09 19:10:57.504220854 +0800
-+++ b/internal/emby/handler.go	2026-10-09 19:10:57.508221179 +0800
+--- a/internal/emby/handler.go	2026-10-09 19:50:43.071147747 +0800
++++ b/internal/emby/handler.go	2026-10-09 19:50:43.076584853 +0800
 @@ -45,6 +45,13 @@
  	FN *fn.Client
  	// ServerName 在 /System/Info 里返回给客户端。
@@ -1550,8 +1738,8 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  }
  
 diff -ruN a/internal/emby/util.go b/internal/emby/util.go
---- a/internal/emby/util.go	2026-10-09 19:10:57.504220854 +0800
-+++ b/internal/emby/util.go	2026-10-09 19:10:57.508221179 +0800
+--- a/internal/emby/util.go	2026-10-09 19:50:43.071407236 +0800
++++ b/internal/emby/util.go	2026-10-09 19:50:43.075932775 +0800
 @@ -6,6 +6,7 @@
  	"io"
  	"math/rand"
@@ -1662,8 +1850,8 @@ diff -ruN a/internal/emby/util.go b/internal/emby/util.go
 +	return title + " · " + tag
 +}
 diff -ruN a/internal/mock/fnos.go b/internal/mock/fnos.go
---- a/internal/mock/fnos.go	2026-10-09 19:10:57.504220854 +0800
-+++ b/internal/mock/fnos.go	2026-10-09 19:10:57.508221179 +0800
+--- a/internal/mock/fnos.go	2026-10-09 19:50:43.071966413 +0800
++++ b/internal/mock/fnos.go	2026-10-09 19:50:43.077277252 +0800
 @@ -47,10 +47,18 @@
  			"duration": 2700, "runtime": 45, "can_play": 1, "is_watched": 0,
  			"season_number": 1, "episode_number": 1, "air_date": "2024-02-01", "overview": "一集剧",

@@ -1,11 +1,12 @@
-# 构建缓存 / 工具链（不入库）
+# 构建产物（由 ./build.sh 或 GitHub Actions 生成，不入库）
+dist/
+fpk/*.fpk
+fpk/fnos-emby-bridge/app/server/fnos-emby-bridge
+
+# 本地工具链 / 构建缓存（若放在仓库内）
 gocache/
 gopath/
 toolchain/
-
-# 打包中间产物（build.sh 会生成；dist/ 里保留最终产物）
-fpk/*.fpk
-fpk/fnos-emby-bridge/app/server/fnos-emby-bridge
 
 # 运行时产物
 *.pid
