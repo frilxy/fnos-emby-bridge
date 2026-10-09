@@ -85,23 +85,57 @@ GET .../Items?ParentId=<库>&IncludeItemTypes=Video         → 95 条
 
 日志：`[items] IncludeItemTypes="Movie,Series" 过滤后为空，库 lib_other 回退为不过滤（1 条）`
 
-### 3. HEAD 取流请求挂死
+### 3. 小幻影视等客户端打不开媒体库 / 影视详情
+
+**现象**：Yamby 一切正常，但小幻影视（Rodel Player）连上后打不开媒体库或详情页。
+
+**排查方法**：拿飞牛**原生 Jellyfin 面（`http://<NAS_IP>:8005`）**做参照——飞牛自己实现
+了哪些端点给第三方客户端用，就说明真实客户端确实会调用。逐个对照后找出的缺口：
+
+| 端点 | 飞牛原生 8005 | 桥接（修复前） |
+|---|---|---|
+| `/UserViews` | ✅ 实现 | ⚠️ 落兜底 → **返回空列表**（客户端看不到任何媒体库） |
+| `/Items/Filters` | ✅ 实现 | ❌ **404** —— 被 `/Items/{id}` 通配吃掉，拿 `"Filters"` 当影片 ID 去查飞牛 |
+| `/Users/{uid}/Items/Filters` | ✅ 实现 | ❌ **404**（同上） |
+| `/Plugins` | ✅ 实现 | ⚠️ 返回 QueryResult 对象（应为数组） |
+| `/Library/VirtualFolders` | ✅ 实现 | ⚠️ 返回 QueryResult 对象（应为数组） |
+| `/Items/Counts` | ✅ 实现 | ⚠️ 返回 QueryResult 对象（应为 `ItemCounts` 对象） |
+| `/Users/{uid}/GroupingOptions` | ✅ 实现 | ⚠️ 返回对象（应为数组） |
+
+`/Items/Filters` 是 Emby 标准端点，**客户端打开媒体库时会调用它**，404 直接导致媒体库页打不开。
+
+另外 `/System/Info/Public` 也缺字段、`Id` 格式不合法：
+
+| | 修复前 | 真 Jellyfin / Emby |
+|---|---|---|
+| `Id` | `"fnos-emby-bridge"` | `"9da9a321945b4e60a7488ea2be37cb9f"`（32 位 hex GUID 形态） |
+| `LocalAddress` | 缺 | ✅ |
+| `OperatingSystem` | 缺 | ✅ |
+| `StartupWizardCompleted` | 缺 | ✅ |
+
+（另：`CanEnableAutoSignIn` 属于需鉴权的 `SystemInfo`，不属于 `Public`，已移出。）
+
+**修复**：补齐上述端点（并给它们加上小写路径的大小写归一，客户端常发 `/userviews`），
+`ServerId` 改为由**飞牛地址 + 服务器名**派生的稳定 32 位 hex——同一套部署重启不变、
+不同部署不撞车（不能随机，否则客户端每次重启都会丢失服务器关联）。
+
+### 4. HEAD 取流请求挂死
 
 Go 的 `GET` 路由会一并匹配 `HEAD`，HEAD 不带 `Range` 时走完整 GET，把**整个文件**（实测 6.7GB）当响应体往外推，而 HEAD 不发送响应体 → 请求永不返回，部分播放器探测失败后判定「无法播放」。
 
 **修复**：HEAD 改为向飞牛只请求 `Range: bytes=0-0` 拿头部与总长度，不传字节。
 
-### 4. 后台连接页 panic
+### 5. 后台连接页 panic
 
 `main.go` 里 `client.Token[:8]` 在飞牛未登录（token 为空）时切片越界 panic。触发路径是 `GET /admin/api/connection`——**恰好是刚部署、还没配好连接时最需要打开的那一页**，结果是面板打不开、地址填不进去，形成死循环。
 
 **修复**：新增 `shortToken()`，三处 `[:8]` 全部加固。
 
-### 5. 改进：取流 `Content-Type`
+### 6. 改进：取流 `Content-Type`
 
 上游 `/v/api/v1/media/range` 一律返回 `application/octet-stream`。现按扩展名给真实 MIME（`video/mp4`、`video/x-matroska` 等），仅在通用类型时覆盖。
 
-### 6. 改进：音轨兼容性提示
+### 7. 改进：音轨兼容性提示
 
 `DTS / TrueHD / FLAC / ALAC / PCM` 音轨的 `DisplayTitle` 追加 `· 需软解`，便于挑选。
 用 `AUDIO_TRACK_HINT=0` 关闭。**刻意不做自动切轨**——备选轨常是导演评论轨，自动切换会让人听到错误音轨。
@@ -191,7 +225,7 @@ cd .. && fnpack build --directory ./fpk/fnos-emby-bridge
 
 ## 与上游的差异
 
-见 [`fixes.patch`](fixes.patch)：6 个文件、**+586 / −15 行**，`patch -p1` 可干净应用到上游 `main`。
+见 [`fixes.patch`](fixes.patch)：6 个文件、**+828 / −38 行**，`patch -p1` 可干净应用到上游 `main`。
 
 ---
 

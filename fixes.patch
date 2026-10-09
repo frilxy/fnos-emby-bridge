@@ -1,6 +1,6 @@
 diff -ruN a/cmd/fnos-emby-bridge/main.go b/cmd/fnos-emby-bridge/main.go
---- a/cmd/fnos-emby-bridge/main.go	2026-10-09 17:39:02.555487935 +0800
-+++ b/cmd/fnos-emby-bridge/main.go	2026-10-09 17:39:02.563488588 +0800
+--- a/cmd/fnos-emby-bridge/main.go	2026-10-09 18:21:41.188472656 +0800
++++ b/cmd/fnos-emby-bridge/main.go	2026-10-09 18:21:41.196473328 +0800
 @@ -95,7 +95,7 @@
  		if err := client.Login(ctx, user, fn.SHA256Hex(pass)); err != nil {
  			log.Printf("飞牛登录失败：%v（可在后台修改连接）", err)
@@ -48,8 +48,8 @@ diff -ruN a/cmd/fnos-emby-bridge/main.go b/cmd/fnos-emby-bridge/main.go
  func withCORS(next http.Handler) http.Handler {
  	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 diff -ruN a/internal/emby/bridge_test.go b/internal/emby/bridge_test.go
---- a/internal/emby/bridge_test.go	2026-10-09 17:39:02.559488262 +0800
-+++ b/internal/emby/bridge_test.go	2026-10-09 17:39:02.567488915 +0800
+--- a/internal/emby/bridge_test.go	2026-10-09 18:21:41.188472656 +0800
++++ b/internal/emby/bridge_test.go	2026-10-09 18:21:41.196473328 +0800
 @@ -6,10 +6,12 @@
  	"io"
  	"net/http"
@@ -127,7 +127,7 @@ diff -ruN a/internal/emby/bridge_test.go b/internal/emby/bridge_test.go
  	// 9. 验证 /Items/{id}/Progress 回传
  	resp3, _ := http.Post(bridge.URL+"/Items/fv_001/Progress?api_key=k", "application/json",
  		strings.NewReader(`{"PositionTicks":1200000000}`)) // 120s
-@@ -115,6 +165,126 @@
+@@ -115,6 +165,204 @@
  	t.Logf("all emby endpoints ok against mock fnos")
  }
  
@@ -251,12 +251,90 @@ diff -ruN a/internal/emby/bridge_test.go b/internal/emby/bridge_test.go
 +	}
 +}
 +
++// 回归（fork 修复）：客户端「打开媒体库 / 影视详情」必经、而此前缺失或形状不符的端点。
++//
++// 参照物是飞牛原生 Jellyfin 面（8005）—— 飞牛自己实现了这些端点给第三方客户端用，
++// 说明真实客户端（含小幻影视）确实会调用；桥接此前要么落到空兜底、要么被通配路由
++// 吃掉返回 404，导致媒体库/详情打不开。
++func TestClientCompatEndpoints(t *testing.T) {
++	fnSrv := httptest.NewServer(mock.NewHandler(false, "", mock.WithOtherLibrary()))
++	defer fnSrv.Close()
++
++	client := fn.NewClient(fnSrv.URL)
++	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
++	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
++	bridge := httptest.NewServer(h.Handler())
++	defer bridge.Close()
++
++	// 1) /System/Info/Public：Id 必须是 32 位 hex（Emby/Jellyfin 的 ServerId 形态），
++	//    且补齐 LocalAddress / OperatingSystem / StartupWizardCompleted
++	body := getJSON(t, bridge.URL+"/System/Info/Public")
++	var pub map[string]any
++	_ = json.Unmarshal(body, &pub)
++	id, _ := pub["Id"].(string)
++	if len(id) != 32 || strings.Trim(id, "0123456789abcdef") != "" {
++		t.Fatalf("/System/Info/Public Id=%q，应为 32 位 hex（非法 ServerId 会让部分客户端登记失败）", id)
++	}
++	for _, k := range []string{"LocalAddress", "OperatingSystem", "StartupWizardCompleted", "ServerName", "Version", "ProductName"} {
++		if _, ok := pub[k]; !ok {
++			t.Fatalf("/System/Info/Public 缺字段 %s：%s", k, body)
++		}
++	}
++
++	// 2) /UserViews 必须返回真实媒体库（此前落到兜底 → 空列表 → 客户端看不到库）
++	body = getJSON(t, bridge.URL+"/UserViews?api_key=k")
++	var qr struct {
++		Items []map[string]any `json:"Items"`
++	}
++	_ = json.Unmarshal(body, &qr)
++	if len(qr.Items) == 0 {
++		t.Fatalf("/UserViews 返回空媒体库列表（客户端看不到任何库）：%s", body)
++	}
++
++	// 3) /Items/Filters 与 /Users/{uid}/Items/Filters 必须存在且是 QueryFilters 对象
++	//    （此前被 /Items/{id} 通配吃掉，拿 "Filters" 当影片 ID 查飞牛 → 404）
++	for _, p := range []string{"/Items/Filters", "/Users/u/Items/Filters", "/items/filters"} {
++		body = getJSON(t, bridge.URL+p+"?api_key=k")
++		var f map[string]any
++		if err := json.Unmarshal(body, &f); err != nil {
++			t.Fatalf("%s 不是 JSON 对象：%s", p, body)
++		}
++		if _, bad := f["Error"]; bad {
++			t.Fatalf("%s 返回错误（客户端打开媒体库会失败）：%s", p, body)
++		}
++		for _, k := range []string{"Genres", "Tags", "OfficialRatings", "Years"} {
++			if _, ok := f[k]; !ok {
++				t.Fatalf("%s 缺字段 %s（应为 Emby QueryFilters）：%s", p, k, body)
++			}
++		}
++	}
++
++	// 4) 这几条 Emby 返回纯数组，给 QueryResult 对象会让客户端解析崩
++	for _, p := range []string{"/Plugins", "/Library/VirtualFolders", "/Users/u/GroupingOptions"} {
++		body = getJSON(t, bridge.URL+p+"?api_key=k")
++		if !strings.HasPrefix(strings.TrimSpace(string(body)), "[") {
++			t.Fatalf("%s 应返回纯数组：%s", p, body)
++		}
++	}
++
++	// 5) /Items/Counts 是 Emby 的 ItemCounts 对象，不是 QueryResult
++	body = getJSON(t, bridge.URL+"/Items/Counts?api_key=k")
++	var counts map[string]any
++	_ = json.Unmarshal(body, &counts)
++	if _, ok := counts["ItemCount"]; !ok {
++		t.Fatalf("/Items/Counts 缺 ItemCount（应返回 Emby ItemCounts 对象）：%s", body)
++	}
++	if _, ok := counts["Items"]; ok {
++		t.Fatalf("/Items/Counts 不应返回 QueryResult：%s", body)
++	}
++}
++
  // 云盘直链路径：mock 返回夸克直链，桥接应直连 mock CDN（ChunkedProxy），透传字节。
  func TestBridgeCloudDirectLink(t *testing.T) {
  	// CDN 与飞牛同域：先建 mock 飞牛服务，再用其 URL 作为 cdnBase。
 diff -ruN a/internal/emby/fork_util_test.go b/internal/emby/fork_util_test.go
 --- a/internal/emby/fork_util_test.go	1970-01-01 08:00:00.000000000 +0800
-+++ b/internal/emby/fork_util_test.go	2026-10-09 17:39:02.567488915 +0800
++++ b/internal/emby/fork_util_test.go	2026-10-09 18:21:41.196473328 +0800
 @@ -0,0 +1,116 @@
 +package emby
 +
@@ -375,9 +453,88 @@ diff -ruN a/internal/emby/fork_util_test.go b/internal/emby/fork_util_test.go
 +	}
 +}
 diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
---- a/internal/emby/handler.go	2026-10-09 17:39:02.559488262 +0800
-+++ b/internal/emby/handler.go	2026-10-09 17:39:02.567488915 +0800
-@@ -269,7 +269,9 @@
+--- a/internal/emby/handler.go	2026-10-09 18:21:41.188472656 +0800
++++ b/internal/emby/handler.go	2026-10-09 18:21:41.196473328 +0800
+@@ -45,6 +45,13 @@
+ 	FN *fn.Client
+ 	// ServerName 在 /System/Info 里返回给客户端。
+ 	ServerName string
++	// ServerID 是 32 位 hex 的服务器唯一标识（GUID 形态，无连字符）。
++	//
++	// Emby/Jellyfin 的 ServerId 都是这种形态（飞牛原生面实测：
++	// 9da9a321945b4e60a7488ea2be37cb9f）。此前固定返回字符串
++	// "fnos-emby-bridge"，格式不合法的 ServerId 会让部分客户端（如小幻影视）
++	// 无法正确登记服务器，表现为打不开媒体库或详情。
++	ServerID string
+ 	// Host 是客户端访问本桥接的主机:端口，用于拼绝对媒体 URL。
+ 	Host string
+ 
+@@ -95,8 +102,22 @@
+ 	if serverName == "" {
+ 		serverName = "fnos"
+ 	}
++	base := ""
++	if fnClient != nil {
++		base = fnClient.BaseURL
++	}
+ 	return &Handler{FN: fnClient, ServerName: serverName, Host: host,
+-		lim115: newRateLimiter(1), sessions: map[string]*embySession{}}
++		ServerID: serverID(base, serverName),
++		lim115:   newRateLimiter(1), sessions: map[string]*embySession{}}
++}
++
++// serverID 生成稳定的 32 位 hex 服务器标识（GUID 形态）。
++//
++// 由飞牛地址 + 服务器名派生：同一套部署每次启动结果一致（客户端不会因为
++// ServerId 变化而重新登记服务器），不同 NAS 之间又不会撞车。
++// 不能用随机值——每次重启都换 ServerId 会让客户端丢失服务器关联。
++func serverID(baseURL, serverName string) string {
++	return fn.SHA256Hex("fnos-emby-bridge|" + baseURL + "|" + serverName)[:32]
+ }
+ 
+ // Routes 返回 http.ServeMux 的路由表，供 main 直接挂载。
+@@ -119,6 +140,30 @@
+ 	mux.HandleFunc("GET /Items", h.handleItems)
+ 	mux.HandleFunc("GET /Users/{uid}/Items", h.handleItems)
+ 	mux.HandleFunc("GET /Users/{uid}/Views", h.handleViews)
++
++	// fork 新增：飞牛原生 Jellyfin 面（8005）实现、而桥接此前缺失/形状不符的端点。
++	// 这些是客户端"打开媒体库/详情"的必经路径，缺了会直接失败：
++	//
++	//   /UserViews                 列媒体库的另一个官方路径。此前落到兜底返回
++	//                              空列表 → 客户端看到的媒体库列表是空的。
++	//   /Items/Filters             此前被 /Items/{id} 通配吃掉，拿 "Filters" 当
++	//   /Users/{uid}/Items/Filters 影片 ID 去查飞牛 → 404，客户端开库时调用它，
++	//                              404 会让媒体库页打不开。（字面量段优先于通配段，
++	//                              显式注册即可抢回）
++	//   /Items/Counts              此前返回 QueryResult 对象，而 Emby 的 ItemCounts
++	//   /Users/{uid}/Items/Counts  是另一套字段的对象。
++	//   /Library/VirtualFolders    Emby 返回数组，不是 QueryResult。
++	//   /Plugins                    Emby 返回 PluginInfo[] 数组。
++	//   /Users/{uid}/GroupingOptions 返回数组。
++	mux.HandleFunc("GET /UserViews", h.handleViews)
++	mux.HandleFunc("GET /Items/Filters", h.handleQueryFilters)
++	mux.HandleFunc("GET /Users/{uid}/Items/Filters", h.handleQueryFilters)
++	mux.HandleFunc("GET /Items/Counts", h.handleItemCountsAll)
++	mux.HandleFunc("GET /Users/{uid}/Items/Counts", h.handleItemCountsAll)
++	mux.HandleFunc("GET /Library/VirtualFolders", h.handleVirtualFolders)
++	mux.HandleFunc("GET /Plugins", h.handleEmptyArray)
++	mux.HandleFunc("GET /Users/{uid}/GroupingOptions", h.handleEmptyArray)
++
+ 	mux.HandleFunc("GET /Items/{id}", h.handleItemByID)
+ 	// 详情页（UserLibraryService 标准路径）：Yamby 点开剧/季/集详情走
+ 	// /Users/{uid}/Items/{id}，未注册会落兜底返回空列表 → 详情页空白
+@@ -201,8 +246,7 @@
+ 	// 外挂字幕下载（Emby-In-One 确认路径 /Videos/{itemId}/{msId}/Subtitles/{index}/Stream.{fmt}）：
+ 	// 飞牛无字幕内容接口，内嵌字幕由客户端直连容器读取；此处注册避免兜底 JSON 被当字幕解析
+ 	mux.HandleFunc("GET /Videos/{id}/{msId}/Subtitles/{index}/{rest}", h.handleSubtitleStream)
+-	// 媒体统计（客户端设置页/仪表盘显示）
+-	mux.HandleFunc("GET /Items/Counts", h.handleEmptyList)
++	// 媒体统计（客户端设置页/仪表盘显示）——已在上方媒体库块改为 handleItemCountsAll
+ 	// 特别收录：web 客户端 getSpecialFeatures 直接 items.slice(...)，必须纯数组
+ 	mux.HandleFunc("GET /Users/{uid}/Items/{id}/SpecialFeatures", h.handleEmptyArray)
+ 	mux.HandleFunc("GET /Items/{id}/SpecialFeatures", h.handleEmptyArray)
+@@ -269,7 +313,9 @@
  // Emby 官方客户端（Android/iOS/TV/Web）所有请求都带 /emby 前缀，必须兼容。
  func (h *Handler) Handler() http.Handler {
  	// withSession 按请求 token 选定飞牛会话注入 ctx——多用户进度/收藏隔离的入口
@@ -388,7 +545,18 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  }
  
  // routeSegmentCase 已知路由静态段 小写→规范大小写（与 Routes() 注册一致）。
-@@ -330,6 +332,10 @@
+@@ -287,6 +333,10 @@
+ 	"displaypreferences": "DisplayPreferences", "intros": "Intros",
+ 	"images": "Images", "primary": "Primary", "thememedia": "ThemeMedia",
+ 	"themesongs": "ThemeSongs", "themevideos": "ThemeVideos",
++	// fork 新增（与上面新增的路由配套，否则客户端发小写路径会落到兜底）
++	"userviews": "UserViews", "filters": "Filters", "plugins": "Plugins",
++	"groupingoptions": "GroupingOptions", "virtualfolders": "VirtualFolders",
++	"library": "Library", "counts": "Counts",
+ }
+ 
+ // normalizePathCase 把路径中命中已知路由段的段重写为规范大小写，
+@@ -330,6 +380,10 @@
  	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
  		rw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
  		start := time.Now()
@@ -399,7 +567,7 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  		next.ServeHTTP(rw, r)
  		q := r.URL.RawQuery
  		if i := strings.Index(q, "api_key="); i >= 0 {
-@@ -349,7 +355,7 @@
+@@ -349,7 +403,7 @@
  				cl = cl[:i]
  			}
  		}
@@ -408,7 +576,7 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  	})
  }
  
-@@ -399,6 +405,75 @@
+@@ -399,6 +453,75 @@
  	})
  }
  
@@ -484,7 +652,110 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  // ---- 工具：从 query/header 取 api_key ----
  
  func (h *Handler) apiKey(r *http.Request) string {
-@@ -842,6 +917,7 @@
+@@ -428,12 +551,12 @@
+ 
+ func (h *Handler) handleRoot(w http.ResponseWriter, r *http.Request) {
+ 	writeJSON(w, http.StatusOK, map[string]any{
+-		"LocalAddress": r.Host,
+-		"ServerId":     "fnos-emby-bridge",
++		"LocalAddress": hostOnly(r.Host),
++		"ServerId":     h.ServerID,
+ 		"ServerName":   h.ServerName,
+ 		"Version":      "4.9.0.0",
+ 		"ProductName":  "FNOS-EFBy-Bridge",
+-		"Id":           "fnos-emby-bridge",
++		"Id":           h.ServerID,
+ 	})
+ }
+ 
+@@ -442,25 +565,48 @@
+ 		"ServerName":                   h.ServerName,
+ 		"Version":                      "4.9.0.0",
+ 		"ProductName":                  "FNOS-EFBy-Bridge",
+-		"Id":                           "fnos-emby-bridge",
++		"Id":                           h.ServerID,
+ 		"IsAdminUser":                  true,
+-		"OperatingSystem":              "Linux",
++		"OperatingSystem":              "fnOS",
+ 		"CanEnableAutoSignIn":          true,
+ 		"SupportsAutoSignOutScheduler": true,
+-		"LocalAddress":                 r.Host,
++		"LocalAddress":                 hostOnly(r.Host),
++		"StartupWizardCompleted":       true,
+ 	})
+ }
+ 
++// handleSystemInfoPublic 实现 GET /System/Info/Public。
++//
++// 字段对齐 Emby/Jellyfin 的 PublicSystemInfo（对照飞牛原生面 8005 实测响应——
++// 那是飞牛自己实现给 Infuse/VidHub 用的，可作为权威参照）：
++//
++//	{"LocalAddress","ServerName","Version","ProductName","OperatingSystem",
++//	 "Id","StartupWizardCompleted"}
++//
++// fork 修复：此前缺 LocalAddress / OperatingSystem / StartupWizardCompleted，
++// 且 Id 固定为字符串 "fnos-emby-bridge" 而非 32 位 hex GUID。严格一些的客户端
++// （如小幻影视）会校验这些字段，导致登记服务器失败、打不开媒体库或详情。
++// 另：CanEnableAutoSignIn 属于需要鉴权的 SystemInfo，不属于 Public，已移出。
+ func (h *Handler) handleSystemInfoPublic(w http.ResponseWriter, r *http.Request) {
+ 	writeJSON(w, http.StatusOK, map[string]any{
+-		"ServerName":          h.ServerName,
+-		"Version":             "4.9.0.0",
+-		"ProductName":         "FNOS-EFBy-Bridge",
+-		"Id":                  "fnos-emby-bridge",
+-		"CanEnableAutoSignIn": true,
++		"LocalAddress":           hostOnly(r.Host),
++		"ServerName":             h.ServerName,
++		"Version":                "4.9.0.0",
++		"ProductName":            "FNOS-EFBy-Bridge",
++		"OperatingSystem":        "fnOS",
++		"Id":                     h.ServerID,
++		"StartupWizardCompleted": true,
+ 	})
+ }
+ 
++// hostOnly 去掉 "host:port" 里的端口（Emby 的 LocalAddress 是纯地址）。
++func hostOnly(h string) string {
++	if i := strings.LastIndexByte(h, ':'); i > 0 {
++		return h[:i]
++	}
++	return h
++}
++
+ func (h *Handler) handleBranding(w http.ResponseWriter, r *http.Request) {
+ 	writeJSON(w, http.StatusOK, map[string]any{
+ 		"ApplicationName":      "FNOS-EFBy",
+@@ -763,7 +909,7 @@
+ 		return
+ 	}
+ 	writeJSON(w, http.StatusOK, map[string]any{
+-		"User": map[string]any{"Name": req.UserName, "Id": "fnos-user", "ServerId": "fnos-emby-bridge",
++		"User": map[string]any{"Name": req.UserName, "Id": "fnos-user", "ServerId": h.ServerID,
+ 			// Configuration 必须存在：官方 web 客户端登录后读 User.Configuration.ProfilePin
+ 			// （undefined 直接 TypeError 中断登录流程）
+ 			"Configuration": userConfiguration(),
+@@ -784,9 +930,9 @@
+ 			"UserName": req.UserName,
+ 			"Client":   "Emby",
+ 			"Id":       "fnos-session",
+-			"ServerId": "fnos-emby-bridge",
++			"ServerId": h.ServerID,
+ 		},
+-		"ServerId":    "fnos-emby-bridge",
++		"ServerId":    h.ServerID,
+ 		"AccessToken": embyToken,
+ 		"Token":       embyToken,
+ 		"UserSecret":  embyToken,
+@@ -824,7 +970,7 @@
+ 		{
+ 			"Name":                  "admin",
+ 			"Id":                    "fnos-user",
+-			"ServerId":              "fnos-emby-bridge",
++			"ServerId":              h.ServerID,
+ 			"HasPassword":           true,
+ 			"HasConfiguredPassword": true,
+ 		},
+@@ -842,6 +988,7 @@
  	limit := queryInt(q, "Limit", 0) // 0 = 不限
  
  	writeItems := func(all []fn.MediaItem) {
@@ -492,7 +763,7 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  		// IncludeItemTypes 类型过滤（Emby 服务器 ASP.NET 大小写不敏感匹配；
  		// 客户端按类型查询如 IncludeItemTypes=Episode/Movie/Series，不过滤
  		// 会把混合列表原样返回=错误内容）。飞牛没有的实体类型 → 空列表。
-@@ -877,6 +953,17 @@
+@@ -877,6 +1024,17 @@
  				all = kept
  			}
  		}
@@ -510,7 +781,16 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  		total := len(all)
  		if start < 0 {
  			start = 0
-@@ -1072,7 +1159,25 @@
+@@ -1056,7 +1214,7 @@
+ 			"Type":                    "CollectionFolder",
+ 			"IsFolder":                true,
+ 			"CanDelete":               false,
+-			"ServerId":                "fnos-emby-bridge",
++			"ServerId":                h.ServerID,
+ 			"ImageTags":               map[string]any{"Primary": "Primary"},
+ 			"PrimaryImageAspectRatio": 0.6667,
+ 		}
+@@ -1072,7 +1230,25 @@
  	})
  }
  
@@ -537,7 +817,7 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  func collectionType(c string) string {
  	switch strings.ToLower(strings.TrimSpace(c)) {
  	case "movie", "movies", "电影":
-@@ -1550,7 +1655,9 @@
+@@ -1550,7 +1726,9 @@
  					title = lang + " " + strings.ToUpper(as.CodecName)
  				}
  				a["DisplayLanguage"] = lang
@@ -548,7 +828,16 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  				a["Title"] = title
  				fillMediaStream(a)
  				streams = append(streams, a)
-@@ -2139,14 +2246,70 @@
+@@ -2080,7 +2258,7 @@
+ 	src := map[string]any{
+ 		"Id":                   id,
+ 		"MediaSourceId":        id,
+-		"ServerId":             "fnos-emby-bridge",
++		"ServerId":             h.ServerID,
+ 		"Protocol":             "Http",
+ 		"Type":                 "Virtual",
+ 		"IsRemote":             true,
+@@ -2139,14 +2317,70 @@
  	}
  
  	// 2) 本地 NAS 文件：media/range 透传
@@ -621,7 +910,7 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  	hdr, status, body, err := h.fnOf(r.Context()).RangeMedia(r.Context(), mediaGuid, rangeHdr)
  	if err != nil {
  		http.Error(w, err.Error(), http.StatusBadGateway)
-@@ -2161,7 +2324,13 @@
+@@ -2161,7 +2395,13 @@
  			if _, err := fmt.Sscanf(cl, "%d", &size); err == nil && size > 0 {
  				if start, end, ok := parseClientRange(rangeHdr, size); ok && start < size {
  					if _, err := io.CopyN(io.Discard, body, start); err == nil {
@@ -636,7 +925,7 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  						w.Header().Set("Accept-Ranges", "bytes")
  						w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
  						w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
-@@ -2180,6 +2349,12 @@
+@@ -2180,6 +2420,12 @@
  			w.Header().Set(k, v)
  		}
  	}
@@ -649,9 +938,119 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  	w.Header().Set("Access-Control-Allow-Origin", "*")
  	if status == http.StatusNoContent {
  		w.WriteHeader(http.StatusNoContent)
+@@ -2487,7 +2733,7 @@
+ 	}
+ 	item := map[string]any{
+ 		"Id":                      info.Guid,
+-		"ServerId":                "fnos-emby-bridge",
++		"ServerId":                h.ServerID,
+ 		"Name":                    displayName(info),
+ 		"Type":                    itemType,
+ 		"SortName":                info.Item.Title,
+@@ -2650,7 +2896,7 @@
+ 	}
+ 	item := map[string]any{
+ 		"Id":                      m.Guid,
+-		"ServerId":                "fnos-emby-bridge",
++		"ServerId":                h.ServerID,
+ 		"Name":                    name,
+ 		"Type":                    itemType,
+ 		"IsFolder":                isFolder,
+@@ -2971,6 +3217,82 @@
+ 	http.Error(w, "subtitle not available via bridge (embedded in container)", http.StatusNotFound)
+ }
+ 
++// handleQueryFilters 实现 GET /Items/Filters 与 /Users/{uid}/Items/Filters。
++//
++// Emby 返回 QueryFilters（Genres / Tags / OfficialRatings / Years）。飞牛侧没有
++// 这层筛选项数据，回空数组即可 —— **关键是端点必须存在**：此前该路径被
++// /Items/{id} 通配吃掉，桥接拿 "Filters" 当作影片 ID 去查飞牛并返回 404，
++// 而客户端打开媒体库时会调用它，404 会导致媒体库页打不开。
++func (h *Handler) handleQueryFilters(w http.ResponseWriter, r *http.Request) {
++	writeJSON(w, http.StatusOK, map[string]any{
++		"Genres":          []any{},
++		"Tags":            []any{},
++		"OfficialRatings": []any{},
++		"Years":           []any{},
++	})
++}
++
++// handleVirtualFolders 实现 GET /Library/VirtualFolders。
++// Emby 返回 VirtualFolderInfo[]（**数组**，不是 QueryResult 对象）。
++// CollectionType 与 /Users/{uid}/Views 保持一致：Other（其他视频）归混合内容，
++// 即不声明该字段。
++func (h *Handler) handleVirtualFolders(w http.ResponseWriter, r *http.Request) {
++	ctx := r.Context()
++	dbs, err := h.fnOf(ctx).MediaDBList(ctx)
++	if err != nil {
++		writeJSON(w, http.StatusOK, []any{})
++		return
++	}
++	out := make([]map[string]any, 0, len(dbs))
++	for _, db := range dbs {
++		f := map[string]any{
++			"Name":           db.Title,
++			"Locations":      []any{},
++			"ItemId":         db.Guid,
++			"LibraryOptions": map[string]any{"PathInfos": []any{}},
++		}
++		if ct := collectionType(db.Category); ct != "" {
++			f["CollectionType"] = ct
++		}
++		out = append(out, f)
++	}
++	writeJSON(w, http.StatusOK, out)
++}
++
++// handleItemCountsAll 实现 GET /Items/Counts 与 /Users/{uid}/Items/Counts。
++//
++// Emby 的 ItemCounts 是一组计数字段的对象，不是 QueryResult —— 此前该路径
++// 返回 {"Items":[],...}，字段全对不上。计数由各媒体库条目数汇总，
++// 按库类别分别归入 MovieCount / SeriesCount。
++func (h *Handler) handleItemCountsAll(w http.ResponseWriter, r *http.Request) {
++	ctx := r.Context()
++	counts := map[string]any{
++		"MovieCount": 0, "SeriesCount": 0, "EpisodeCount": 0, "ArtistCount": 0,
++		"ProgramCount": 0, "TrailerCount": 0, "SongCount": 0, "AlbumCount": 0,
++		"BoxSetCount": 0, "BookCount": 0, "ItemCount": 0,
++	}
++	if dbs, err := h.fnOf(ctx).MediaDBList(ctx); err == nil {
++		total, movies, series := 0, 0, 0
++		for _, db := range dbs {
++			_, n, err := h.fnOf(ctx).ItemListPage(ctx, "ancestor_guid", db.Guid, 1, 1)
++			if err != nil || n <= 0 {
++				continue
++			}
++			total += n
++			switch collectionType(db.Category) {
++			case "movies":
++				movies += n
++			case "tvshows":
++				series += n
++			}
++		}
++		counts["ItemCount"] = total
++		counts["MovieCount"] = movies
++		counts["SeriesCount"] = series
++	}
++	writeJSON(w, http.StatusOK, counts)
++}
++
+ // handleItemCounts 实现 GET /Items/{id}/Counts：客户端仪表盘统计。
+ func (h *Handler) handleItemCounts(w http.ResponseWriter, r *http.Request) {
+ 	dbs, err := h.fnOf(r.Context()).MediaDBList(r.Context())
+@@ -2980,7 +3302,7 @@
+ 	}
+ 	writeJSON(w, http.StatusOK, map[string]any{
+ 		"LibraryCount": len(dbs),
+-		"ServerId":     "fnos-emby-bridge",
++		"ServerId":     h.ServerID,
+ 	})
+ }
+ 
 diff -ruN a/internal/emby/util.go b/internal/emby/util.go
---- a/internal/emby/util.go	2026-10-09 17:39:02.559488262 +0800
-+++ b/internal/emby/util.go	2026-10-09 17:39:02.567488915 +0800
+--- a/internal/emby/util.go	2026-10-09 18:21:41.188472656 +0800
++++ b/internal/emby/util.go	2026-10-09 18:21:41.196473328 +0800
 @@ -6,6 +6,7 @@
  	"io"
  	"math/rand"
@@ -762,8 +1161,8 @@ diff -ruN a/internal/emby/util.go b/internal/emby/util.go
 +	return title + " · " + tag
 +}
 diff -ruN a/internal/mock/fnos.go b/internal/mock/fnos.go
---- a/internal/mock/fnos.go	2026-10-09 17:39:02.559488262 +0800
-+++ b/internal/mock/fnos.go	2026-10-09 17:39:02.567488915 +0800
+--- a/internal/mock/fnos.go	2026-10-09 18:21:41.192472992 +0800
++++ b/internal/mock/fnos.go	2026-10-09 18:21:41.196473328 +0800
 @@ -47,10 +47,18 @@
  			"duration": 2700, "runtime": 45, "can_play": 1, "is_watched": 0,
  			"season_number": 1, "episode_number": 1, "air_date": "2024-02-01", "overview": "一集剧",

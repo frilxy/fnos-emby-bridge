@@ -285,6 +285,84 @@ func TestOtherLibraryNotBlank(t *testing.T) {
 	}
 }
 
+// 回归（fork 修复）：客户端「打开媒体库 / 影视详情」必经、而此前缺失或形状不符的端点。
+//
+// 参照物是飞牛原生 Jellyfin 面（8005）—— 飞牛自己实现了这些端点给第三方客户端用，
+// 说明真实客户端（含小幻影视）确实会调用；桥接此前要么落到空兜底、要么被通配路由
+// 吃掉返回 404，导致媒体库/详情打不开。
+func TestClientCompatEndpoints(t *testing.T) {
+	fnSrv := httptest.NewServer(mock.NewHandler(false, "", mock.WithOtherLibrary()))
+	defer fnSrv.Close()
+
+	client := fn.NewClient(fnSrv.URL)
+	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
+	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	bridge := httptest.NewServer(h.Handler())
+	defer bridge.Close()
+
+	// 1) /System/Info/Public：Id 必须是 32 位 hex（Emby/Jellyfin 的 ServerId 形态），
+	//    且补齐 LocalAddress / OperatingSystem / StartupWizardCompleted
+	body := getJSON(t, bridge.URL+"/System/Info/Public")
+	var pub map[string]any
+	_ = json.Unmarshal(body, &pub)
+	id, _ := pub["Id"].(string)
+	if len(id) != 32 || strings.Trim(id, "0123456789abcdef") != "" {
+		t.Fatalf("/System/Info/Public Id=%q，应为 32 位 hex（非法 ServerId 会让部分客户端登记失败）", id)
+	}
+	for _, k := range []string{"LocalAddress", "OperatingSystem", "StartupWizardCompleted", "ServerName", "Version", "ProductName"} {
+		if _, ok := pub[k]; !ok {
+			t.Fatalf("/System/Info/Public 缺字段 %s：%s", k, body)
+		}
+	}
+
+	// 2) /UserViews 必须返回真实媒体库（此前落到兜底 → 空列表 → 客户端看不到库）
+	body = getJSON(t, bridge.URL+"/UserViews?api_key=k")
+	var qr struct {
+		Items []map[string]any `json:"Items"`
+	}
+	_ = json.Unmarshal(body, &qr)
+	if len(qr.Items) == 0 {
+		t.Fatalf("/UserViews 返回空媒体库列表（客户端看不到任何库）：%s", body)
+	}
+
+	// 3) /Items/Filters 与 /Users/{uid}/Items/Filters 必须存在且是 QueryFilters 对象
+	//    （此前被 /Items/{id} 通配吃掉，拿 "Filters" 当影片 ID 查飞牛 → 404）
+	for _, p := range []string{"/Items/Filters", "/Users/u/Items/Filters", "/items/filters"} {
+		body = getJSON(t, bridge.URL+p+"?api_key=k")
+		var f map[string]any
+		if err := json.Unmarshal(body, &f); err != nil {
+			t.Fatalf("%s 不是 JSON 对象：%s", p, body)
+		}
+		if _, bad := f["Error"]; bad {
+			t.Fatalf("%s 返回错误（客户端打开媒体库会失败）：%s", p, body)
+		}
+		for _, k := range []string{"Genres", "Tags", "OfficialRatings", "Years"} {
+			if _, ok := f[k]; !ok {
+				t.Fatalf("%s 缺字段 %s（应为 Emby QueryFilters）：%s", p, k, body)
+			}
+		}
+	}
+
+	// 4) 这几条 Emby 返回纯数组，给 QueryResult 对象会让客户端解析崩
+	for _, p := range []string{"/Plugins", "/Library/VirtualFolders", "/Users/u/GroupingOptions"} {
+		body = getJSON(t, bridge.URL+p+"?api_key=k")
+		if !strings.HasPrefix(strings.TrimSpace(string(body)), "[") {
+			t.Fatalf("%s 应返回纯数组：%s", p, body)
+		}
+	}
+
+	// 5) /Items/Counts 是 Emby 的 ItemCounts 对象，不是 QueryResult
+	body = getJSON(t, bridge.URL+"/Items/Counts?api_key=k")
+	var counts map[string]any
+	_ = json.Unmarshal(body, &counts)
+	if _, ok := counts["ItemCount"]; !ok {
+		t.Fatalf("/Items/Counts 缺 ItemCount（应返回 Emby ItemCounts 对象）：%s", body)
+	}
+	if _, ok := counts["Items"]; ok {
+		t.Fatalf("/Items/Counts 不应返回 QueryResult：%s", body)
+	}
+}
+
 // 云盘直链路径：mock 返回夸克直链，桥接应直连 mock CDN（ChunkedProxy），透传字节。
 func TestBridgeCloudDirectLink(t *testing.T) {
 	// CDN 与飞牛同域：先建 mock 飞牛服务，再用其 URL 作为 cdnBase。
