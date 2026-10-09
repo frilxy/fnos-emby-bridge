@@ -366,10 +366,8 @@ func TestClientCompatEndpoints(t *testing.T) {
 	//    实测小幻影视请求 /Items/{id}/Images 拿到对象后，详情页一直加载。
 	for _, p := range []string{
 		"/Items/fv_001/Images",
-		"/Videos/fv_001/AdditionalParts",
 		"/Items/fv_001/LocalTrailers",
 		"/Items/fv_001/Ancestors",
-		"/Items/fv_001/CriticReviews",
 		"/Localization/Options",
 		"/Localization/Countries",
 		"/Localization/ParentalRatings",
@@ -380,7 +378,27 @@ func TestClientCompatEndpoints(t *testing.T) {
 		}
 	}
 
-	// 7) /Items/{id}/Images 必须是真实的 ImageInfo 列表，不能只是空数组
+	// 7) AdditionalParts / CriticReviews 官方是 QueryResult **对象**（不是数组）。
+	//    实机证据：小幻影视把 AdditionalParts 反序列化成 EmbyQueryResult<EmbyMediaItem>，
+	//    给数组报 "The JSON value could not be converted to ...EmbyQueryResult`1[...]"。
+	for _, p := range []string{
+		"/Videos/fv_001/AdditionalParts",
+		"/Items/fv_001/CriticReviews",
+	} {
+		body = getJSON(t, bridge.URL+p+"?api_key=k")
+		if strings.HasPrefix(strings.TrimSpace(string(body)), "[") {
+			t.Fatalf("%s 应返回 QueryResult 对象（Emby 官方契约），不是数组：%s", p, body)
+		}
+		var qr map[string]any
+		if err := json.Unmarshal(body, &qr); err != nil {
+			t.Fatalf("%s 响应不是 JSON 对象：%s", p, body)
+		}
+		if _, ok := qr["Items"]; !ok {
+			t.Fatalf("%s 缺 Items 字段，不是 QueryResult：%s", p, body)
+		}
+	}
+
+	// 8) /Items/{id}/Images 必须是真实的 ImageInfo 列表，不能只是空数组
 	body = getJSON(t, bridge.URL+"/Items/fv_001/Images")
 	var imgs []map[string]any
 	_ = json.Unmarshal(body, &imgs)

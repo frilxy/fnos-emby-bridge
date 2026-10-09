@@ -133,7 +133,6 @@ System.InvalidOperationException: Emby item '73b9597b...' returned incomplete re
 | `/Items/Counts` | ✅ 实现 | ⚠️ 返回 QueryResult 对象（应为 `ItemCounts` 对象） |
 | `/Users/{uid}/GroupingOptions` | ✅ 实现 | ⚠️ 返回对象（应为数组） |
 | `/Items/{id}/Images` | ✅ 实现 | ⚠️ 返回 QueryResult 对象（应为 `ImageInfo[]` 数组） |
-| `/Videos/{id}/AdditionalParts` | ✅ 实现 | ⚠️ 返回对象（应为数组） |
 | `/Localization/Options` 等 | — | ⚠️ 返回对象（应为数组） |
 
 **形状不符比 404 更隐蔽**：状态码是 `200`，客户端连报错都没有，只是把响应塞进
@@ -196,23 +195,47 @@ DELETE /Users/{uid}/PlayedItems/{id} → 204 ；DELETE 后 Played = False
 DTO 含官方全字段，其中 `ServerId` 官方注明 **"Used only by our Windows app"**——
 小幻影视正是 Windows 应用，会读这个字段。
 
-### 6. HEAD 取流请求挂死
+### 6. 修正上一版自己的错误：`AdditionalParts` / `CriticReviews` 是**对象**不是数组
+
+1.0.5 里我**基于猜测**把一批端点改成了纯数组，其中两个改错了。实机日志（小幻影视）：
+
+```
+Could not load Additional Parts for "4c5ea3e4..."
+System.Text.Json.JsonException: The JSON value could not be converted to
+  Richasy.RodelPlayer.Sources.Emby.Models.EmbyQueryResult`1[EmbyMediaItem].
+  Path: $ | LineNumber: 0 | BytePositionInLine: 1
+```
+
+`BytePositionInLine: 1` —— 第 1 个字符就解析失败，说明客户端要的是**对象** `{"Items":[...]}`，
+而 1.0.5 给了数组 `[]`。查官方文档确认：
+
+> `get /Items/{Id}/CriticReviews` → **`200 | QueryResult_BaseItemDto`**
+> "Operation successful. **Returning a QueryResult object.**"
+
+`/Videos/{Id}/AdditionalParts` 同理（Jellyfin 对应类型 `BaseItemDtoQueryResult`）。两个已改回
+`QueryResult` 对象。
+
+**教训**：这一批"应为数组"的判断里，只有 `/Items/{id}/Images` 有实机证据支持（日志显示
+"Loaded 4 art images" 成功）。其余靠推理，就出了这个错。回归测试现在对每个端点**分别断言**
+期望形状，而不是笼统地要求"都是数组"。
+
+### 7. HEAD 取流请求挂死
 
 Go 的 `GET` 路由会一并匹配 `HEAD`，HEAD 不带 `Range` 时走完整 GET，把**整个文件**（实测 6.7GB）当响应体往外推，而 HEAD 不发送响应体 → 请求永不返回，部分播放器探测失败后判定「无法播放」。
 
 **修复**：HEAD 改为向飞牛只请求 `Range: bytes=0-0` 拿头部与总长度，不传字节。
 
-### 7. 后台连接页 panic
+### 8. 后台连接页 panic
 
 `main.go` 里 `client.Token[:8]` 在飞牛未登录（token 为空）时切片越界 panic。触发路径是 `GET /admin/api/connection`——**恰好是刚部署、还没配好连接时最需要打开的那一页**，结果是面板打不开、地址填不进去，形成死循环。
 
 **修复**：新增 `shortToken()`，三处 `[:8]` 全部加固。
 
-### 8. 改进：取流 `Content-Type`
+### 9. 改进：取流 `Content-Type`
 
 上游 `/v/api/v1/media/range` 一律返回 `application/octet-stream`。现按扩展名给真实 MIME（`video/mp4`、`video/x-matroska` 等），仅在通用类型时覆盖。
 
-### 9. 改进：音轨兼容性提示
+### 10. 改进：音轨兼容性提示
 
 `DTS / TrueHD / FLAC / ALAC / PCM` 音轨的 `DisplayTitle` 追加 `· 需软解`，便于挑选。
 用 `AUDIO_TRACK_HINT=0` 关闭。**刻意不做自动切轨**——备选轨常是导演评论轨，自动切换会让人听到错误音轨。
@@ -302,7 +325,7 @@ cd .. && fnpack build --directory ./fpk/fnos-emby-bridge
 
 ## 与上游的差异
 
-见 [`fixes.patch`](fixes.patch)：6 个文件、**+1073 / −47 行**，`patch -p1` 可干净应用到上游 `main`。
+见 [`fixes.patch`](fixes.patch)：6 个文件、**+1199 / −52 行**，`patch -p1` 可干净应用到上游 `main`。
 
 ---
 

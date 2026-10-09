@@ -218,14 +218,22 @@ func (h *Handler) Routes() *http.ServeMux {
 	// 详情页一直加载。形状对不上的响应比 404 更隐蔽：状态码是 200，客户端也不报错。
 	mux.HandleFunc("GET /Items/{id}/Images", h.handleItemImages)
 	mux.HandleFunc("GET /Users/{uid}/Items/{id}/Images", h.handleItemImages)
-	mux.HandleFunc("GET /Videos/{id}/AdditionalParts", h.handleEmptyArray)
+	// ⚠️ AdditionalParts / CriticReviews 官方返回的是 **QueryResult 对象**，不是数组：
+	//   get /Videos/{Id}/AdditionalParts → QueryResult<BaseItemDto>
+	//   get /Items/{Id}/CriticReviews    → QueryResult<BaseItemDto>（dev.emby.media 原文：
+	//     "200 | QueryResult_BaseItemDto | Returning a QueryResult object."）
+	// 实机证据：小幻影视把 AdditionalParts 反序列化成 EmbyQueryResult<EmbyMediaItem>，
+	// 给数组会报 "The JSON value could not be converted to ...EmbyQueryResult`1[...].
+	// Path: $ | LineNumber: 0 | BytePositionInLine: 1"（第 1 个字符就失败）。
+	mux.HandleFunc("GET /Videos/{id}/AdditionalParts", h.handleEmptyList)
+	mux.HandleFunc("GET /Items/{id}/CriticReviews", h.handleEmptyList)
+	mux.HandleFunc("GET /Users/{uid}/Items/{id}/CriticReviews", h.handleEmptyList)
+	// 以下官方确实是数组（Jellyfin/Emby 均为 BaseItemDto[]）：
 	mux.HandleFunc("GET /Videos/{id}/LocalTrailers", h.handleEmptyArray)
 	mux.HandleFunc("GET /Items/{id}/LocalTrailers", h.handleEmptyArray)
 	mux.HandleFunc("GET /Users/{uid}/Items/{id}/LocalTrailers", h.handleEmptyArray)
 	mux.HandleFunc("GET /Items/{id}/Ancestors", h.handleEmptyArray)
 	mux.HandleFunc("GET /Users/{uid}/Items/{id}/Ancestors", h.handleEmptyArray)
-	mux.HandleFunc("GET /Items/{id}/CriticReviews", h.handleEmptyArray)
-	mux.HandleFunc("GET /Users/{uid}/Items/{id}/CriticReviews", h.handleEmptyArray)
 	// Localization 三个端点官方都是数组；Options 至少要给 "Auto"（跟随客户端语言）
 	mux.HandleFunc("GET /Localization/Options", h.handleLocalizationOptions)
 	mux.HandleFunc("GET /Localization/Countries", h.handleEmptyArray)
