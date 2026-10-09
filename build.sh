@@ -62,9 +62,8 @@ cp -f "${BIN_OUT}" "${FPK_DIR}/app/server/${APPNAME}"
 chmod 755 "${FPK_DIR}/app/server/${APPNAME}"
 
 echo "==> 生成 fpk"
-"${ROOT}/fpk/pack.sh" "${APPNAME}" "${DIST}/${APPNAME}.fpk"
-cp -f "${DIST}/${APPNAME}.fpk" "${DIST}/${APPNAME}-${VERSION}.fpk"
-echo "    版本化副本：dist/${APPNAME}-${VERSION}.fpk"
+# 只产出带版本号的那一个：文件本身就表明版本，Release 里也只放这一个
+"${ROOT}/fpk/pack.sh" "${APPNAME}" "${DIST}/${APPNAME}-${VERSION}.fpk"
 
 echo "==> 完成"
 ls -la "${DIST}"

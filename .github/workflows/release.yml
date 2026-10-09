@@ -59,19 +59,27 @@ jobs:
           set -euo pipefail
           TAG="${INPUT_TAG:-$REF_NAME}"
           VER="${TAG#v}"
-          ASSETS=("dist/fnos-emby-bridge-${VER}.fpk" "dist/fnos-emby-bridge.fpk")
-          for f in "${ASSETS[@]}"; do
-            [ -f "$f" ] || { echo "::error::缺少构建产物 $f"; exit 1; }
-          done
+          ASSET="dist/fnos-emby-bridge-${VER}.fpk"
+          [ -f "$ASSET" ] || { echo "::error::缺少构建产物 $ASSET"; exit 1; }
 
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "${ASSETS[@]}" --clobber
+            gh release upload "$TAG" "$ASSET" --clobber
           else
             gh release create "$TAG" \
               --title "$TAG" \
               --generate-notes \
-              "${ASSETS[@]}"
+              "$ASSET"
           fi
+
+          # 附件只保留当前版本这一个（清掉历史遗留的旧命名附件）
+          WANT="$(basename "$ASSET")"
+          gh release view "$TAG" --json assets --jq '.assets[].name' | while read -r name; do
+            [ -z "$name" ] && continue
+            if [ "$name" != "$WANT" ]; then
+              echo "清理多余附件: $name"
+              gh release delete-asset "$TAG" "$name" --yes
+            fi
+          done
 
           gh release view "$TAG" --json url,assets \
             --jq '"Release: \(.url)\n附件: \([.assets[].name] | join(", "))"'

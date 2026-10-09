@@ -1,6 +1,6 @@
 diff -ruN a/.github/workflows/build.yml b/.github/workflows/build.yml
 --- a/.github/workflows/build.yml	1970-01-01 08:00:00.000000000 +0800
-+++ b/.github/workflows/build.yml	2026-10-09 19:50:43.082534033 +0800
++++ b/.github/workflows/build.yml	2026-10-09 20:19:23.749528892 +0800
 @@ -0,0 +1,34 @@
 +name: Build
 +
@@ -38,8 +38,8 @@ diff -ruN a/.github/workflows/build.yml b/.github/workflows/build.yml
 +          retention-days: 30
 diff -ruN a/.github/workflows/release.yml b/.github/workflows/release.yml
 --- a/.github/workflows/release.yml	1970-01-01 08:00:00.000000000 +0800
-+++ b/.github/workflows/release.yml	2026-10-09 19:50:43.082442424 +0800
-@@ -0,0 +1,77 @@
++++ b/.github/workflows/release.yml	2026-10-09 20:19:23.749625081 +0800
+@@ -0,0 +1,85 @@
 +name: Release
 +
 +# push 一个 v* tag 就自动：构建 fpk → 发布 Release 并附上产物。
@@ -101,25 +101,33 @@ diff -ruN a/.github/workflows/release.yml b/.github/workflows/release.yml
 +          set -euo pipefail
 +          TAG="${INPUT_TAG:-$REF_NAME}"
 +          VER="${TAG#v}"
-+          ASSETS=("dist/fnos-emby-bridge-${VER}.fpk" "dist/fnos-emby-bridge.fpk")
-+          for f in "${ASSETS[@]}"; do
-+            [ -f "$f" ] || { echo "::error::缺少构建产物 $f"; exit 1; }
-+          done
++          ASSET="dist/fnos-emby-bridge-${VER}.fpk"
++          [ -f "$ASSET" ] || { echo "::error::缺少构建产物 $ASSET"; exit 1; }
 +
 +          if gh release view "$TAG" >/dev/null 2>&1; then
-+            gh release upload "$TAG" "${ASSETS[@]}" --clobber
++            gh release upload "$TAG" "$ASSET" --clobber
 +          else
 +            gh release create "$TAG" \
 +              --title "$TAG" \
 +              --generate-notes \
-+              "${ASSETS[@]}"
++              "$ASSET"
 +          fi
++
++          # 附件只保留当前版本这一个（清掉历史遗留的旧命名附件）
++          WANT="$(basename "$ASSET")"
++          gh release view "$TAG" --json assets --jq '.assets[].name' | while read -r name; do
++            [ -z "$name" ] && continue
++            if [ "$name" != "$WANT" ]; then
++              echo "清理多余附件: $name"
++              gh release delete-asset "$TAG" "$name" --yes
++            fi
++          done
 +
 +          gh release view "$TAG" --json url,assets \
 +            --jq '"Release: \(.url)\n附件: \([.assets[].name] | join(", "))"'
 diff -ruN a/cmd/fnos-emby-bridge/main.go b/cmd/fnos-emby-bridge/main.go
---- a/cmd/fnos-emby-bridge/main.go	2026-10-09 19:50:43.069386923 +0800
-+++ b/cmd/fnos-emby-bridge/main.go	2026-10-09 19:50:43.075057850 +0800
+--- a/cmd/fnos-emby-bridge/main.go	2026-09-29 23:36:45.000000000 +0800
++++ b/cmd/fnos-emby-bridge/main.go	2026-10-09 20:19:23.745674314 +0800
 @@ -95,7 +95,7 @@
  		if err := client.Login(ctx, user, fn.SHA256Hex(pass)); err != nil {
  			log.Printf("飞牛登录失败：%v（可在后台修改连接）", err)
@@ -167,8 +175,8 @@ diff -ruN a/cmd/fnos-emby-bridge/main.go b/cmd/fnos-emby-bridge/main.go
  func withCORS(next http.Handler) http.Handler {
  	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 diff -ruN a/internal/admin/admin.go b/internal/admin/admin.go
---- a/internal/admin/admin.go	2026-10-09 19:50:43.070284771 +0800
-+++ b/internal/admin/admin.go	2026-10-09 19:50:43.075599906 +0800
+--- a/internal/admin/admin.go	2026-09-29 23:36:45.000000000 +0800
++++ b/internal/admin/admin.go	2026-10-09 20:19:23.746318331 +0800
 @@ -390,7 +390,7 @@
  func (s *Store) page(w http.ResponseWriter, r *http.Request) {
  	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -179,8 +187,8 @@ diff -ruN a/internal/admin/admin.go b/internal/admin/admin.go
  
  func (s *Store) login(w http.ResponseWriter, r *http.Request) {
 diff -ruN a/internal/admin/admin_html.go b/internal/admin/admin_html.go
---- a/internal/admin/admin_html.go	2026-10-09 19:50:43.070493251 +0800
-+++ b/internal/admin/admin_html.go	2026-10-09 19:50:43.075746235 +0800
+--- a/internal/admin/admin_html.go	2026-09-29 23:36:45.000000000 +0800
++++ b/internal/admin/admin_html.go	2026-10-09 20:19:23.746492438 +0800
 @@ -1,22 +1,33 @@
  package admin
  
@@ -236,8 +244,8 @@ diff -ruN a/internal/admin/admin_html.go b/internal/admin/admin_html.go
 +	return strings.ReplaceAll(adminHTML, "__ICON__", iconDataURI)
 +}
 diff -ruN a/internal/emby/bridge_test.go b/internal/emby/bridge_test.go
---- a/internal/emby/bridge_test.go	2026-10-09 19:50:43.070654365 +0800
-+++ b/internal/emby/bridge_test.go	2026-10-09 19:50:43.076390966 +0800
+--- a/internal/emby/bridge_test.go	2026-09-29 23:36:45.000000000 +0800
++++ b/internal/emby/bridge_test.go	2026-10-09 20:19:23.747247306 +0800
 @@ -6,10 +6,12 @@
  	"io"
  	"net/http"
@@ -684,7 +692,7 @@ diff -ruN a/internal/emby/bridge_test.go b/internal/emby/bridge_test.go
  	// CDN 与飞牛同域：先建 mock 飞牛服务，再用其 URL 作为 cdnBase。
 diff -ruN a/internal/emby/fork_util_test.go b/internal/emby/fork_util_test.go
 --- a/internal/emby/fork_util_test.go	1970-01-01 08:00:00.000000000 +0800
-+++ b/internal/emby/fork_util_test.go	2026-10-09 19:50:43.076065004 +0800
++++ b/internal/emby/fork_util_test.go	2026-10-09 20:19:23.746872532 +0800
 @@ -0,0 +1,116 @@
 +package emby
 +
@@ -803,8 +811,8 @@ diff -ruN a/internal/emby/fork_util_test.go b/internal/emby/fork_util_test.go
 +	}
 +}
 diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
---- a/internal/emby/handler.go	2026-10-09 19:50:43.071147747 +0800
-+++ b/internal/emby/handler.go	2026-10-09 19:50:43.076584853 +0800
+--- a/internal/emby/handler.go	2026-09-29 23:36:45.000000000 +0800
++++ b/internal/emby/handler.go	2026-10-09 20:19:23.747561405 +0800
 @@ -45,6 +45,13 @@
  	FN *fn.Client
  	// ServerName 在 /System/Info 里返回给客户端。
@@ -1738,8 +1746,8 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  }
  
 diff -ruN a/internal/emby/util.go b/internal/emby/util.go
---- a/internal/emby/util.go	2026-10-09 19:50:43.071407236 +0800
-+++ b/internal/emby/util.go	2026-10-09 19:50:43.075932775 +0800
+--- a/internal/emby/util.go	2026-09-29 23:36:45.000000000 +0800
++++ b/internal/emby/util.go	2026-10-09 20:19:23.746717154 +0800
 @@ -6,6 +6,7 @@
  	"io"
  	"math/rand"
@@ -1850,8 +1858,8 @@ diff -ruN a/internal/emby/util.go b/internal/emby/util.go
 +	return title + " · " + tag
 +}
 diff -ruN a/internal/mock/fnos.go b/internal/mock/fnos.go
---- a/internal/mock/fnos.go	2026-10-09 19:50:43.071966413 +0800
-+++ b/internal/mock/fnos.go	2026-10-09 19:50:43.077277252 +0800
+--- a/internal/mock/fnos.go	2026-09-29 23:36:45.000000000 +0800
++++ b/internal/mock/fnos.go	2026-10-09 20:19:23.748425233 +0800
 @@ -47,10 +47,18 @@
  			"duration": 2700, "runtime": 45, "can_play": 1, "is_watched": 0,
  			"season_number": 1, "episode_number": 1, "air_date": "2024-02-01", "overview": "一集剧",
