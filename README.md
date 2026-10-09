@@ -160,23 +160,59 @@ System.InvalidOperationException: Emby item '73b9597b...' returned incomplete re
 `ServerId` 改为由**飞牛地址 + 服务器名**派生的稳定 32 位 hex——同一套部署重启不变、
 不同部署不撞车（不能随机，否则客户端每次重启都会丢失服务器关联）。
 
-### 5. HEAD 取流请求挂死
+### 5. 「标记已看 / 未看 / 收藏」提示操作失败（写操作响应形状不对）
+
+**现象**：详情页点「标记为未看」，客户端提示**操作失败**。
+
+**排查**：在服务端直接做往返测试，其实**功能是好的**——
+
+```
+操作前 Played = False
+POST   /Users/{uid}/PlayedItems/{id} → 204 ；POST 后 Played = True
+DELETE /Users/{uid}/PlayedItems/{id} → 204 ；DELETE 后 Played = False
+```
+
+问题不在功能，在**响应形状**。查官方契约
+（[Emby PlaystateService](https://betadev.emby.media/reference/RestAPI/PlaystateService/postUsersByUseridPlayeditemsById.html)）：
+
+> `post /Users/{UserId}/PlayedItems/{Id}` → **`200 | UserItemDataDto`**
+> "Operation successful. **Returning a UserItemDataDto object.**"
+
+桥接返回的是 **`204` 空响应**。.NET 客户端按 `UserItemDataDto` 反序列化并校验必需字段，
+拿到空 body 就判成操作失败。`FavoriteItems` 那边更离谱——返回了自造的
+`{"Id":..,"UserData":{..}}` 包装对象，也不是官方模型。
+
+顺带一个坑：`playedItemsRe` 原来只匹配纯 hex id（`[0-9a-fA-F]+`），**id 不含纯 hex 时
+正则不匹配，会静默落到「写操作 → 204 兜底」**——表面成功、实际什么都没做。已放宽为 `[^/]+`。
+
+**修复**：三个写端点统一返回 `200 + UserItemDataDto` 本体：
+
+| 端点 | 修复前 | 修复后 |
+|---|---|---|
+| `POST/DELETE /Users/{uid}/PlayedItems/{id}` | `204` 空 | **`200` + DTO** ✅ |
+| `POST/DELETE /Users/{uid}/FavoriteItems/{id}` | 包装对象 | **`200` + DTO** ✅ |
+| `POST /Users/{uid}/Items/{id}/UserData` | `204`（未实现） | **`200` + DTO**（真正生效）✅ |
+
+DTO 含官方全字段，其中 `ServerId` 官方注明 **"Used only by our Windows app"**——
+小幻影视正是 Windows 应用，会读这个字段。
+
+### 6. HEAD 取流请求挂死
 
 Go 的 `GET` 路由会一并匹配 `HEAD`，HEAD 不带 `Range` 时走完整 GET，把**整个文件**（实测 6.7GB）当响应体往外推，而 HEAD 不发送响应体 → 请求永不返回，部分播放器探测失败后判定「无法播放」。
 
 **修复**：HEAD 改为向飞牛只请求 `Range: bytes=0-0` 拿头部与总长度，不传字节。
 
-### 6. 后台连接页 panic
+### 7. 后台连接页 panic
 
 `main.go` 里 `client.Token[:8]` 在飞牛未登录（token 为空）时切片越界 panic。触发路径是 `GET /admin/api/connection`——**恰好是刚部署、还没配好连接时最需要打开的那一页**，结果是面板打不开、地址填不进去，形成死循环。
 
 **修复**：新增 `shortToken()`，三处 `[:8]` 全部加固。
 
-### 7. 改进：取流 `Content-Type`
+### 8. 改进：取流 `Content-Type`
 
 上游 `/v/api/v1/media/range` 一律返回 `application/octet-stream`。现按扩展名给真实 MIME（`video/mp4`、`video/x-matroska` 等），仅在通用类型时覆盖。
 
-### 8. 改进：音轨兼容性提示
+### 9. 改进：音轨兼容性提示
 
 `DTS / TrueHD / FLAC / ALAC / PCM` 音轨的 `DisplayTitle` 追加 `· 需软解`，便于挑选。
 用 `AUDIO_TRACK_HINT=0` 关闭。**刻意不做自动切轨**——备选轨常是导演评论轨，自动切换会让人听到错误音轨。
@@ -266,7 +302,7 @@ cd .. && fnpack build --directory ./fpk/fnos-emby-bridge
 
 ## 与上游的差异
 
-见 [`fixes.patch`](fixes.patch)：6 个文件、**+947 / −39 行**，`patch -p1` 可干净应用到上游 `main`。
+见 [`fixes.patch`](fixes.patch)：6 个文件、**+1073 / −47 行**，`patch -p1` 可干净应用到上游 `main`。
 
 ---
 

@@ -389,6 +389,65 @@ func TestClientCompatEndpoints(t *testing.T) {
 	}
 }
 
+// 回归（fork 修复）：写操作的响应必须是 200 + UserItemDataDto 本体。
+//
+// 官方契约（betadev.emby.media → PlaystateService）：
+//   POST/DELETE /Users/{UserId}/PlayedItems/{Id} → 200 + UserItemDataDto
+//   "Operation successful. Returning a UserItemDataDto object."
+// 此前桥接返回 204 空响应，「标记未看」在 .NET 客户端（小幻影视）被判为操作失败；
+// FavoriteItems 则返回了自造的 {"Id":..,"UserData":{..}} 包装对象，同样不是官方模型。
+func TestWriteEndpointsReturnUserItemData(t *testing.T) {
+	fnSrv := httptest.NewServer(mock.NewHandler(false, ""))
+	defer fnSrv.Close()
+
+	client := fn.NewClient(fnSrv.URL)
+	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
+	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	bridge := httptest.NewServer(h.Handler())
+	defer bridge.Close()
+
+	cases := []struct{ method, path, body string }{
+		{"DELETE", "/Users/u/PlayedItems/fv_001", ""},
+		{"POST", "/Users/u/PlayedItems/fv_001", ""},
+		{"POST", "/Users/u/FavoriteItems/fv_001", ""},
+		{"DELETE", "/Users/u/FavoriteItems/fv_001", ""},
+		{"POST", "/Users/u/Items/fv_001/UserData", `{"Played":false}`},
+	}
+	for _, c := range cases {
+		req, err := http.NewRequest(c.method, bridge.URL+c.path, strings.NewReader(c.body))
+		if err != nil {
+			t.Fatalf("构造请求失败: %v", err)
+		}
+		if c.body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s 请求失败: %v", c.method, c.path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s %s 应返回 200（官方契约是 200 + UserItemDataDto；204/空响应会被 .NET 客户端判为操作失败），实际 %d",
+				c.method, c.path, resp.StatusCode)
+		}
+		var dto map[string]any
+		if err := json.Unmarshal(body, &dto); err != nil {
+			t.Fatalf("%s %s 响应不是 JSON 对象: %s", c.method, c.path, body)
+		}
+		if _, wrapped := dto["UserData"]; wrapped {
+			t.Fatalf("%s %s 返回了包装对象，应为 UserItemDataDto 本体: %s", c.method, c.path, body)
+		}
+		// ServerId 官方注释 "Used only by our Windows app" —— Windows 客户端会读
+		for _, k := range []string{"PlaybackPositionTicks", "PlayCount", "IsFavorite", "Played", "Key", "ItemId", "ServerId"} {
+			if _, ok := dto[k]; !ok {
+				t.Fatalf("%s %s 的 UserItemDataDto 缺字段 %s: %s", c.method, c.path, k, body)
+			}
+		}
+	}
+}
+
 // 回归（fork 修复）：UserData 的必需字段必须齐全。
 //
 // 客户端（实测小幻影视 Sprout 的 ProductMetadataUserStateProjection.

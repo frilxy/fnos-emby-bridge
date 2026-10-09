@@ -257,6 +257,11 @@ func (h *Handler) Routes() *http.ServeMux {
 	// Emby 标准路径 POST/DELETE /Users/{uid}/FavoriteItems/{id}
 	mux.HandleFunc("POST /Users/{uid}/FavoriteItems/{id}", h.handleFavorite)
 	mux.HandleFunc("DELETE /Users/{uid}/FavoriteItems/{id}", h.handleFavorite)
+	// 更新用户播放状态（Emby/Jellyfin 标准）：POST /Users/{uid}/Items/{id}/UserData
+	// 客户端「标记已看/未看」的另一条常用路径，body 形如
+	// {"Played":false} / {"PlaybackPositionTicks":0} / {"IsFavorite":true}
+	mux.HandleFunc("POST /Users/{uid}/Items/{id}/UserData", h.handleUpdateUserData)
+	mux.HandleFunc("POST /Items/{id}/UserData", h.handleUpdateUserData)
 	// 元数据刷新（详情页下拉刷新 → 飞牛 item/refresh）
 	mux.HandleFunc("POST /Items/{id}/Refresh", h.handleRefresh)
 	// 主题音乐/主题视频：web 客户端详情页必调，读 ThemeVideosResult.Items
@@ -291,6 +296,12 @@ func (h *Handler) handleFallback(w http.ResponseWriter, r *http.Request) {
 	}
 	// 已看标记：POST /Users/{uid}/PlayedItems/{id}（看完）→ 飞牛 item/watched + 进度写满；
 	// DELETE（取消已看）→ 清进度。真机抓包：飞牛播放器播完调 item/watched 同效果
+	//
+	// ⚠️ fork 修复：官方契约是 **200 + UserItemDataDto**，不是 204 空响应。
+	// 见 betadev.emby.media → PlaystateService/postUsersByUseridPlayeditemsById：
+	//   "200 | UserItemDataDto | Operation successful. Returning a UserItemDataDto object."
+	// .NET 客户端（小幻影视）按该模型反序列化并校验必需字段，拿到 204 空 body 会判成
+	// 「操作失败」—— 这正是「标记未看提示操作失败」的原因。
 	if m := playedItemsRe.FindStringSubmatch(r.URL.Path); m != nil {
 		id := m[1]
 		ctx := r.Context()
@@ -300,7 +311,7 @@ func (h *Handler) handleFallback(w http.ResponseWriter, r *http.Request) {
 			}
 			_ = h.fnOf(ctx).WatchItem(ctx, id)
 			touchProgress(id)
-			w.WriteHeader(http.StatusNoContent)
+			writeJSON(w, http.StatusOK, h.userItemDataDTOOf(ctx, id, true))
 			return
 		}
 		if r.Method == http.MethodDelete {
@@ -314,7 +325,7 @@ func (h *Handler) handleFallback(w http.ResponseWriter, r *http.Request) {
 			resumeMu.Lock()
 			resumeAt = time.Time{}
 			resumeMu.Unlock()
-			w.WriteHeader(http.StatusNoContent)
+			writeJSON(w, http.StatusOK, h.userItemDataDTOOf(ctx, id, false))
 			return
 		}
 	}
@@ -328,7 +339,11 @@ func (h *Handler) handleFallback(w http.ResponseWriter, r *http.Request) {
 }
 
 // playedItemsRe 匹配 /Users/{uid}/PlayedItems/{id}（大小写归一发生在路由层之前）。
-var playedItemsRe = regexp.MustCompile(`(?i)^/Users/[^/]+/PlayedItems/([0-9a-fA-F]+)$`)
+//
+// id 段用 [^/]+ 而不是 [0-9a-fA-F]+：飞牛 guid 是 32 位 hex，但桥接也会遇到
+// mock / 非标准 id；一旦正则不匹配就会静默落到「写操作 204 兜底」，
+// 表面成功、实际什么都没做（客户端随后提示操作失败），排查成本极高。
+var playedItemsRe = regexp.MustCompile(`(?i)^/Users/[^/]+/PlayedItems/([^/]+)$`)
 
 // Handler 返回包了 /emby 前缀剥离 + 大小写归一 + 请求日志的完整 handler。
 // Emby 官方客户端（Android/iOS/TV/Web）所有请求都带 /emby 前缀，必须兼容。
@@ -647,27 +662,133 @@ func (h *Handler) handleBrandingIcon(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(png1x1())
 }
 
-// handleFavorite 收藏/取消收藏：POST/DELETE /Users/{uid}/FavoriteItems/{id}
-// → 飞牛 PUT/DELETE item/favorite（真机抓包 body 只有 item_guid）。
-// 返回最小 UserItem（客户端读 UserData.IsFavorite 更新 UI）。
+// handleFavorite 收藏/取消收藏：POST/DELETE /Users/{uid}/FavoriteItems/{id}。
+//
+// ⚠️ fork 修复：官方契约同样是 **200 + UserItemDataDto**（不是包装对象）。
+// 此前返回 {"Id":..,"UserData":{..}}，.NET 客户端按 UserItemDataDto 反序列化会得到
+// 全空字段 → 必需字段校验失败。改为直接返回官方模型，与 PlayedItems 保持一致。
 func (h *Handler) handleFavorite(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	on := r.Method == http.MethodPost
 	if err := h.fnOf(r.Context()).SetFavorite(r.Context(), id, on); err != nil {
 		log.Printf("[favorite] %s %s: %v", r.Method, id, err)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"Id": id,
-		"UserData": map[string]any{
-			"Key":                   id,
-			"ItemId":                id,
-			"Played":                false,
-			"PlayCount":             0,
-			"IsFavorite":            on,
-			"Likes":                 on,
-			"PlaybackPositionTicks": 0,
-		},
-	})
+	played := false
+	if m, err := h.fnOf(r.Context()).ItemDetail(r.Context(), id); err == nil && m != nil {
+		played = m.Watched != 0 || m.IsWatched != 0
+	}
+	dto := h.userItemDataDTOOf(r.Context(), id, played)
+	dto["IsFavorite"] = on // 刚改过，以入参为准（ItemDetail 可能还没反映）
+	dto["Likes"] = on
+	writeJSON(w, http.StatusOK, dto)
+}
+
+// handleUpdateUserData 实现 POST /Users/{uid}/Items/{id}/UserData。
+//
+// Emby/Jellyfin 标准的「更新用户播放状态」端点，客户端用它设置 Played /
+// PlaybackPositionTicks / IsFavorite（「标记已看/未看」的另一条常用路径）。
+// 此前未注册 → 落到非 GET 的 204 静默兜底：表面成功、实际什么都没做，
+// 客户端刷新后发现状态没变就会提示操作失败。
+//
+// 官方契约：200 + UserItemDataDto。
+func (h *Handler) handleUpdateUserData(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	ctx := r.Context()
+
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	var req struct {
+		Played                *bool  `json:"Played"`
+		PlaybackPositionTicks *int64 `json:"PlaybackPositionTicks"`
+		IsFavorite            *bool  `json:"IsFavorite"`
+	}
+	_ = json.Unmarshal(body, &req)
+
+	switch {
+	case req.Played != nil && *req.Played:
+		if info, err := h.fnOf(ctx).PlayInfoByGuid(ctx, id); err == nil {
+			_ = h.fnOf(ctx).RecordProgress(ctx, id, info.MediaGuid, playInfoSeconds(info), playInfoSeconds(info))
+		}
+		_ = h.fnOf(ctx).WatchItem(ctx, id)
+		touchProgress(id)
+	case req.Played != nil: // 显式 false = 取消已看
+		if err := h.fnOf(ctx).UnwatchItem(ctx, id); err != nil {
+			log.Printf("[userdata] 取消已看 %s: %v", id, err)
+		}
+		if info, err := h.fnOf(ctx).PlayInfoByGuid(ctx, id); err == nil {
+			_ = h.fnOf(ctx).RecordProgress(ctx, id, info.MediaGuid, 0, playInfoSeconds(info))
+		}
+		resumeMu.Lock()
+		resumeAt = time.Time{}
+		resumeMu.Unlock()
+	case req.PlaybackPositionTicks != nil:
+		if info, err := h.fnOf(ctx).PlayInfoByGuid(ctx, id); err == nil {
+			_ = h.fnOf(ctx).RecordProgress(ctx, id, info.MediaGuid,
+				*req.PlaybackPositionTicks/10_000_000, playInfoSeconds(info))
+			touchProgress(id)
+		}
+	}
+
+	if req.IsFavorite != nil {
+		if err := h.fnOf(ctx).SetFavorite(ctx, id, *req.IsFavorite); err != nil {
+			log.Printf("[userdata] 收藏 %s: %v", id, err)
+		}
+	}
+
+	played := false
+	if req.Played != nil {
+		played = *req.Played
+	} else if m, err := h.fnOf(ctx).ItemDetail(ctx, id); err == nil && m != nil {
+		played = m.Watched != 0 || m.IsWatched != 0
+	}
+	dto := h.userItemDataDTOOf(ctx, id, played)
+	if req.IsFavorite != nil {
+		dto["IsFavorite"] = *req.IsFavorite // 刚改过，以入参为准
+		dto["Likes"] = *req.IsFavorite
+	}
+	writeJSON(w, http.StatusOK, dto)
+}
+
+// userItemDataDTO 构造 Emby 官方 UserItemDataDto 的完整字段集。
+//
+// 字段表见 betadev.emby.media → MediaBrowser.Model.Dto.UserItemDataDto：
+// Rating / PlayedPercentage / UnplayedItemCount / PlaybackPositionTicks /
+// PlayCount / IsFavorite / Likes / LastPlayedDate / Played / Key / ItemId / ServerId。
+//
+// 两点关键：
+//  1. ServerId 官方注明 "Used only by our Windows app" —— Windows 客户端
+//     （小幻影视）会读，必须给，否则它无法关联服务器。
+//  2. PlaybackPositionTicks / PlayCount / IsFavorite / Played 是客户端校验的必需字段，
+//     **值为 0/false 也必须输出**：缺字段会被判 incomplete required user state。
+func (h *Handler) userItemDataDTO(guid string, played, favorite bool, positionTicks int64) map[string]any {
+	return map[string]any{
+		"Key":                   guid,
+		"ItemId":                guid,
+		"ServerId":              h.ServerID,
+		"Played":                played,
+		"PlayCount":             playCountOf(played),
+		"IsFavorite":            favorite,
+		"PlaybackPositionTicks": positionTicks,
+	}
+}
+
+// userItemDataDTOOf 在 userItemDataDTO 基础上补齐当前收藏状态与续播位置。
+// 标记已看/未看的响应要反映**操作后**的真实状态——客户端会直接拿它刷新界面。
+func (h *Handler) userItemDataDTOOf(ctx context.Context, guid string, played bool) map[string]any {
+	favorite := false
+	position := int64(0)
+	if m, err := h.fnOf(ctx).ItemDetail(ctx, guid); err == nil && m != nil {
+		favorite = m.IsFavorite != 0
+		if played {
+			total := int64(m.Duration)
+			if total == 0 && m.Runtime > 0 {
+				total = int64(m.Runtime) * 60
+			}
+			if total > 0 {
+				position = total * 10_000_000
+			}
+		}
+	}
+	return h.userItemDataDTO(guid, played, favorite, position)
 }
 
 // handleRefresh 元数据刷新：POST /Items/{id}/Refresh → 飞牛 item/refresh。
