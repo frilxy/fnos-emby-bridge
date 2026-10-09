@@ -1,5 +1,5 @@
 appname               = fnos-emby-bridge
-version               = 1.0.9
+version               = 1.0.10
 display_name          = 飞牛影视 Emby 桥接
 desc                  = 把飞牛影视（fnOS）媒体库以 Emby 协议暴露出来，供 Infuse、VidHub、Yamby、小幻影视、爆米花等第三方客户端直接连接与播放。社区维护版，已修复一批客户端兼容问题。不做转码，播放取决于客户端解码能力。
 platform              = x86
@@ -11,4 +11,4 @@ desktop_uidir         = ui
 desktop_applaunchname = fnos-emby-bridge.Application
 service_port          = 8096
 ctl_stop              = true
-changelog             = 1.0.9：品牌统一为「飞牛影视 Emby 桥接」，更换应用图标，后台界面同步。1.0.8：修正 /Videos/{id}/AdditionalParts 与 /Items/{id}/CriticReviews 的形状（官方为 QueryResult 对象，此前误改为数组导致客户端解析失败）。1.0.7：写操作（标记已看/未看/收藏）改为返回 200 + UserItemDataDto，修复「操作失败」。1.0.6：补齐 UserData 必需字段（PlayCount 等），修复影视详情页一直加载。1.0.4/1.0.5：补齐 /UserViews、/Items/Filters 等客户端必经端点。
+changelog             = 1.0.10：与 1.0.9 源码相同，重新发布并附上构建产物（1.0.9 的 Release 在整理 tag 时丢了附件）。1.0.9：品牌统一为「飞牛影视 Emby 桥接」，图标统一由 fpk/图标.jpg 派生，打包迁到 GitHub Actions。1.0.8：修正 /Videos/{id}/AdditionalParts 与 /Items/{id}/CriticReviews 的形状（官方为 QueryResult 对象）。1.0.7：写操作返回 200 + UserItemDataDto，修复「标记已看/未看/收藏」操作失败。1.0.6：补齐 UserData 必需字段，修复影视详情页一直加载。
