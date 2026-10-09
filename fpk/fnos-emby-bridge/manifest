@@ -1,0 +1,14 @@
+appname               = fnos-emby-bridge
+version               = 1.0.3
+display_name          = Emby 桥接（飞牛影视）
+desc                  = 把飞牛影视包装成 Emby/Jellyfin 兼容服务端，让 Infuse、Yamby、爆米花等第三方播放器直接播放飞牛影视媒体库。本包为社区 fork，修复了播放地址拼接、其他视频类库空白、HEAD 取流挂死、后台 panic 四个问题。
+platform              = x86
+source                = thirdparty
+maintainer            = fnos-emby-bridge fork
+maintainer_url        = https://github.com/ssabv/fnos-emby-bridge
+os_min_version        = 1.2.0
+desktop_uidir         = ui
+desktop_applaunchname = fnos-emby-bridge.Application
+service_port          = 8096
+ctl_stop              = true
+changelog             = 1.0.3：Other（其他视频）类库按 Emby 定义归为混合内容（不声明 CollectionType），并为库级浏览增加空结果兜底，修复该类库点进去一片空白。1.0.1：修复畸形播放地址导致的点开视频无法播放（返回 200+空 JSON）、HEAD 取流挂死、后台连接页 panic；取流返回真实 MIME；音轨兼容性提示。

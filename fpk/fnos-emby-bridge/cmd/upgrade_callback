@@ -1,0 +1,5 @@
+#!/bin/bash
+# 升级后：数据与配置迁移保持幂等；这里只需确保目录存在。
+set -u
+mkdir -p "${TRIM_PKGVAR}" 2>/dev/null
+exit 0

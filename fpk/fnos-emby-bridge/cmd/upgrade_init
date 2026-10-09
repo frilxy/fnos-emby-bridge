@@ -1,0 +1,9 @@
+#!/bin/bash
+# 升级前：备份现有配置，保证可回滚。
+set -u
+VAR_DIR="${TRIM_PKGVAR}"
+ENV_FILE="${VAR_DIR}/bridge.env"
+if [ -r "${ENV_FILE}" ]; then
+    cp -f "${ENV_FILE}" "${ENV_FILE}.bak" 2>/dev/null
+fi
+exit 0

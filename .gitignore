@@ -1,15 +1,22 @@
-.DS_Store
-*.exe
-*.exe~
-admin-debug.js
-admin-debug.png
-admin-access.png
-probe.txt
-fn-index.js
+# 构建缓存 / 工具链（不入库）
+gocache/
+gopath/
+toolchain/
+
+# 打包中间产物（build.sh 会生成；dist/ 里保留最终产物）
+fpk/*.fpk
+fpk/fnos-emby-bridge/app/server/fnos-emby-bridge
+
+# 运行时产物
+*.pid
+*.log
 bridge-config.json
-bridge-test-config.json
-bridge-sessions.json
+bridge-config.json.tmp
+bridge.env
+bridge.env.bak
+admin.pass
 bridge-progress.json
-internal/emby/bridge-sessions.json
-internal/emby/bridge-progress.json
-.tmp-browser/
+bridge-sessions.json
+
+# 系统杂物
+.DS_Store

@@ -1,0 +1,4 @@
+#!/bin/bash
+# 配置修改前：不做校验以外的动作（真正的值在 config_callback 落盘）。
+set -u
+exit 0

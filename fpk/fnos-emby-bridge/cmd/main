@@ -1,0 +1,143 @@
+#!/bin/bash
+# fnos-emby-bridge 生命周期脚本
+# 依据飞牛 fnOS 应用规范：run-as=package、TRIM_* 目录、start/stop/status 语义。
+set -u
+
+APPNAME="fnos-emby-bridge"
+APP_BIN="${TRIM_APPDEST}/server/${APPNAME}"
+VAR_DIR="${TRIM_PKGVAR}"
+PID_FILE="${VAR_DIR}/app.pid"
+LOG_FILE="${VAR_DIR}/service.log"
+ENV_FILE="${VAR_DIR}/bridge.env"
+PASS_FILE="${VAR_DIR}/admin.pass"
+DEFAULT_PORT="8096"
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"
+}
+
+# 只接受白名单键，逐行解析（不用 source/eval，避免密码中的特殊字符被执行）
+load_env() {
+    [ -r "${ENV_FILE}" ] || return 0
+    while IFS= read -r line; do
+        case "${line}" in ''|'#'*) continue ;; esac
+        key="${line%%=*}"
+        val="${line#*=}"
+        case "${key}" in
+            PORT|ADMIN_USER|ADMIN_PASS|FNOS_BASE|FNOS_USER|FNOS_PASS|HOST|AUDIO_TRACK_HINT)
+                export "${key}=${val}" ;;
+        esac
+    done < "${ENV_FILE}"
+}
+
+is_running() {
+    [ -f "${PID_FILE}" ] || return 1
+    pid="$(head -n 1 "${PID_FILE}" 2>/dev/null | tr -d '[:space:]')"
+    [ -n "${pid}" ] || return 1
+    kill -0 "${pid}" 2>/dev/null
+}
+
+gen_pass() {
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex 8
+    else
+        head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n'
+    fi
+}
+
+start_process() {
+    if is_running; then
+        return 0
+    fi
+
+    mkdir -p "${VAR_DIR}" 2>/dev/null
+
+    if [ ! -x "${APP_BIN}" ]; then
+        echo "应用可执行文件缺失或不可执行：${APP_BIN}" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
+        log_msg "ERROR: ${APP_BIN} missing or not executable"
+        return 1
+    fi
+
+    # 连接与端口配置：bridge.env（安装向导写入）优先，其次环境变量，最后默认值
+    load_env
+    export PORT="${PORT:-${DEFAULT_PORT}}"
+    export CONFIG_PATH="${CONFIG_PATH:-${VAR_DIR}/bridge-config.json}"
+    export ADMIN_USER="${ADMIN_USER:-admin}"
+
+    newly_generated=0
+    if [ -z "${ADMIN_PASS:-}" ]; then
+        if [ -r "${PASS_FILE}" ]; then
+            ADMIN_PASS="$(cat "${PASS_FILE}")"
+        else
+            ADMIN_PASS="$(gen_pass)"
+            printf '%s' "${ADMIN_PASS}" > "${PASS_FILE}"
+            chmod 600 "${PASS_FILE}" 2>/dev/null
+            newly_generated=1
+        fi
+        export ADMIN_PASS
+    fi
+
+    rm -f "${PID_FILE}"
+    log_msg "Starting ${APPNAME} on port ${PORT} (config=${CONFIG_PATH})"
+    nohup "${APP_BIN}" >> "${LOG_FILE}" 2>&1 &
+    pid=$!
+    printf '%s' "${pid}" > "${PID_FILE}"
+
+    sleep 1
+    if ! kill -0 "${pid}" 2>/dev/null; then
+        rm -f "${PID_FILE}"
+        echo "服务启动失败：端口 ${PORT} 可能已被占用。详情见 ${LOG_FILE}" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
+        log_msg "ERROR: process exited immediately; port ${PORT} may be in use"
+        return 1
+    fi
+
+    log_msg "Started, pid=${pid}"
+    if [ "${newly_generated}" = "1" ]; then
+        log_msg "后台管理: http://<NAS_IP>:${PORT}/admin  账号: ${ADMIN_USER}  密码: ${ADMIN_PASS}  （同时保存在 ${PASS_FILE}）"
+        {
+            echo "Emby 桥接启动完成。"
+            echo "后台管理: http://<NAS_IP>:${PORT}/admin"
+            echo "账号: ${ADMIN_USER}   密码: ${ADMIN_PASS}"
+            echo "请登录后在「连接」页填写飞牛影视地址（形如 http://<NAS_IP>:8005）、账号与密码。"
+        } > "${TRIM_TEMP_LOGFILE:-/dev/null}"
+    fi
+    return 0
+}
+
+stop_process() {
+    if ! is_running; then
+        rm -f "${PID_FILE}"
+        return 0
+    fi
+
+    pid="$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')"
+    log_msg "Stopping pid=${pid}"
+    kill -TERM "${pid}" 2>/dev/null
+
+    count=0
+    while kill -0 "${pid}" 2>/dev/null && [ "${count}" -lt 15 ]; do
+        sleep 1
+        count=$((count + 1))
+    done
+
+    if kill -0 "${pid}" 2>/dev/null; then
+        log_msg "Force killing pid=${pid}"
+        kill -KILL "${pid}" 2>/dev/null
+    fi
+
+    rm -f "${PID_FILE}"
+    log_msg "Stopped"
+    return 0
+}
+
+case "${1:-}" in
+    start)  start_process ;;
+    stop)   stop_process ;;
+    status)
+        if is_running; then
+            exit 0
+        fi
+        exit 3
+        ;;
+    *)      exit 1 ;;
+esac

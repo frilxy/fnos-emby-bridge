@@ -1,0 +1,7 @@
+#!/bin/bash
+# 安装后：建立数据目录。不启动服务（由应用中心/用户操作触发 start）。
+set -u
+VAR_DIR="${TRIM_PKGVAR}"
+mkdir -p "${VAR_DIR}" 2>/dev/null
+chmod 700 "${VAR_DIR}" 2>/dev/null
+exit 0

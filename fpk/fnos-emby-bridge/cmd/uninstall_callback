@@ -1,0 +1,21 @@
+#!/bin/bash
+# 卸载后：仅当用户明确选择「删除数据」时才清理本应用自己的文件。
+# 默认保留（keep_data 非空且非 false/0 即视为保留），不触碰应用目录之外的任何数据。
+set -u
+VAR_DIR="${TRIM_PKGVAR}"
+
+keep="${keep_data:-${KEEP_DATA:-true}}"
+case "${keep}" in
+    false|False|FALSE|0|no|No|NO)
+        rm -f "${VAR_DIR}/bridge-config.json" \
+              "${VAR_DIR}/bridge-config.json.tmp" \
+              "${VAR_DIR}/bridge.env" "${VAR_DIR}/bridge.env.bak" \
+              "${VAR_DIR}/admin.pass" "${VAR_DIR}/app.pid" \
+              "${VAR_DIR}/service.log" \
+              "${VAR_DIR}/bridge-progress.json" "${VAR_DIR}/bridge-sessions.json" 2>/dev/null
+        ;;
+    *)
+        : # 保留
+        ;;
+esac
+exit 0

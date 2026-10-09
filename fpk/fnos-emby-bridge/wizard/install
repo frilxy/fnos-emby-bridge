@@ -1,0 +1,43 @@
+[
+  {
+    "stepTitle": "连接飞牛影视",
+    "items": [
+      {
+        "type": "text",
+        "field": "fnos_base",
+        "label": "飞牛影视地址（形如 http://192.168.1.10:8005，必须用局域网 IP，不能用 127.0.0.1）",
+        "rules": [
+          { "required": true, "message": "请填写飞牛影视地址" },
+          { "pattern": "^https?://.+", "message": "需要以 http:// 或 https:// 开头" }
+        ]
+      },
+      {
+        "type": "text",
+        "field": "fnos_user",
+        "label": "飞牛影视账号",
+        "rules": [
+          { "required": true, "message": "请填写飞牛影视账号" }
+        ]
+      },
+      {
+        "type": "password",
+        "field": "fnos_pass",
+        "label": "飞牛影视密码",
+        "rules": [
+          { "required": true, "message": "请填写飞牛影视密码" }
+        ]
+      }
+    ]
+  },
+  {
+    "stepTitle": "桥接后台",
+    "items": [
+      {
+        "type": "password",
+        "field": "admin_pass",
+        "label": "后台管理密码（用于打开 /admin 配置页；留空则首次启动自动生成随机密码）",
+        "rules": []
+      }
+    ]
+  }
+]

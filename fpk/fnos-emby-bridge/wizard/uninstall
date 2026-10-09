@@ -1,0 +1,13 @@
+[
+  {
+    "stepTitle": "卸载选项",
+    "items": [
+      {
+        "type": "switch",
+        "field": "keep_data",
+        "label": "保留配置数据（桥接连接配置与后台密码；关闭则一并删除）",
+        "rules": []
+      }
+    ]
+  }
+]
