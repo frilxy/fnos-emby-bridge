@@ -659,8 +659,13 @@ func (h *Handler) handleFavorite(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"Id": id,
 		"UserData": map[string]any{
-			"IsFavorite": on,
-			"Likes":      on,
+			"Key":                   id,
+			"ItemId":                id,
+			"Played":                false,
+			"PlayCount":             0,
+			"IsFavorite":            on,
+			"Likes":                 on,
+			"PlaybackPositionTicks": 0,
 		},
 	})
 }
@@ -686,7 +691,12 @@ func personToEmby(pd *fn.PersonDetail) map[string]any {
 		"IsFolder":                false,
 		"PrimaryImageAspectRatio": 0.6666666666666666,
 		"UserData": map[string]any{
-			"IsFavorite": pd.IsFavorite != 0,
+			"Key":                   pd.Guid,
+			"ItemId":                pd.Guid,
+			"Played":                false,
+			"PlayCount":             0,
+			"IsFavorite":            pd.IsFavorite != 0,
+			"PlaybackPositionTicks": 0,
 		},
 	}
 	if pd.Profile != "" {
@@ -2754,6 +2764,17 @@ func (h *Handler) serveSysImg(w http.ResponseWriter, r *http.Request, p string) 
 
 // ---- 转换 ----
 
+// playCountOf 已看完记 1 次播放，未看过记 0。
+//
+// ⚠️ 返回值必须**始终写进 UserData**，不能因为「值为 0/未看过」就省略字段：
+// 客户端会校验必需字段是否齐全，缺字段直接抛 incomplete required user state。
+func playCountOf(played bool) int {
+	if played {
+		return 1
+	}
+	return 0
+}
+
 // imageTags 生成 BaseItemDto.ImageTags：客户端只在 tag 非空时才发对应图片请求
 // （此前只填 Primary，Logo/Thumb 请求根本不会发出——Yamby "logo 没有了" 的根因）。
 // Primary=海报；Logo 用飞牛 logos 资源；Thumb/Backdrop/Art/Banner 用 backdrops
@@ -2847,7 +2868,9 @@ func toEmbyItemFromPlayInfo(info *fn.PlayInfo, h *Handler) map[string]any {
 		"LocationType":        "FileSystem",
 		"UserData": map[string]any{
 			"Key":                   info.Guid,
+			"ItemId":                info.Guid,
 			"Played":                info.Item.IsWatched != 0,
+			"PlayCount":             playCountOf(info.Item.IsWatched != 0),
 			"IsFavorite":            false,
 			"PlaybackPositionTicks": info.Ts * 10_000_000, // 续播位置（秒→ticks）
 		},
@@ -3096,10 +3119,20 @@ func toEmbyItemWithSeries(r *http.Request, m fn.MediaItem, seriesID string, h *H
 	}
 	// UserData（官方 UserItemDataDto）：Played/PlayCount/续播位置/收藏——
 	// 飞牛 ts=续播位置秒，watched=1 已看完
+	//
+	// ⚠️ fork 修复：PlayCount 必须**始终存在**（未看过写 0，不能缺字段）。
+	// 客户端（实测小幻影视 Sprout 的 ProductMetadataUserStateProjection.
+	// EnsureRequiredUserState）把 PlaybackPositionTicks / PlayCount / IsFavorite /
+	// Played 当作必需项，任一为 null 就抛
+	// InvalidOperationException: Emby item '...' returned incomplete required user state，
+	// 详情页直接加载失败。此前只在 played 时才写 PlayCount，未看过的条目因此缺该字段。
+	// ItemId 也是官方 UserItemDataDto 的字段，一并补齐。
 	played := m.Watched != 0 || m.IsWatched != 0
 	ud := map[string]any{
 		"Key":                   m.Guid,
+		"ItemId":                m.Guid,
 		"Played":                played,
+		"PlayCount":             0,
 		"IsFavorite":            m.IsFavorite != 0,
 		"PlaybackPositionTicks": m.Ts * 10_000_000,
 	}

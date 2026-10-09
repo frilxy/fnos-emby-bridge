@@ -389,6 +389,65 @@ func TestClientCompatEndpoints(t *testing.T) {
 	}
 }
 
+// 回归（fork 修复）：UserData 的必需字段必须齐全。
+//
+// 客户端（实测小幻影视 Sprout 的 ProductMetadataUserStateProjection.
+// EnsureRequiredUserState）会校验 PlaybackPositionTicks / PlayCount / IsFavorite /
+// Played，任一为 null 就抛
+// InvalidOperationException: Emby item '...' returned incomplete required user state，
+// 详情页直接加载失败。此前只在「已看完」时才写 PlayCount，未看过的条目缺该字段 ——
+// 这是「Yamby 正常但小幻影视打不开详情」的根因。
+func TestUserDataRequiredFields(t *testing.T) {
+	fnSrv := httptest.NewServer(mock.NewHandler(false, ""))
+	defer fnSrv.Close()
+
+	client := fn.NewClient(fnSrv.URL)
+	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
+	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	bridge := httptest.NewServer(h.Handler())
+	defer bridge.Close()
+
+	// 覆盖电影 / 剧 / 集 与两条 item 路由
+	for _, p := range []string{
+		"/Users/u/Items/fv_001?EnableUserData=true",
+		"/Users/u/Items/fv_tv?EnableUserData=true",
+		"/Users/u/Items/fv_002?EnableUserData=true",
+		"/Items/fv_001?EnableUserData=true",
+		// 列表响应（走 Items 数组分支）
+		"/Users/u/Items?Recursive=true&IncludeItemTypes=Movie&EnableUserData=true",
+	} {
+		body := getJSON(t, bridge.URL+p)
+		var payload map[string]any
+		_ = json.Unmarshal(body, &payload)
+
+		checkUD := func(where string, ud map[string]any) {
+			for _, k := range []string{"PlaybackPositionTicks", "PlayCount", "IsFavorite", "Played", "Key"} {
+				if _, ok := ud[k]; !ok {
+					t.Fatalf("%s 的 UserData 缺必需字段 %s（客户端会抛 incomplete required user state）：%s", where, k, body)
+				}
+			}
+		}
+
+		if ud, ok := payload["UserData"].(map[string]any); ok {
+			checkUD(p, ud)
+			continue
+		}
+		// 列表响应：逐个条目校验
+		items, _ := payload["Items"].([]any)
+		if len(items) == 0 {
+			t.Fatalf("%s 无条目可校验：%s", p, body)
+		}
+		for i, raw := range items {
+			it, _ := raw.(map[string]any)
+			ud, ok := it["UserData"].(map[string]any)
+			if !ok {
+				t.Fatalf("%s 第 %d 条缺 UserData：%s", p, i, body)
+			}
+			checkUD(p, ud)
+		}
+	}
+}
+
 // 云盘直链路径：mock 返回夸克直链，桥接应直连 mock CDN（ChunkedProxy），透传字节。
 func TestBridgeCloudDirectLink(t *testing.T) {
 	// CDN 与飞牛同域：先建 mock 飞牛服务，再用其 URL 作为 cdnBase。

@@ -85,7 +85,38 @@ GET .../Items?ParentId=<库>&IncludeItemTypes=Video         → 95 条
 
 日志：`[items] IncludeItemTypes="Movie,Series" 过滤后为空，库 lib_other 回退为不过滤（1 条）`
 
-### 3. 小幻影视等客户端打不开媒体库 / 影视详情
+### 3. 小幻影视打不开影视详情（**UserData 字段不全** ← 真正的根因）
+
+**现象**：Yamby 一切正常，小幻影视（Rodel Player，Windows）能登录、能列出媒体库，
+但**点开任意条目详情页一直转圈**。
+
+**定位**：让它走一个落日志的反向代理，再导出小幻影视自己的日志，异常写得很清楚：
+
+```
+System.InvalidOperationException: Emby item '73b9597b...' returned incomplete required user state.
+   at RodelPlayer.SproutHost.Metadata.ProductMetadataUserStateProjection
+        .EnsureRequiredUserState(String, String, Nullable, Nullable, Nullable, Nullable)
+   at RodelPlayer.SproutHost.Metadata.ProductMetadataUserStateProjection.FromEmby(EmbyMediaItem)
+```
+
+**根因**：桥接的 `UserData`（Emby 官方 `UserItemDataDto`）**只在「已看完」时才写 `PlayCount`**，
+没看过的条目直接缺这个字段 → 客户端校验必需字段时判为 "incomplete" 抛异常。
+
+修复前 / 后对比（同一个未看过的条目）：
+
+```jsonc
+// 修复前：缺 PlayCount
+{"Key":"fv_001","Played":false,"IsFavorite":false,"PlaybackPositionTicks":0}
+// 修复后：必需字段齐全
+{"Key":"fv_001","ItemId":"fv_001","Played":false,"PlayCount":0,
+ "IsFavorite":false,"PlaybackPositionTicks":0}
+```
+
+`PlaybackPositionTicks` / `PlayCount` / `IsFavorite` / `Played` 四个字段**必须始终存在**，
+值为 0/false 也要写出来——**"字段缺失"和"值为 0"对客户端不是一回事**。
+另补上官方同样有的 `ItemId`。四处 `UserData` 构造点（列表/详情、play-infoo、人物、收藏响应）已统一。
+
+### 4. 小幻影视等客户端打不开媒体库
 
 **现象**：Yamby 一切正常，但小幻影视（Rodel Player）连上后打不开媒体库或详情页。
 
@@ -129,23 +160,23 @@ GET .../Items?ParentId=<库>&IncludeItemTypes=Video         → 95 条
 `ServerId` 改为由**飞牛地址 + 服务器名**派生的稳定 32 位 hex——同一套部署重启不变、
 不同部署不撞车（不能随机，否则客户端每次重启都会丢失服务器关联）。
 
-### 4. HEAD 取流请求挂死
+### 5. HEAD 取流请求挂死
 
 Go 的 `GET` 路由会一并匹配 `HEAD`，HEAD 不带 `Range` 时走完整 GET，把**整个文件**（实测 6.7GB）当响应体往外推，而 HEAD 不发送响应体 → 请求永不返回，部分播放器探测失败后判定「无法播放」。
 
 **修复**：HEAD 改为向飞牛只请求 `Range: bytes=0-0` 拿头部与总长度，不传字节。
 
-### 5. 后台连接页 panic
+### 6. 后台连接页 panic
 
 `main.go` 里 `client.Token[:8]` 在飞牛未登录（token 为空）时切片越界 panic。触发路径是 `GET /admin/api/connection`——**恰好是刚部署、还没配好连接时最需要打开的那一页**，结果是面板打不开、地址填不进去，形成死循环。
 
 **修复**：新增 `shortToken()`，三处 `[:8]` 全部加固。
 
-### 6. 改进：取流 `Content-Type`
+### 7. 改进：取流 `Content-Type`
 
 上游 `/v/api/v1/media/range` 一律返回 `application/octet-stream`。现按扩展名给真实 MIME（`video/mp4`、`video/x-matroska` 等），仅在通用类型时覆盖。
 
-### 7. 改进：音轨兼容性提示
+### 8. 改进：音轨兼容性提示
 
 `DTS / TrueHD / FLAC / ALAC / PCM` 音轨的 `DisplayTitle` 追加 `· 需软解`，便于挑选。
 用 `AUDIO_TRACK_HINT=0` 关闭。**刻意不做自动切轨**——备选轨常是导演评论轨，自动切换会让人听到错误音轨。
@@ -235,7 +266,7 @@ cd .. && fnpack build --directory ./fpk/fnos-emby-bridge
 
 ## 与上游的差异
 
-见 [`fixes.patch`](fixes.patch)：6 个文件、**+905 / −38 行**，`patch -p1` 可干净应用到上游 `main`。
+见 [`fixes.patch`](fixes.patch)：6 个文件、**+947 / −39 行**，`patch -p1` 可干净应用到上游 `main`。
 
 ---
 
