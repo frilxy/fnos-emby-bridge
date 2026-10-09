@@ -10,7 +10,7 @@
 //	HOST        客户端访问本桥接的主机:端口（用于拼绝对媒体/海报 URL），默认 127.0.0.1:PORT
 //	SERVER_NAME 显示的服务器名，默认 fnos
 //	ADMIN_USER /admin 后台账号，默认 admin
-//	ADMIN_PASS /admin 后台密码，默认 admin123
+//	ADMIN_PASS /admin 后台密码，**必填**（没有内置默认值：写死弱密码等于没有后台鉴权）
 //
 // 0.9.8 起媒体库通过 mediadb/list 自动列出，无需 SEED_GUIDS。
 //
@@ -64,12 +64,16 @@ func main() {
 	}
 	store := admin.LoadStore(cfgPath)
 	adminUser := os.Getenv("ADMIN_USER")
-	adminPass := os.Getenv("ADMIN_PASS")
 	if adminUser == "" {
 		adminUser = "admin"
 	}
+	// 后台密码必须显式提供：以前内置默认值 admin123，等于后台没有鉴权；
+	// 而生命周期脚本生成的随机密码又只写在文件里没人看得到，两者都不对。
+	adminPass := os.Getenv("ADMIN_PASS")
 	if adminPass == "" {
-		adminPass = "admin123"
+		log.Fatal("未设置后台密码。请通过环境变量 ADMIN_PASS 指定，" +
+			"或在飞牛「应用中心 → 飞牛影视 Emby 桥接 → 配置」里设置后台管理密码" +
+			"（用 .fpk 安装的由安装向导写入）。")
 	}
 	store.SetAdminCredentials(adminUser, adminPass)
 	if cc := store.Connection(); cc != nil {

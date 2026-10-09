@@ -7,7 +7,10 @@
         "field": "fnos_base",
         "label": "飞牛影视地址（留空则保持不变）",
         "rules": [
-          { "pattern": "^$|^https?://.+", "message": "需要以 http:// 或 https:// 开头" }
+          {
+            "pattern": "^$|^https?://.+",
+            "message": "需要以 http:// 或 https:// 开头"
+          }
         ]
       },
       {
@@ -21,12 +24,33 @@
         "field": "fnos_pass",
         "label": "飞牛影视密码（留空则保持不变）",
         "rules": []
+      }
+    ]
+  },
+  {
+    "stepTitle": "修改桥接后台账号（仅用于登录桥接后台，与飞牛影视账号无关）",
+    "items": [
+      {
+        "type": "text",
+        "field": "admin_user",
+        "label": "后台管理账号（留空则保持不变）",
+        "rules": [
+          {
+            "pattern": "^$|^[A-Za-z0-9._-]{2,32}$",
+            "message": "2-32 位，仅限字母、数字、点、下划线、短横线"
+          }
+        ]
       },
       {
         "type": "password",
         "field": "admin_pass",
-        "label": "后台管理密码（留空则保持不变）",
-        "rules": []
+        "label": "后台管理密码（留空则保持不变，至少 6 位）",
+        "rules": [
+          {
+            "pattern": "^$|^.{6,}$",
+            "message": "至少 6 位"
+          }
+        ]
       }
     ]
   }

@@ -10,7 +10,8 @@ services:
       # 连接和媒体库都可在后台填
       PORT: "8096"
       ADMIN_USER: "admin"
-      ADMIN_PASS: "admin123"
+      # 必填：留空程序会拒绝启动（不再有内置的弱默认密码）
+      ADMIN_PASS: "换成你自己的强密码"
       CONFIG_PATH: "/data/bridge-config.json"
     volumes:
       - ./data:/data

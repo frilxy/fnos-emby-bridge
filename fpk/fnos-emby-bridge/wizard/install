@@ -7,8 +7,14 @@
         "field": "fnos_base",
         "label": "飞牛影视地址（形如 http://192.168.1.10:8005，必须用局域网 IP，不能用 127.0.0.1）",
         "rules": [
-          { "required": true, "message": "请填写飞牛影视地址" },
-          { "pattern": "^https?://.+", "message": "需要以 http:// 或 https:// 开头" }
+          {
+            "required": true,
+            "message": "请填写飞牛影视地址"
+          },
+          {
+            "pattern": "^https?://.+",
+            "message": "需要以 http:// 或 https:// 开头"
+          }
         ]
       },
       {
@@ -16,7 +22,10 @@
         "field": "fnos_user",
         "label": "飞牛影视账号",
         "rules": [
-          { "required": true, "message": "请填写飞牛影视账号" }
+          {
+            "required": true,
+            "message": "请填写飞牛影视账号"
+          }
         ]
       },
       {
@@ -24,19 +33,46 @@
         "field": "fnos_pass",
         "label": "飞牛影视密码",
         "rules": [
-          { "required": true, "message": "请填写飞牛影视密码" }
+          {
+            "required": true,
+            "message": "请填写飞牛影视密码"
+          }
         ]
       }
     ]
   },
   {
-    "stepTitle": "桥接后台",
+    "stepTitle": "设置桥接后台账号（仅用于登录桥接后台，与飞牛影视账号无关）",
     "items": [
+      {
+        "type": "text",
+        "field": "admin_user",
+        "label": "后台管理账号（自行设定，例如 admin）",
+        "rules": [
+          {
+            "required": true,
+            "message": "请设置后台管理账号"
+          },
+          {
+            "pattern": "^[A-Za-z0-9._-]{2,32}$",
+            "message": "2-32 位，仅限字母、数字、点、下划线、短横线"
+          }
+        ]
+      },
       {
         "type": "password",
         "field": "admin_pass",
-        "label": "后台管理密码（用于打开 /admin 配置页；留空则首次启动自动生成随机密码）",
-        "rules": []
+        "label": "后台管理密码（自行设定，至少 6 位）",
+        "rules": [
+          {
+            "required": true,
+            "message": "请设置后台管理密码"
+          },
+          {
+            "pattern": "^.{6,}$",
+            "message": "至少 6 位"
+          }
+        ]
       }
     ]
   }

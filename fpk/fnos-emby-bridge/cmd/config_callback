@@ -1,13 +1,19 @@
 #!/bin/bash
-# 配置修改后：把向导字段落到 ${TRIM_PKGVAR}/bridge.env，并重启服务使其生效。
+# 配置修改后：把向导字段落到 ${TRIM_PKGETC}/bridge.env（配置目录），并重启服务使其生效。
 #
 # 字段名兼容：向导字段可能以原名传入，也可能带 wizard_ 前缀，两种都尝试。
 # 只保留白名单键，未提供的键沿用旧值（避免改一项把其它项清空）。
 set -u
 
-VAR_DIR="${TRIM_PKGVAR}"
-ENV_FILE="${VAR_DIR}/bridge.env"
-mkdir -p "${VAR_DIR}" 2>/dev/null
+ETC_DIR="${TRIM_PKGETC:-${TRIM_PKGVAR}}"
+VAR_DIR="${TRIM_PKGVAR:-${ETC_DIR}}"
+ENV_FILE="${ETC_DIR}/bridge.env"
+mkdir -p "${ETC_DIR}" 2>/dev/null
+
+# 旧版本把 bridge.env 放在 TRIM_PKGVAR，搬过来（幂等）
+if [ "${ETC_DIR}" != "${VAR_DIR}" ] && [ ! -e "${ENV_FILE}" ] && [ -e "${VAR_DIR}/bridge.env" ]; then
+    mv -f "${VAR_DIR}/bridge.env" "${ENV_FILE}" 2>/dev/null
+fi
 
 # 间接展开 ${!name}：按变量名取值，不用 eval
 pick() {
@@ -38,6 +44,7 @@ set_kv() { # key value
 v="$(pick fnos_base FNOS_BASE wizard_fnos_base wizard_FNOS_BASE)" && set_kv FNOS_BASE "${v}"
 v="$(pick fnos_user FNOS_USER wizard_fnos_user wizard_FNOS_USER)" && set_kv FNOS_USER "${v}"
 v="$(pick fnos_pass FNOS_PASS wizard_fnos_pass wizard_FNOS_PASS)" && set_kv FNOS_PASS "${v}"
+v="$(pick admin_user ADMIN_USER wizard_admin_user wizard_ADMIN_USER)" && set_kv ADMIN_USER "${v}"
 v="$(pick admin_pass ADMIN_PASS wizard_admin_pass wizard_ADMIN_PASS)" && set_kv ADMIN_PASS "${v}"
 v="$(pick port PORT wizard_port wizard_PORT)" && set_kv PORT "${v}"
 

@@ -1,5 +1,18 @@
 #!/bin/bash
-# 升级后：数据与配置迁移保持幂等；这里只需确保目录存在。
+# 升级后：确保目录存在，并把旧版本放在 TRIM_PKGVAR 的配置搬到 TRIM_PKGETC。
+# 幂等：只在目标不存在、源存在时移动。
 set -u
-mkdir -p "${TRIM_PKGVAR}" 2>/dev/null
+
+ETC_DIR="${TRIM_PKGETC:-${TRIM_PKGVAR}}"
+VAR_DIR="${TRIM_PKGVAR:-${ETC_DIR}}"
+
+mkdir -p "${ETC_DIR}" "${VAR_DIR}" 2>/dev/null
+
+if [ "${ETC_DIR}" != "${VAR_DIR}" ]; then
+    for f in bridge.env admin.pass bridge-config.json; do
+        if [ ! -e "${ETC_DIR}/${f}" ] && [ -e "${VAR_DIR}/${f}" ]; then
+            mv -f "${VAR_DIR}/${f}" "${ETC_DIR}/${f}" 2>/dev/null
+        fi
+    done
+fi
 exit 0

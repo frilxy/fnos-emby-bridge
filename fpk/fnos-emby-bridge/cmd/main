@@ -1,22 +1,61 @@
 #!/bin/bash
-# fnos-emby-bridge 生命周期脚本
+# 飞牛影视 Emby 桥接 —— 生命周期脚本
 # 依据飞牛 fnOS 应用规范：run-as=package、TRIM_* 目录、start/stop/status 语义。
+#
+# 目录划分（按飞牛规范：etc=配置、var=重启后保留的运行数据）：
+#   TRIM_PKGETC  bridge.env（连接配置 + 后台账号密码）
+#                admin.pass（当前生效的后台账号密码，便于查找）
+#                bridge-config.json（后台页面改过的连接配置）
+#   TRIM_PKGVAR  service.log、app.pid、bridge-progress.json、bridge-sessions.json
 set -u
 
 APPNAME="fnos-emby-bridge"
 APP_BIN="${TRIM_APPDEST}/server/${APPNAME}"
-VAR_DIR="${TRIM_PKGVAR}"
+
+ETC_DIR="${TRIM_PKGETC:-${TRIM_PKGVAR}}"
+VAR_DIR="${TRIM_PKGVAR:-${TRIM_APPDEST}}"
+HOME_DIR="${TRIM_PKGHOME:-${VAR_DIR}}"
+
+ENV_FILE="${ETC_DIR}/bridge.env"
+PASS_FILE="${ETC_DIR}/admin.pass"
 PID_FILE="${VAR_DIR}/app.pid"
 LOG_FILE="${VAR_DIR}/service.log"
-ENV_FILE="${VAR_DIR}/bridge.env"
-PASS_FILE="${VAR_DIR}/admin.pass"
 DEFAULT_PORT="8096"
 
 log_msg() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}" 2>/dev/null
 }
 
-# 只接受白名单键，逐行解析（不用 source/eval，避免密码中的特殊字符被执行）
+# 用户可见的失败：先写 TRIM_TEMP_LOGFILE（安装/配置向导会展示），再非零退出
+fail() {
+    echo "$1" > "${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+    log_msg "ERROR: $1"
+    exit 1
+}
+
+# 早期版本把配置和运行缓存都放在 TRIM_PKGVAR 或进程工作目录下，升级时搬到规范位置。
+# 幂等：只在「目标不存在、源存在」时移动，不会覆盖新位置的数据。
+migrate_layout() {
+    mkdir -p "${ETC_DIR}" "${VAR_DIR}" 2>/dev/null
+    if [ "${ETC_DIR}" != "${VAR_DIR}" ]; then
+        for f in bridge.env admin.pass bridge-config.json; do
+            if [ ! -e "${ETC_DIR}/${f}" ] && [ -e "${VAR_DIR}/${f}" ]; then
+                mv -f "${VAR_DIR}/${f}" "${ETC_DIR}/${f}" 2>/dev/null \
+                    && log_msg "moved ${f} to TRIM_PKGETC"
+            fi
+        done
+    fi
+    if [ "${HOME_DIR}" != "${VAR_DIR}" ]; then
+        for f in bridge-progress.json bridge-sessions.json; do
+            if [ ! -e "${VAR_DIR}/${f}" ] && [ -e "${HOME_DIR}/${f}" ]; then
+                mv -f "${HOME_DIR}/${f}" "${VAR_DIR}/${f}" 2>/dev/null
+            fi
+        done
+    fi
+    return 0
+}
+
+# 只接受白名单键，逐行解析（不用 source/eval，避免密码里的特殊字符被执行）
 load_env() {
     [ -r "${ENV_FILE}" ] || return 0
     while IFS= read -r line; do
@@ -37,48 +76,48 @@ is_running() {
     kill -0 "${pid}" 2>/dev/null
 }
 
-gen_pass() {
-    if command -v openssl >/dev/null 2>&1; then
-        openssl rand -hex 8
-    else
-        head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n'
-    fi
-}
-
 start_process() {
     if is_running; then
         return 0
     fi
 
-    mkdir -p "${VAR_DIR}" 2>/dev/null
+    migrate_layout
+    mkdir -p "${VAR_DIR}" "${ETC_DIR}" 2>/dev/null
 
     if [ ! -x "${APP_BIN}" ]; then
-        echo "应用可执行文件缺失或不可执行：${APP_BIN}" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
-        log_msg "ERROR: ${APP_BIN} missing or not executable"
-        return 1
+        fail "应用可执行文件缺失或不可执行：${APP_BIN}"
     fi
 
-    # 连接与端口配置：bridge.env（安装向导写入）优先，其次环境变量，最后默认值
     load_env
     export PORT="${PORT:-${DEFAULT_PORT}}"
-    export CONFIG_PATH="${CONFIG_PATH:-${VAR_DIR}/bridge-config.json}"
-    export ADMIN_USER="${ADMIN_USER:-admin}"
+    export ADMIN_USER="${ADMIN_USER:-}"
+    export CONFIG_PATH="${CONFIG_PATH:-${ETC_DIR}/bridge-config.json}"
 
-    newly_generated=0
-    if [ -z "${ADMIN_PASS:-}" ]; then
-        if [ -r "${PASS_FILE}" ]; then
-            ADMIN_PASS="$(cat "${PASS_FILE}")"
-        else
-            ADMIN_PASS="$(gen_pass)"
-            printf '%s' "${ADMIN_PASS}" > "${PASS_FILE}"
-            chmod 600 "${PASS_FILE}" 2>/dev/null
-            newly_generated=1
-        fi
-        export ADMIN_PASS
+    # 后台账号密码必须显式设置。这里不再自动生成随机密码：随机值写在文件里没人会看到，
+    # 反而与真正生效的凭据不一致（旧版本就有这个问题），只会造成困惑。
+    if [ -z "${ADMIN_USER}" ] || [ -z "${ADMIN_PASS:-}" ]; then
+        fail "后台账号或密码未设置。请打开「应用中心 → ${APPNAME} → 配置」，填写后台管理账号与密码后保存，服务会自动重启。"
     fi
+
+    # 历史版本 Go 端内置过 admin123 这个默认密码（等于后台没有鉴权）。升级后如果还沿用它，
+    # 等于白改，所以同样按「未设置」处理，逼出一次显式配置。
+    if [ "${ADMIN_PASS}" = "admin123" ]; then
+        fail "后台密码仍是旧版本内置的弱默认值 admin123。请打开「应用中心 → ${APPNAME} → 配置」，改成你自己的密码后保存，服务会自动重启。"
+    fi
+
+    # 把当前生效的后台凭据记到配置目录，便于查找；每次启动都刷新，始终与生效值一致
+    {
+        echo "账号: ${ADMIN_USER}"
+        echo "密码: ${ADMIN_PASS}"
+        echo "后台地址: http://<NAS_IP>:${PORT}/admin"
+    } > "${PASS_FILE}" 2>/dev/null
+    chmod 600 "${PASS_FILE}" 2>/dev/null
 
     rm -f "${PID_FILE}"
     log_msg "Starting ${APPNAME} on port ${PORT} (config=${CONFIG_PATH})"
+
+    # 固定工作目录：桥接写的会话/进度缓存落在这里，而不是继承来的不确定 CWD
+    cd "${VAR_DIR}" 2>/dev/null || true
     nohup "${APP_BIN}" >> "${LOG_FILE}" 2>&1 &
     pid=$!
     printf '%s' "${pid}" > "${PID_FILE}"
@@ -86,21 +125,16 @@ start_process() {
     sleep 1
     if ! kill -0 "${pid}" 2>/dev/null; then
         rm -f "${PID_FILE}"
-        echo "服务启动失败：端口 ${PORT} 可能已被占用。详情见 ${LOG_FILE}" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
-        log_msg "ERROR: process exited immediately; port ${PORT} may be in use"
-        return 1
+        fail "服务启动失败：端口 ${PORT} 可能已被占用。详情见 ${LOG_FILE}"
     fi
 
     log_msg "Started, pid=${pid}"
-    if [ "${newly_generated}" = "1" ]; then
-        log_msg "后台管理: http://<NAS_IP>:${PORT}/admin  账号: ${ADMIN_USER}  密码: ${ADMIN_PASS}  （同时保存在 ${PASS_FILE}）"
-        {
-            echo "Emby 桥接启动完成。"
-            echo "后台管理: http://<NAS_IP>:${PORT}/admin"
-            echo "账号: ${ADMIN_USER}   密码: ${ADMIN_PASS}"
-            echo "请登录后在「连接」页填写飞牛影视地址（形如 http://<NAS_IP>:8005）、账号与密码。"
-        } > "${TRIM_TEMP_LOGFILE:-/dev/null}"
-    fi
+    {
+        echo "飞牛影视 Emby 桥接 已启动。"
+        echo "后台管理: http://<NAS_IP>:${PORT}/admin"
+        echo "账号: ${ADMIN_USER}   密码: ${ADMIN_PASS}"
+        echo "（后台账号密码同样记录在 ${PASS_FILE}）"
+    } > "${TRIM_TEMP_LOGFILE:-/dev/null}"
     return 0
 }
 
