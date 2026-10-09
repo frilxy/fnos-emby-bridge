@@ -47,10 +47,18 @@ var (
 			"duration": 2700, "runtime": 45, "can_play": 1, "is_watched": 0,
 			"season_number": 1, "episode_number": 1, "air_date": "2024-02-01", "overview": "一集剧",
 			"tv_title": "剧集B"},
+		// fork 新增：Other 类库 —— 复现「点进媒体库一片空白」。
+		// 飞牛 Other 类库的条目 type=Video，桥接映射为 Emby Type=Video；
+		// 客户端若按 CollectionType 猜成 IncludeItemTypes=Movie,Series 就会全被过滤掉。
+		"lib_other": {"guid": "lib_other", "title": "其他库", "type": "MediaDB", "category": "Other"},
+		"fv_vid": {"guid": "fv_vid", "parent_guid": "lib_other", "title": "散装视频A", "type": "Video",
+			"poster": "/1c/09/mock_fvvid.webp", "duration": 1800, "runtime": 30,
+			"can_play": 1, "is_watched": 0, "overview": "一个散装视频"},
 	}
 	// ancestor_guid 模式（库 guid → 子条目）
 	mockAncestor = map[string][]string{
-		"lib_001": {"fv_001", "fv_tv"},
+		"lib_001":   {"fv_001", "fv_tv"},
+		"lib_other": {"fv_vid"},
 	}
 	// parent_guid 模式（剧 → 季、季 → 集）
 	mockParent = map[string][]string{
@@ -75,7 +83,20 @@ var (
 	records    []RecordEntry
 	loginMu    sync.Mutex
 	loginCount           = map[string]int{} // username → 真登录次数
+	rangeMu    sync.Mutex
+	lastRange            string // 最近一次 media/range 收到的 Range 头
 )
+
+// MockLastRangeHeader 返回最近一次 /v/api/v1/media/range 收到的 Range 头。
+//
+// fork 新增（回归测试用）：HEAD 取流必须用 bytes=0-0 向飞牛只要元数据；
+// 若返回空串，说明桥接正在按「完整文件」去拉上游 —— 真机上这会把
+// 整个文件当响应体推给 HEAD 请求，导致请求永不返回。
+func MockLastRangeHeader() string {
+	rangeMu.Lock()
+	defer rangeMu.Unlock()
+	return lastRange
+}
 
 // MockRecords 返回并清空 play/record 记录。
 func MockRecords() []RecordEntry {
@@ -101,9 +122,30 @@ func MockReset() {
 	loginMu.Lock()
 	loginCount = map[string]int{}
 	loginMu.Unlock()
+	rangeMu.Lock()
+	lastRange = ""
+	rangeMu.Unlock()
 }
 
-func NewHandler(cloudDirect bool, cdnBase string) *http.ServeMux {
+// Option 调整 mock 提供的夹具（默认与历史行为完全一致，避免影响既有断言）。
+type Option func(*mockOpts)
+
+type mockOpts struct {
+	otherLibrary bool
+}
+
+// WithOtherLibrary 额外提供一个 Other 类库（条目 type=Video）。
+// 用于回归「点进媒体库一片空白」：Other 类库此前不声明 CollectionType，
+// 客户端猜成 IncludeItemTypes=Movie,Series 会把 Type=Video 条目全过滤掉。
+func WithOtherLibrary() Option {
+	return func(o *mockOpts) { o.otherLibrary = true }
+}
+
+func NewHandler(cloudDirect bool, cdnBase string, opts ...Option) *http.ServeMux {
+	var o mockOpts
+	for _, fn := range opts {
+		fn(&o)
+	}
 	mux := http.NewServeMux()
 
 	// 0.9.8 登录：v2 + SHA256 密码
@@ -129,10 +171,16 @@ func NewHandler(cloudDirect bool, cdnBase string) *http.ServeMux {
 	})
 
 	mux.HandleFunc("GET /v/api/v1/mediadb/list", func(w http.ResponseWriter, r *http.Request) {
-		writeResult(w, 0, "", []map[string]any{
+		libs := []map[string]any{
 			{"guid": "lib_001", "title": "电影库", "category": "Movie", "view_type": 0,
 				"posters": []string{"/1c/09/mock_lib.webp"}},
-		})
+		}
+		if o.otherLibrary {
+			libs = append(libs, map[string]any{
+				"guid": "lib_other", "title": "其他库", "category": "Other", "view_type": 0,
+				"posters": []string{"/1c/09/mock_lib.webp"}})
+		}
+		writeResult(w, 0, "", libs)
 	})
 
 	mux.HandleFunc("POST /v/api/v1/item/list", func(w http.ResponseWriter, r *http.Request) {
@@ -243,6 +291,9 @@ func NewHandler(cloudDirect bool, cdnBase string) *http.ServeMux {
 
 	// 模拟视频字节流（真实飞牛是 mp4 文件，这里回 4KB 假数据；正确处理 Range）
 	mux.HandleFunc("GET /v/api/v1/media/range/{guid}", func(w http.ResponseWriter, r *http.Request) {
+		rangeMu.Lock()
+		lastRange = r.Header.Get("Range")
+		rangeMu.Unlock()
 		total := int64(4096)
 		buf := make([]byte, total)
 		for i := range buf {

@@ -1,0 +1,869 @@
+diff -ruN a/cmd/fnos-emby-bridge/main.go b/cmd/fnos-emby-bridge/main.go
+--- a/cmd/fnos-emby-bridge/main.go	2026-10-09 17:39:02.555487935 +0800
++++ b/cmd/fnos-emby-bridge/main.go	2026-10-09 17:39:02.563488588 +0800
+@@ -95,7 +95,7 @@
+ 		if err := client.Login(ctx, user, fn.SHA256Hex(pass)); err != nil {
+ 			log.Printf("飞牛登录失败：%v（可在后台修改连接）", err)
+ 		} else {
+-			log.Printf("飞牛登录成功，token=%s...", client.Token[:8])
++			log.Printf("飞牛登录成功，token=%s...", shortToken(client.Token))
+ 		}
+ 	}
+ 
+@@ -127,7 +127,7 @@
+ 				Base: base, User: user,
+ 				PassSet: pass != "",
+ 				OK:      client.Token != "",
+-				Token:   client.Token[:8],
++				Token:   shortToken(client.Token),
+ 			}
+ 			if cc != nil {
+ 				if cc.Base != "" {
+@@ -159,7 +159,7 @@
+ 			if err := store.SetConnection(newBase, newUser, effPass); err != nil {
+ 				log.Printf("[admin] 连接配置落盘: %v", err)
+ 			}
+-			log.Printf("[admin] 飞牛连接已切换：%s（token=%s...）", newBase, test.Token[:8])
++			log.Printf("[admin] 飞牛连接已切换：%s（token=%s...）", newBase, shortToken(test.Token))
+ 			return nil
+ 		},
+ 	})
+@@ -217,6 +217,18 @@
+ 	}
+ }
+ 
++// shortToken 取 token 前 8 位用于日志/后台展示。
++//
++// fork 修复：上游直接写 client.Token[:8]，当飞牛尚未登录成功（token 为空）时
++// 切片越界 panic。触发路径是后台 GET /admin/api/connection —— 也就是用户刚部署、
++// 还没配好连接时最需要打开的那一页：结果是面板打不开，配置填不进去，形成死循环。
++func shortToken(t string) string {
++	if len(t) <= 8 {
++		return t
++	}
++	return t[:8]
++}
++
+ // withCORS 给所有响应加 CORS 头，方便浏览器/网页版 Emby 客户端跨域访问。
+ func withCORS(next http.Handler) http.Handler {
+ 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+diff -ruN a/internal/emby/bridge_test.go b/internal/emby/bridge_test.go
+--- a/internal/emby/bridge_test.go	2026-10-09 17:39:02.559488262 +0800
++++ b/internal/emby/bridge_test.go	2026-10-09 17:39:02.567488915 +0800
+@@ -6,10 +6,12 @@
+ 	"io"
+ 	"net/http"
+ 	"net/http/httptest"
++	"net/url"
+ 	"strconv"
+ 	"strings"
+ 	"sync/atomic"
+ 	"testing"
++	"time"
+ 
+ 	"fnos-emby-bridge/internal/emby"
+ 	"fnos-emby-bridge/internal/fn"
+@@ -28,7 +30,9 @@
+ 	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
+ 
+ 	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+-	bridge := httptest.NewServer(h.Routes())
++	// 用 Handler() 而非 Routes()：生产入口是 Handler()（含 /emby 剥离、大小写归一、
++	// 畸形绝对 URL 还原三层中间件），裸路由表测不到这些中间件的行为。
++	bridge := httptest.NewServer(h.Handler())
+ 	defer bridge.Close()
+ 
+ 	// 3. 验证 /System/Info
+@@ -105,6 +109,52 @@
+ 		t.Fatalf("stream empty")
+ 	}
+ 
++	// 8b. 回归（fork 修复）：HEAD 取流必须立即返回元数据，不能挂起。
++	// 上游实现把 GET 路由一并匹配 HEAD，HEAD 无 Range 时把整个文件当响应体
++	// 往外推、而 HEAD 不发送响应体，请求永不返回（真机表现为 curl 超时、
++	// 部分播放器探测失败后判定「无法播放」）。
++	headClient := &http.Client{Timeout: 5 * time.Second}
++	hreq, _ := http.NewRequest("HEAD", bridge.URL+"/Videos/fv_001/stream?api_key=k", nil)
++	hresp, err := headClient.Do(hreq)
++	if err != nil {
++		t.Fatalf("HEAD stream 未能及时返回（疑似挂起）: %v", err)
++	}
++	hresp.Body.Close()
++	if hresp.StatusCode != 200 {
++		t.Fatalf("HEAD stream status=%d", hresp.StatusCode)
++	}
++	if got := hresp.Header.Get("Accept-Ranges"); got != "bytes" {
++		t.Fatalf("HEAD stream accept-ranges=%q", got)
++	}
++	if cl := hresp.Header.Get("Content-Length"); cl == "" || cl == "0" {
++		t.Fatalf("HEAD stream content-length=%q", cl)
++	}
++	// 关键判据：HEAD 只能向飞牛要 1 字节，绝不能按「完整文件」拉上游。
++	// mock 只有 4KB，光看响应快慢区分不出上游实现差异，所以直接断言上游收到的 Range。
++	if got := mock.MockLastRangeHeader(); got != "bytes=0-0" {
++		t.Fatalf("HEAD 向上游请求的 Range=%q，应为 bytes=0-0（否则真机上 HEAD 会拉整个文件并挂死）", got)
++	}
++
++	// 8c. HEAD + Range 应回 206 且 Content-Range 合法
++	hreq2, _ := http.NewRequest("HEAD", bridge.URL+"/Videos/fv_001/stream?api_key=k", nil)
++	hreq2.Header.Set("Range", "bytes=0-99")
++	hresp2, err := headClient.Do(hreq2)
++	if err != nil {
++		t.Fatalf("HEAD(range) stream: %v", err)
++	}
++	hresp2.Body.Close()
++	if hresp2.StatusCode != 206 {
++		t.Fatalf("HEAD(range) status=%d", hresp2.StatusCode)
++	}
++	if cr := hresp2.Header.Get("Content-Range"); !strings.HasPrefix(cr, "bytes 0-99/") {
++		t.Fatalf("HEAD(range) content-range=%q", cr)
++	}
++	if got := mock.MockLastRangeHeader(); got != "bytes=0-0" {
++		t.Fatalf("HEAD(range) 向上游请求的 Range=%q，应为 bytes=0-0", got)
++	}
++
++	// 8d. 畸形绝对 URL 路径的回归测试见 TestMangledAbsoluteURLPathRepaired（独立函数）
++
+ 	// 9. 验证 /Items/{id}/Progress 回传
+ 	resp3, _ := http.Post(bridge.URL+"/Items/fv_001/Progress?api_key=k", "application/json",
+ 		strings.NewReader(`{"PositionTicks":1200000000}`)) // 120s
+@@ -115,6 +165,126 @@
+ 	t.Logf("all emby endpoints ok against mock fnos")
+ }
+ 
++// 回归（fork 修复）：客户端把「绝对播放地址」拼到自己 base 后面，会产生
++// /embyhttp:/host/Videos/{id}/stream 这类畸形路径（Go 把请求行里的 // 归一成 /）。
++//
++// 上游行为：该路径不匹配任何路由 → 落到兜底 handler → 对 GET 返回
++// 200 + 空 QueryResult JSON。播放器拿到 49 字节 JSON 而非视频字节，
++// 而且状态码是 200，客户端连报错都没有，表现为「点开视频无法播放」。
++//
++// 修复：入站把 scheme+host 摘掉还原成真实路径，让请求进入 handleStream。
++// 独立成函数是为了能在上游代码上单独跑，确认它确实抓得到这个问题。
++func TestMangledAbsoluteURLPathRepaired(t *testing.T) {
++	fnSrv := httptest.NewServer(mock.NewHandler(false, ""))
++	defer fnSrv.Close()
++
++	client := fn.NewClient(fnSrv.URL)
++	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
++	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
++	bridge := httptest.NewServer(h.Handler())
++	defer bridge.Close()
++
++	mangled := &http.Request{
++		Method: "GET",
++		URL: &url.URL{
++			Scheme:   "http",
++			Host:     strings.TrimPrefix(bridge.URL, "http://"),
++			Path:     "/embyhttp:/192.168.10.229:8096/Videos/fv_001/stream",
++			RawQuery: "MediaSourceId=fv_001&Static=true",
++		},
++		Header: http.Header{},
++	}
++	mangled.Header.Set("Range", "bytes=0-100")
++
++	resp, err := http.DefaultClient.Do(mangled)
++	if err != nil {
++		t.Fatalf("畸形路径请求: %v", err)
++	}
++	body, _ := io.ReadAll(resp.Body)
++	resp.Body.Close()
++
++	if resp.StatusCode != 200 && resp.StatusCode != 206 {
++		t.Fatalf("畸形路径 status=%d body=%s", resp.StatusCode, body)
++	}
++	// 最关键的判据：绝不能是 JSON 兜底响应
++	if ct := resp.Header.Get("Content-Type"); strings.Contains(ct, "json") {
++		t.Fatalf("畸形路径落到了兜底(JSON)，未进入 handleStream: status=%d ct=%q body=%s",
++			resp.StatusCode, ct, body)
++	}
++	if len(body) == 0 {
++		t.Fatalf("畸形路径未返回视频字节: status=%d ct=%q", resp.StatusCode, resp.Header.Get("Content-Type"))
++	}
++	// 还原后仍应把客户端的 Range 正常透传给上游
++	if got := mock.MockLastRangeHeader(); got != "bytes=0-100" {
++		t.Fatalf("畸形路径还原后上游 Range=%q，应为 bytes=0-100", got)
++	}
++}
++
++// 回归（fork 修复）：飞牛 Other 类库（界面里叫「其他视频」）在 Emby 里没有对应类型，
++// 按 Emby 官方定义归为**混合内容**——即不声明 CollectionType
++// （"If CollectionType is null, it indicates a mixed movie/tv folder"）。
++//
++// 混合库会让客户端自行猜 IncludeItemTypes（多为 Movie,Series），而该类库条目是
++// Type=Video → 猜错就返回 0 条，表现为「点进媒体库一片空白，但首页能看到这些视频」。
++// 该问题由 handleItems 的库级浏览空结果兜底解决，不靠伪造 CollectionType。
++func TestOtherLibraryNotBlank(t *testing.T) {
++	fnSrv := httptest.NewServer(mock.NewHandler(false, "", mock.WithOtherLibrary()))
++	defer fnSrv.Close()
++
++	client := fn.NewClient(fnSrv.URL)
++	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
++	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
++	bridge := httptest.NewServer(h.Handler())
++	defer bridge.Close()
++
++	var views struct {
++		Items []map[string]any `json:"Items"`
++	}
++	var items struct {
++		Items            []map[string]any `json:"Items"`
++		TotalRecordCount int              `json:"TotalRecordCount"`
++	}
++
++	// 1) Other 类库应作为混合内容：不声明 CollectionType
++	body := getJSON(t, bridge.URL+"/Users/fnos-user/Views?api_key=k")
++	_ = json.Unmarshal(body, &views)
++	found := false
++	for _, v := range views.Items {
++		if v["Id"] != "lib_other" {
++			continue
++		}
++		found = true
++		if ct, ok := v["CollectionType"]; ok && ct != nil && ct != "" {
++			t.Fatalf("Other 类库应按混合内容处理（不声明 CollectionType），实际=%v；"+
++				"上报非空值（尤其 \"mixed\"）不在 Emby 的 CollectionType 响应枚举内，部分客户端会加载不了该库", ct)
++		}
++	}
++	if !found {
++		t.Fatalf("Views 里没有 lib_other：%s", body)
++	}
++
++	// 2) 客户端按猜错的类型（Movie,Series）请求时，库级浏览不能返回空白
++	body = getJSON(t, bridge.URL+"/Users/fnos-user/Items?ParentId=lib_other&IncludeItemTypes=Movie,Series&api_key=k")
++	_ = json.Unmarshal(body, &items)
++	if len(items.Items) == 0 {
++		t.Fatalf("IncludeItemTypes=Movie,Series 时 Other 库返回空白（应回退为该库真实内容）：%s", body)
++	}
++
++	// 3) 类型正确时（Video）走正常路径
++	body = getJSON(t, bridge.URL+"/Users/fnos-user/Items?ParentId=lib_other&IncludeItemTypes=Video&api_key=k")
++	_ = json.Unmarshal(body, &items)
++	if len(items.Items) == 0 {
++		t.Fatalf("IncludeItemTypes=Video 时 Other 库应有条目：%s", body)
++	}
++
++	// 4) 兜底只作用于库级浏览：不带 ParentId 的全局类型筛选仍应严格
++	body = getJSON(t, bridge.URL+"/Users/fnos-user/Items?IncludeItemTypes=MusicAlbum&api_key=k")
++	_ = json.Unmarshal(body, &items)
++	if len(items.Items) != 0 {
++		t.Fatalf("不带 ParentId 时不应触发空结果兜底：%s", body)
++	}
++}
++
+ // 云盘直链路径：mock 返回夸克直链，桥接应直连 mock CDN（ChunkedProxy），透传字节。
+ func TestBridgeCloudDirectLink(t *testing.T) {
+ 	// CDN 与飞牛同域：先建 mock 飞牛服务，再用其 URL 作为 cdnBase。
+diff -ruN a/internal/emby/fork_util_test.go b/internal/emby/fork_util_test.go
+--- a/internal/emby/fork_util_test.go	1970-01-01 08:00:00.000000000 +0800
++++ b/internal/emby/fork_util_test.go	2026-10-09 17:39:02.567488915 +0800
+@@ -0,0 +1,116 @@
++package emby
++
++import "testing"
++
++// fork 新增工具函数的单元测试（package emby 内部测试，可访问未导出符号）。
++
++func TestMimeForExt(t *testing.T) {
++	cases := map[string]string{
++		"mp4": "video/mp4", ".MP4": "video/mp4",
++		"mkv": "video/x-matroska", ".mkv": "video/x-matroska",
++		"webm": "video/webm", "mov": "video/quicktime",
++		"ts": "video/mp2t", "avi": "video/x-msvideo",
++		"": "", ".": "", "exe": "",
++	}
++	for in, want := range cases {
++		if got := mimeForExt(in); got != want {
++			t.Errorf("mimeForExt(%q)=%q want %q", in, got, want)
++		}
++	}
++}
++
++func TestGenericMime(t *testing.T) {
++	generic := []string{"", "  ", "application/octet-stream",
++		"application/octet-stream; charset=utf-8", "binary/octet-stream"}
++	for _, ct := range generic {
++		if !genericMime(ct) {
++			t.Errorf("genericMime(%q) 应为 true", ct)
++		}
++	}
++	specific := []string{"video/mp4", "video/x-matroska; codecs=h264", "image/png"}
++	for _, ct := range specific {
++		if genericMime(ct) {
++			t.Errorf("genericMime(%q) 应为 false", ct)
++		}
++	}
++}
++
++func TestParseTotalSize(t *testing.T) {
++	cases := map[string]int64{
++		"bytes 0-0/6721466674": 6721466674,
++		"bytes 100-199/4096":   4096,
++		"bytes */4096":         4096,
++		"":                     0,
++		"garbage":              0,
++		"bytes 0-0/0":          0,
++		"bytes 0-0/abc":        0,
++	}
++	for in, want := range cases {
++		if got := parseTotalSize(in); got != want {
++			t.Errorf("parseTotalSize(%q)=%d want %d", in, got, want)
++		}
++	}
++}
++
++func TestStripAbsoluteURLPrefix(t *testing.T) {
++	cases := []struct {
++		in   string
++		want string
++		ok   bool
++	}{
++		// 实测形态：Go 已把 "http://" 归一成 "http:/"
++		{"/embyhttp:/192.168.10.229:8096/Videos/x/Stream", "/Videos/x/Stream", true},
++		// 双斜杠形态（部分 HTTP 客户端/代理会保留）
++		{"/embyhttp://192.168.10.229:8096/Videos/x/stream", "/Videos/x/stream", true},
++		{"/http:/host:8096/Videos/x/stream", "/Videos/x/stream", true},
++		{"http:/host/Videos/x/stream", "/Videos/x/stream", true},
++		{"/embyhttps://nas.local/Videos/x/stream", "/Videos/x/stream", true},
++		// 畸形路径里再嵌一层 /emby 也要能还原（交给后续 stripEmbyPrefix 处理）
++		{"/embyhttp:/host/emby/Videos/x/stream", "/emby/Videos/x/stream", true},
++		// 正常路径不得被改动
++		{"/Videos/x/stream", "/Videos/x/stream", false},
++		{"/emby/Videos/x/stream", "/emby/Videos/x/stream", false},
++		{"/System/Info/Public", "/System/Info/Public", false},
++		{"/", "/", false},
++		// 只有 host 没有路径 → 不改
++		{"/embyhttp:/192.168.10.229:8096", "/embyhttp:/192.168.10.229:8096", false},
++	}
++	for _, c := range cases {
++		got, ok := stripAbsoluteURLPrefix(c.in)
++		if got != c.want || ok != c.ok {
++			t.Errorf("stripAbsoluteURLPrefix(%q) = (%q,%v), want (%q,%v)", c.in, got, ok, c.want, c.ok)
++		}
++	}
++}
++
++func TestAudioDisplayTitle(t *testing.T) {
++	// 默认开启：手机普遍无法直解的编码会被标注
++	hostile := []string{"dts", "DTS-HD", "truehd", "flac", "alac", "pcm_s24le"}
++	for _, c := range hostile {
++		got := audioDisplayTitle("国语 "+c, c)
++		if got == "国语 "+c {
++			t.Errorf("codec %q 应被标注，实际未变: %q", c, got)
++		}
++	}
++	// 广泛支持的编码不标注
++	for _, c := range []string{"aac", "mp3", "ac3", "eac3", "opus", "vorbis"} {
++		base := "国语 " + c
++		if got := audioDisplayTitle(base, c); got != base {
++			t.Errorf("codec %q 不应被标注，实际: %q", c, got)
++		}
++	}
++	// 空标题不应产生以分隔符开头的怪串
++	if got := audioDisplayTitle("", "truehd"); got != "需软解" {
++		t.Errorf("空标题 result=%q", got)
++	}
++	// 重复调用不叠加
++	once := audioDisplayTitle("国语", "dts")
++	if twice := audioDisplayTitle(once, "dts"); twice != once {
++		t.Errorf("重复标注: %q -> %q", once, twice)
++	}
++	// 可用环境变量关闭
++	t.Setenv("AUDIO_TRACK_HINT", "0")
++	if got := audioDisplayTitle("国语", "dts"); got != "国语" {
++		t.Errorf("AUDIO_TRACK_HINT=0 时应保持原样，实际 %q", got)
++	}
++}
+diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
+--- a/internal/emby/handler.go	2026-10-09 17:39:02.559488262 +0800
++++ b/internal/emby/handler.go	2026-10-09 17:39:02.567488915 +0800
+@@ -269,7 +269,9 @@
+ // Emby 官方客户端（Android/iOS/TV/Web）所有请求都带 /emby 前缀，必须兼容。
+ func (h *Handler) Handler() http.Handler {
+ 	// withSession 按请求 token 选定飞牛会话注入 ctx——多用户进度/收藏隔离的入口
+-	return logRequests(normalizePathCase(stripEmbyPrefix(h.withSession(h.Routes()))))
++	// repairMangledURLPath 紧随日志之后、最先改写路径：先把 "/embyhttp:/host/..."
++	// 还原成 "/Videos/..."，后续大小写归一与 /emby 剥离才能作用于真实路径。
++	return logRequests(repairMangledURLPath(normalizePathCase(stripEmbyPrefix(h.withSession(h.Routes())))))
+ }
+ 
+ // routeSegmentCase 已知路由静态段 小写→规范大小写（与 Routes() 注册一致）。
+@@ -330,6 +332,10 @@
+ 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		rw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+ 		start := time.Now()
++		// fork: 进站路径快照。内部中间件会重写 r.URL.Path（/emby 剥离、大小写归一、
++		// 畸形绝对 URL 修复），日志必须记录客户端真正发来的路径，
++		// 否则这类"路径拼接错"的问题在日志里会被抹掉、无从排查。
++		origPath := r.URL.Path
+ 		next.ServeHTTP(rw, r)
+ 		q := r.URL.RawQuery
+ 		if i := strings.Index(q, "api_key="); i >= 0 {
+@@ -349,7 +355,7 @@
+ 				cl = cl[:i]
+ 			}
+ 		}
+-		log.Printf("[http] %d %s %s?%s (%s) [%s]", rw.status, r.Method, r.URL.Path, q, time.Since(start).Round(time.Millisecond), cl)
++		log.Printf("[http] %d %s %s?%s (%s) [%s]", rw.status, r.Method, origPath, q, time.Since(start).Round(time.Millisecond), cl)
+ 	})
+ }
+ 
+@@ -399,6 +405,75 @@
+ 	})
+ }
+ 
++// repairMangledURLPath 修复「客户端把绝对播放地址拼到自己 base 后面」产生的畸形路径。
++//
++// 实测（Yamby + 本桥接）：
++//
++//	桥接返回 MediaSource.Path / DirectStreamUrl =
++//	    http://192.168.10.229:8096/Videos/{id}/stream?MediaSourceId=...&Static=true
++//	客户端基于自身 base（http://192.168.10.229:8096/emby）做字符串拼接，得到
++//	    http://192.168.10.229:8096/embyhttp://192.168.10.229:8096/Videos/{id}/stream?...
++//	Go 解析请求行时把 "//" 归一为 "/"，服务端实际收到：
++//	    /embyhttp:/192.168.10.229:8096/Videos/{id}/stream?...
++//
++// 这种路径不匹配任何已注册路由，会落到兜底 handler —— 兜底对 GET 返回
++// 200 + 空 QueryResult JSON，于是播放器拿到的是 49 字节 JSON 而不是视频字节，
++// 而且因为状态码是 200，客户端连报错都没有，表现为「点开视频无法播放」。
++//
++// 修复方式是在入站侧把 scheme+host 摘掉，还原成服务器内真实路径，
++// 让请求正常命中 handleStream。
++//
++// 为什么不在出站侧改成相对路径？因为 handlePlayback 处有明确注释：
++// 「Path 必须真实 URL：客户端直接交给播放器内核（fn:// 伪协议零请求失败）」——
++// 存在一类客户端会把 Path 原样交给播放器，改成相对路径会把它弄坏。
++// 入站修复可以让两类客户端同时工作。
++func repairMangledURLPath(next http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if p, ok := stripAbsoluteURLPrefix(r.URL.Path); ok {
++			log.Printf("[repair] 路径含绝对 URL 前缀，已还原: %s → %s", r.URL.Path, p)
++			r.URL.Path = p
++		}
++		next.ServeHTTP(w, r)
++	})
++}
++
++// stripAbsoluteURLPrefix 从形如 "/embyhttp:/host/xxx"、"/embyhttp://host/xxx"
++// 的畸形路径里剥掉 scheme+host，返回 "/xxx"。第二个返回值表示是否发生改写。
++// 注意 Go 会把请求行里的 "http://" 归一成 "http:/"，两种形态都要认。
++func stripAbsoluteURLPrefix(p string) (string, bool) {
++	lower := strings.ToLower(p)
++	idx := -1
++	for _, s := range []string{"http://", "https://", "http:/", "https:/"} {
++		if i := strings.Index(lower, s); i >= 0 && (idx < 0 || i < idx) {
++			idx = i
++		}
++	}
++	if idx < 0 {
++		return p, false
++	}
++	rest := lower[idx:]
++	skip := len("http:/")
++	switch {
++	case strings.HasPrefix(rest, "https://"):
++		skip = len("https://")
++	case strings.HasPrefix(rest, "http://"):
++		skip = len("http://")
++	case strings.HasPrefix(rest, "https:/"):
++		skip = len("https:/")
++	}
++	after := p[idx+skip:]
++	// 跳过 host[:port]，取第一个 '/' 之后的部分作为真实路径
++	slash := strings.IndexByte(after, '/')
++	if slash < 0 {
++		return p, false
++	}
++	out := after[slash:]
++	if len(out) <= 1 {
++		return p, false
++	}
++	return out, true
++}
++
+ // ---- 工具：从 query/header 取 api_key ----
+ 
+ func (h *Handler) apiKey(r *http.Request) string {
+@@ -842,6 +917,7 @@
+ 	limit := queryInt(q, "Limit", 0) // 0 = 不限
+ 
+ 	writeItems := func(all []fn.MediaItem) {
++		unfiltered := all
+ 		// IncludeItemTypes 类型过滤（Emby 服务器 ASP.NET 大小写不敏感匹配；
+ 		// 客户端按类型查询如 IncludeItemTypes=Episode/Movie/Series，不过滤
+ 		// 会把混合列表原样返回=错误内容）。飞牛没有的实体类型 → 空列表。
+@@ -877,6 +953,17 @@
+ 				all = kept
+ 			}
+ 		}
++		// fork 新增：库级浏览的空结果兜底。
++		// 飞牛的库类别（TV/Movie/Other/Live）与 Emby 的类型体系不是一一对应，
++		// 客户端按 CollectionType 猜出来的 IncludeItemTypes 可能整个对不上，
++		// 表现为「点进媒体库一片空白，但首页能正常看到这些视频」。
++		// 此时忽略类型过滤、返回该库的真实内容，比返回空列表更有用。
++		// 仅在带 ParentId 的库级浏览生效，不影响全局筛选（如"所有电影"）。
++		if len(all) == 0 && len(unfiltered) > 0 && parentID != "" {
++			log.Printf("[items] IncludeItemTypes=%q 过滤后为空，库 %s 回退为不过滤（%d 条）",
++				q.Get("IncludeItemTypes"), parentID, len(unfiltered))
++			all = unfiltered
++		}
+ 		total := len(all)
+ 		if start < 0 {
+ 			start = 0
+@@ -1072,7 +1159,25 @@
+ 	})
+ }
+ 
+-// collectionType 把飞牛库类别映射成 Emby CollectionType（空=混合库）。
++// collectionType 把飞牛库类别映射成 Emby CollectionType。
++//
++// 飞牛库类别只有 TV / Movie / Other / Live 四种（见 fn.MediaDB.Category 注释）。
++// 其中 Other（飞牛界面里叫「其他视频」）在 Emby 里没有对应类型，按 Emby 官方定义
++// 归为**混合内容**：
++//
++//	"If CollectionType is null, it indicates a mixed movie/tv folder
++//	 that should be displayed generically."   —— Emby REST API 文档
++//
++// 也就是返回空串、不声明 CollectionType。
++//
++// ⚠️ 不要写成 "mixed"：Emby 文档列出的可用值（movies/tvshows/music/games/books/
++// musicvideos/homevideos/livetv/channels）里没有 mixed，Jellyfin 的 CollectionType
++// 响应枚举同样没有（mixed 只存在于建库选项 CollectionTypeOptions）。上报未知值
++// 会让部分客户端直接加载不了该媒体库。
++//
++// 混合库会让客户端自行猜测 IncludeItemTypes（多为 Movie,Series），而 Other 类库的
++// 条目是 Type=Video —— 猜错就返回 0 条、点进库一片空白。这一层在 handleItems 的
++// 空结果兜底里解决，不需要伪造 CollectionType。
+ func collectionType(c string) string {
+ 	switch strings.ToLower(strings.TrimSpace(c)) {
+ 	case "movie", "movies", "电影":
+@@ -1550,7 +1655,9 @@
+ 					title = lang + " " + strings.ToUpper(as.CodecName)
+ 				}
+ 				a["DisplayLanguage"] = lang
+-				a["DisplayTitle"] = title
++				// fork: 对手机普遍无法直解的编码（DTS/TrueHD/FLAC…）在标题里加提示，
++				// 让用户能手动挑一条兼容音轨；不影响任何播放决策。
++				a["DisplayTitle"] = audioDisplayTitle(title, as.CodecName)
+ 				a["Title"] = title
+ 				fillMediaStream(a)
+ 				streams = append(streams, a)
+@@ -2139,14 +2246,70 @@
+ 	}
+ 
+ 	// 2) 本地 NAS 文件：media/range 透传
+-	h.streamLocal(w, r, mediaGuid)
++	// fork: 上游 media/range 一律返回 application/octet-stream，这里用文件名
++	// 扩展名推导真实 MIME 以便纠正（部分播放器不看内容嗅探、只认 MIME）。
++	mimeHint := ""
++	if streamResp != nil && streamResp.FileStream.FileName != "" {
++		mimeHint = filepath.Ext(streamResp.FileStream.FileName)
++	}
++	h.streamLocal(w, r, mediaGuid, mimeHint)
++}
++
++// streamHead 处理取流端点的 HEAD 请求。
++//
++// fork 新增：上游实现里 GET 路由会一并匹配 HEAD，HEAD 不带 Range 时
++// RangeMedia 走完整 GET，于是整个文件（实测 6.7GB）被当作响应体往外推，
++// 而 HEAD 并不发送响应体 —— 请求永不返回，客户端超时并判定「无法播放」。
++// 这里改为向飞牛只请求 1 字节（bytes=0-0）拿头部与总长度，然后直接返回。
++func (h *Handler) streamHead(w http.ResponseWriter, r *http.Request, mediaGuid, mimeHint, clientRange string) {
++	hdr, _, body, err := h.fnOf(r.Context()).RangeMedia(r.Context(), mediaGuid, "bytes=0-0")
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusBadGateway)
++		return
++	}
++	body.Close()
++
++	total := parseTotalSize(hdr.Get("Content-Range"))
++
++	ct := hdr.Get("Content-Type")
++	if genericMime(ct) {
++		if m := mimeForExt(mimeHint); m != "" {
++			ct = m
++		}
++	}
++	if ct != "" {
++		w.Header().Set("Content-Type", ct)
++	}
++	w.Header().Set("Accept-Ranges", "bytes")
++	w.Header().Set("Access-Control-Allow-Origin", "*")
++
++	if total > 0 {
++		if clientRange != "" {
++			if start, end, ok := parseClientRange(clientRange, total); ok {
++				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
++				w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
++				w.WriteHeader(http.StatusPartialContent)
++				return
++			}
++		}
++		w.Header().Set("Content-Length", strconv.FormatInt(total, 10))
++	}
++	w.WriteHeader(http.StatusOK)
+ }
+ 
+ // streamLocal 本地 NAS 文件：media/range 透传。
++// mimeHint 为按容器扩展名推导的 MIME（可为空），上游返回通用类型时用它纠正。
+ // 兜底：若客户端带 Range 而上游忽略返回 200 全量（带 Content-Length），
+ // 桥接自行裁剪回 206，保证官方客户端断点续传可用。
+-func (h *Handler) streamLocal(w http.ResponseWriter, r *http.Request, mediaGuid string) {
++func (h *Handler) streamLocal(w http.ResponseWriter, r *http.Request, mediaGuid, mimeHint string) {
+ 	rangeHdr := r.Header.Get("Range")
++
++	// fork: HEAD 只取头部，绝不传体（见 streamHead 注释）
++	if r.Method == http.MethodHead {
++		h.streamHead(w, r, mediaGuid, mimeHint, rangeHdr)
++		return
++	}
++
+ 	hdr, status, body, err := h.fnOf(r.Context()).RangeMedia(r.Context(), mediaGuid, rangeHdr)
+ 	if err != nil {
+ 		http.Error(w, err.Error(), http.StatusBadGateway)
+@@ -2161,7 +2324,13 @@
+ 			if _, err := fmt.Sscanf(cl, "%d", &size); err == nil && size > 0 {
+ 				if start, end, ok := parseClientRange(rangeHdr, size); ok && start < size {
+ 					if _, err := io.CopyN(io.Discard, body, start); err == nil {
+-						w.Header().Set("Content-Type", hdr.Get("Content-Type"))
++						ct := hdr.Get("Content-Type")
++						if genericMime(ct) {
++							if m := mimeForExt(mimeHint); m != "" {
++								ct = m
++							}
++						}
++						w.Header().Set("Content-Type", ct)
+ 						w.Header().Set("Accept-Ranges", "bytes")
+ 						w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+ 						w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+@@ -2180,6 +2349,12 @@
+ 			w.Header().Set(k, v)
+ 		}
+ 	}
++	// fork: 上游是通用 octet-stream 时，用容器扩展名推导的 MIME 覆盖
++	if genericMime(w.Header().Get("Content-Type")) {
++		if m := mimeForExt(mimeHint); m != "" {
++			w.Header().Set("Content-Type", m)
++		}
++	}
+ 	w.Header().Set("Access-Control-Allow-Origin", "*")
+ 	if status == http.StatusNoContent {
+ 		w.WriteHeader(http.StatusNoContent)
+diff -ruN a/internal/emby/util.go b/internal/emby/util.go
+--- a/internal/emby/util.go	2026-10-09 17:39:02.559488262 +0800
++++ b/internal/emby/util.go	2026-10-09 17:39:02.567488915 +0800
+@@ -6,6 +6,7 @@
+ 	"io"
+ 	"math/rand"
+ 	"net/http"
++	"os"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+@@ -120,3 +121,100 @@
+ 	}
+ 	return f
+ }
++
++// ---------------------------------------------------------------------------
++// 以下为 fork 新增（上游 ssabv/fnos-emby-bridge 无这些函数）
++// ---------------------------------------------------------------------------
++
++// mimeByExt 容器扩展名 → MIME。
++// 背景：上游 /v/api/v1/media/range 一律返回 application/octet-stream，
++// 部分播放器（不依赖内容嗅探、只看 MIME 的实现）会因此拒绝播放。
++var mimeByExt = map[string]string{
++	"mp4":  "video/mp4",
++	"m4v":  "video/mp4",
++	"mkv":  "video/x-matroska",
++	"webm": "video/webm",
++	"mov":  "video/quicktime",
++	"avi":  "video/x-msvideo",
++	"ts":   "video/mp2t",
++	"m2ts": "video/mp2t",
++	"flv":  "video/x-flv",
++	"wmv":  "video/x-ms-wmv",
++	"mpg":  "video/mpeg",
++	"mpeg": "video/mpeg",
++	"m2v":  "video/mpeg",
++	"rmvb": "application/vnd.rn-realmedia-vbr",
++}
++
++// mimeForExt 按扩展名（可带点，如 ".mkv"）返回 MIME；未知返回空串。
++func mimeForExt(ext string) string {
++	return mimeByExt[strings.ToLower(strings.TrimPrefix(strings.TrimSpace(ext), "."))]
++}
++
++// genericMime 判断 Content-Type 是否属于「没有信息量」的通用类型
++// （空、application/octet-stream 等）；这类值应当用扩展名推导的 MIME 覆盖。
++func genericMime(ct string) bool {
++	ct = strings.ToLower(strings.TrimSpace(ct))
++	if i := strings.IndexByte(ct, ';'); i >= 0 {
++		ct = strings.TrimSpace(ct[:i])
++	}
++	switch ct {
++	case "", "application/octet-stream", "binary/octet-stream", "application/binary":
++		return true
++	}
++	return false
++}
++
++// parseTotalSize 从 Content-Range "bytes 0-0/6721466674" 解析资源总长度。
++// 解析失败返回 0（调用方应退化为不设置 Content-Length）。
++func parseTotalSize(contentRange string) int64 {
++	i := strings.LastIndexByte(contentRange, '/')
++	if i < 0 {
++		return 0
++	}
++	n, err := strconv.ParseInt(strings.TrimSpace(contentRange[i+1:]), 10, 64)
++	if err != nil || n <= 0 {
++		return 0
++	}
++	return n
++}
++
++// hostileAudioCodecs 移动端/电视端普遍无法直接解码的音频编码。
++// DTS/杜比（TrueHD）需要授权，多数 Android 设备不带解码器；
++// FLAC/ALAC/PCM 一般也只在桌面端或软解播放器可用。
++// 说明：这里只用于「标题提示」，不参与任何播放决策。
++var hostileAudioCodecs = map[string]bool{
++	"dts": true, "dts-hd": true, "dtshd": true, "dts-hd ma": true, "dts:x": true,
++	"truehd": true, "mlp": true, "flac": true, "alac": true,
++	"pcm": true, "pcm_s16le": true, "pcm_s24le": true, "pcm_bluray": true,
++}
++
++// audioHintEnabled 音轨兼容性提示开关（默认开启，AUDIO_TRACK_HINT=0 关闭）。
++func audioHintEnabled() bool {
++	switch strings.ToLower(strings.TrimSpace(os.Getenv("AUDIO_TRACK_HINT"))) {
++	case "0", "false", "off", "no":
++		return false
++	}
++	return true
++}
++
++// audioDisplayTitle 在音轨显示标题后追加兼容性提示，方便用户手动挑一条能直解的轨道。
++//
++// 刻意不做「自动切到兼容音轨」：备选轨常常是导演评论轨（实测霸王别姬、
++// 花样年华等文件即如此），自动切换会让用户听到错误音轨，风险高于收益。
++func audioDisplayTitle(title, codec string) string {
++	if !audioHintEnabled() {
++		return title
++	}
++	if !hostileAudioCodecs[strings.ToLower(strings.TrimSpace(codec))] {
++		return title
++	}
++	const tag = "需软解"
++	if strings.Contains(title, tag) {
++		return title
++	}
++	if title == "" {
++		return tag
++	}
++	return title + " · " + tag
++}
+diff -ruN a/internal/mock/fnos.go b/internal/mock/fnos.go
+--- a/internal/mock/fnos.go	2026-10-09 17:39:02.559488262 +0800
++++ b/internal/mock/fnos.go	2026-10-09 17:39:02.567488915 +0800
+@@ -47,10 +47,18 @@
+ 			"duration": 2700, "runtime": 45, "can_play": 1, "is_watched": 0,
+ 			"season_number": 1, "episode_number": 1, "air_date": "2024-02-01", "overview": "一集剧",
+ 			"tv_title": "剧集B"},
++		// fork 新增：Other 类库 —— 复现「点进媒体库一片空白」。
++		// 飞牛 Other 类库的条目 type=Video，桥接映射为 Emby Type=Video；
++		// 客户端若按 CollectionType 猜成 IncludeItemTypes=Movie,Series 就会全被过滤掉。
++		"lib_other": {"guid": "lib_other", "title": "其他库", "type": "MediaDB", "category": "Other"},
++		"fv_vid": {"guid": "fv_vid", "parent_guid": "lib_other", "title": "散装视频A", "type": "Video",
++			"poster": "/1c/09/mock_fvvid.webp", "duration": 1800, "runtime": 30,
++			"can_play": 1, "is_watched": 0, "overview": "一个散装视频"},
+ 	}
+ 	// ancestor_guid 模式（库 guid → 子条目）
+ 	mockAncestor = map[string][]string{
+-		"lib_001": {"fv_001", "fv_tv"},
++		"lib_001":   {"fv_001", "fv_tv"},
++		"lib_other": {"fv_vid"},
+ 	}
+ 	// parent_guid 模式（剧 → 季、季 → 集）
+ 	mockParent = map[string][]string{
+@@ -75,8 +83,21 @@
+ 	records    []RecordEntry
+ 	loginMu    sync.Mutex
+ 	loginCount           = map[string]int{} // username → 真登录次数
++	rangeMu    sync.Mutex
++	lastRange            string // 最近一次 media/range 收到的 Range 头
+ )
+ 
++// MockLastRangeHeader 返回最近一次 /v/api/v1/media/range 收到的 Range 头。
++//
++// fork 新增（回归测试用）：HEAD 取流必须用 bytes=0-0 向飞牛只要元数据；
++// 若返回空串，说明桥接正在按「完整文件」去拉上游 —— 真机上这会把
++// 整个文件当响应体推给 HEAD 请求，导致请求永不返回。
++func MockLastRangeHeader() string {
++	rangeMu.Lock()
++	defer rangeMu.Unlock()
++	return lastRange
++}
++
+ // MockRecords 返回并清空 play/record 记录。
+ func MockRecords() []RecordEntry {
+ 	recordMu.Lock()
+@@ -101,9 +122,30 @@
+ 	loginMu.Lock()
+ 	loginCount = map[string]int{}
+ 	loginMu.Unlock()
++	rangeMu.Lock()
++	lastRange = ""
++	rangeMu.Unlock()
++}
++
++// Option 调整 mock 提供的夹具（默认与历史行为完全一致，避免影响既有断言）。
++type Option func(*mockOpts)
++
++type mockOpts struct {
++	otherLibrary bool
+ }
+ 
+-func NewHandler(cloudDirect bool, cdnBase string) *http.ServeMux {
++// WithOtherLibrary 额外提供一个 Other 类库（条目 type=Video）。
++// 用于回归「点进媒体库一片空白」：Other 类库此前不声明 CollectionType，
++// 客户端猜成 IncludeItemTypes=Movie,Series 会把 Type=Video 条目全过滤掉。
++func WithOtherLibrary() Option {
++	return func(o *mockOpts) { o.otherLibrary = true }
++}
++
++func NewHandler(cloudDirect bool, cdnBase string, opts ...Option) *http.ServeMux {
++	var o mockOpts
++	for _, fn := range opts {
++		fn(&o)
++	}
+ 	mux := http.NewServeMux()
+ 
+ 	// 0.9.8 登录：v2 + SHA256 密码
+@@ -129,10 +171,16 @@
+ 	})
+ 
+ 	mux.HandleFunc("GET /v/api/v1/mediadb/list", func(w http.ResponseWriter, r *http.Request) {
+-		writeResult(w, 0, "", []map[string]any{
++		libs := []map[string]any{
+ 			{"guid": "lib_001", "title": "电影库", "category": "Movie", "view_type": 0,
+ 				"posters": []string{"/1c/09/mock_lib.webp"}},
+-		})
++		}
++		if o.otherLibrary {
++			libs = append(libs, map[string]any{
++				"guid": "lib_other", "title": "其他库", "category": "Other", "view_type": 0,
++				"posters": []string{"/1c/09/mock_lib.webp"}})
++		}
++		writeResult(w, 0, "", libs)
+ 	})
+ 
+ 	mux.HandleFunc("POST /v/api/v1/item/list", func(w http.ResponseWriter, r *http.Request) {
+@@ -243,6 +291,9 @@
+ 
+ 	// 模拟视频字节流（真实飞牛是 mp4 文件，这里回 4KB 假数据；正确处理 Range）
+ 	mux.HandleFunc("GET /v/api/v1/media/range/{guid}", func(w http.ResponseWriter, r *http.Request) {
++		rangeMu.Lock()
++		lastRange = r.Header.Get("Range")
++		rangeMu.Unlock()
+ 		total := int64(4096)
+ 		buf := make([]byte, total)
+ 		for i := range buf {

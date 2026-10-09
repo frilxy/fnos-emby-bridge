@@ -269,7 +269,9 @@ var playedItemsRe = regexp.MustCompile(`(?i)^/Users/[^/]+/PlayedItems/([0-9a-fA-
 // Emby 官方客户端（Android/iOS/TV/Web）所有请求都带 /emby 前缀，必须兼容。
 func (h *Handler) Handler() http.Handler {
 	// withSession 按请求 token 选定飞牛会话注入 ctx——多用户进度/收藏隔离的入口
-	return logRequests(normalizePathCase(stripEmbyPrefix(h.withSession(h.Routes()))))
+	// repairMangledURLPath 紧随日志之后、最先改写路径：先把 "/embyhttp:/host/..."
+	// 还原成 "/Videos/..."，后续大小写归一与 /emby 剥离才能作用于真实路径。
+	return logRequests(repairMangledURLPath(normalizePathCase(stripEmbyPrefix(h.withSession(h.Routes())))))
 }
 
 // routeSegmentCase 已知路由静态段 小写→规范大小写（与 Routes() 注册一致）。
@@ -330,6 +332,10 @@ func logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		start := time.Now()
+		// fork: 进站路径快照。内部中间件会重写 r.URL.Path（/emby 剥离、大小写归一、
+		// 畸形绝对 URL 修复），日志必须记录客户端真正发来的路径，
+		// 否则这类"路径拼接错"的问题在日志里会被抹掉、无从排查。
+		origPath := r.URL.Path
 		next.ServeHTTP(rw, r)
 		q := r.URL.RawQuery
 		if i := strings.Index(q, "api_key="); i >= 0 {
@@ -349,7 +355,7 @@ func logRequests(next http.Handler) http.Handler {
 				cl = cl[:i]
 			}
 		}
-		log.Printf("[http] %d %s %s?%s (%s) [%s]", rw.status, r.Method, r.URL.Path, q, time.Since(start).Round(time.Millisecond), cl)
+		log.Printf("[http] %d %s %s?%s (%s) [%s]", rw.status, r.Method, origPath, q, time.Since(start).Round(time.Millisecond), cl)
 	})
 }
 
@@ -397,6 +403,75 @@ func stripEmbyPrefix(next http.Handler) http.Handler {
 			}
 		}
 	})
+}
+
+// repairMangledURLPath 修复「客户端把绝对播放地址拼到自己 base 后面」产生的畸形路径。
+//
+// 实测（Yamby + 本桥接）：
+//
+//	桥接返回 MediaSource.Path / DirectStreamUrl =
+//	    http://192.168.10.229:8096/Videos/{id}/stream?MediaSourceId=...&Static=true
+//	客户端基于自身 base（http://192.168.10.229:8096/emby）做字符串拼接，得到
+//	    http://192.168.10.229:8096/embyhttp://192.168.10.229:8096/Videos/{id}/stream?...
+//	Go 解析请求行时把 "//" 归一为 "/"，服务端实际收到：
+//	    /embyhttp:/192.168.10.229:8096/Videos/{id}/stream?...
+//
+// 这种路径不匹配任何已注册路由，会落到兜底 handler —— 兜底对 GET 返回
+// 200 + 空 QueryResult JSON，于是播放器拿到的是 49 字节 JSON 而不是视频字节，
+// 而且因为状态码是 200，客户端连报错都没有，表现为「点开视频无法播放」。
+//
+// 修复方式是在入站侧把 scheme+host 摘掉，还原成服务器内真实路径，
+// 让请求正常命中 handleStream。
+//
+// 为什么不在出站侧改成相对路径？因为 handlePlayback 处有明确注释：
+// 「Path 必须真实 URL：客户端直接交给播放器内核（fn:// 伪协议零请求失败）」——
+// 存在一类客户端会把 Path 原样交给播放器，改成相对路径会把它弄坏。
+// 入站修复可以让两类客户端同时工作。
+func repairMangledURLPath(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if p, ok := stripAbsoluteURLPrefix(r.URL.Path); ok {
+			log.Printf("[repair] 路径含绝对 URL 前缀，已还原: %s → %s", r.URL.Path, p)
+			r.URL.Path = p
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// stripAbsoluteURLPrefix 从形如 "/embyhttp:/host/xxx"、"/embyhttp://host/xxx"
+// 的畸形路径里剥掉 scheme+host，返回 "/xxx"。第二个返回值表示是否发生改写。
+// 注意 Go 会把请求行里的 "http://" 归一成 "http:/"，两种形态都要认。
+func stripAbsoluteURLPrefix(p string) (string, bool) {
+	lower := strings.ToLower(p)
+	idx := -1
+	for _, s := range []string{"http://", "https://", "http:/", "https:/"} {
+		if i := strings.Index(lower, s); i >= 0 && (idx < 0 || i < idx) {
+			idx = i
+		}
+	}
+	if idx < 0 {
+		return p, false
+	}
+	rest := lower[idx:]
+	skip := len("http:/")
+	switch {
+	case strings.HasPrefix(rest, "https://"):
+		skip = len("https://")
+	case strings.HasPrefix(rest, "http://"):
+		skip = len("http://")
+	case strings.HasPrefix(rest, "https:/"):
+		skip = len("https:/")
+	}
+	after := p[idx+skip:]
+	// 跳过 host[:port]，取第一个 '/' 之后的部分作为真实路径
+	slash := strings.IndexByte(after, '/')
+	if slash < 0 {
+		return p, false
+	}
+	out := after[slash:]
+	if len(out) <= 1 {
+		return p, false
+	}
+	return out, true
 }
 
 // ---- 工具：从 query/header 取 api_key ----
@@ -842,6 +917,7 @@ func (h *Handler) handleItems(w http.ResponseWriter, r *http.Request) {
 	limit := queryInt(q, "Limit", 0) // 0 = 不限
 
 	writeItems := func(all []fn.MediaItem) {
+		unfiltered := all
 		// IncludeItemTypes 类型过滤（Emby 服务器 ASP.NET 大小写不敏感匹配；
 		// 客户端按类型查询如 IncludeItemTypes=Episode/Movie/Series，不过滤
 		// 会把混合列表原样返回=错误内容）。飞牛没有的实体类型 → 空列表。
@@ -876,6 +952,17 @@ func (h *Handler) handleItems(w http.ResponseWriter, r *http.Request) {
 				}
 				all = kept
 			}
+		}
+		// fork 新增：库级浏览的空结果兜底。
+		// 飞牛的库类别（TV/Movie/Other/Live）与 Emby 的类型体系不是一一对应，
+		// 客户端按 CollectionType 猜出来的 IncludeItemTypes 可能整个对不上，
+		// 表现为「点进媒体库一片空白，但首页能正常看到这些视频」。
+		// 此时忽略类型过滤、返回该库的真实内容，比返回空列表更有用。
+		// 仅在带 ParentId 的库级浏览生效，不影响全局筛选（如"所有电影"）。
+		if len(all) == 0 && len(unfiltered) > 0 && parentID != "" {
+			log.Printf("[items] IncludeItemTypes=%q 过滤后为空，库 %s 回退为不过滤（%d 条）",
+				q.Get("IncludeItemTypes"), parentID, len(unfiltered))
+			all = unfiltered
 		}
 		total := len(all)
 		if start < 0 {
@@ -1072,7 +1159,25 @@ func (h *Handler) handleViews(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// collectionType 把飞牛库类别映射成 Emby CollectionType（空=混合库）。
+// collectionType 把飞牛库类别映射成 Emby CollectionType。
+//
+// 飞牛库类别只有 TV / Movie / Other / Live 四种（见 fn.MediaDB.Category 注释）。
+// 其中 Other（飞牛界面里叫「其他视频」）在 Emby 里没有对应类型，按 Emby 官方定义
+// 归为**混合内容**：
+//
+//	"If CollectionType is null, it indicates a mixed movie/tv folder
+//	 that should be displayed generically."   —— Emby REST API 文档
+//
+// 也就是返回空串、不声明 CollectionType。
+//
+// ⚠️ 不要写成 "mixed"：Emby 文档列出的可用值（movies/tvshows/music/games/books/
+// musicvideos/homevideos/livetv/channels）里没有 mixed，Jellyfin 的 CollectionType
+// 响应枚举同样没有（mixed 只存在于建库选项 CollectionTypeOptions）。上报未知值
+// 会让部分客户端直接加载不了该媒体库。
+//
+// 混合库会让客户端自行猜测 IncludeItemTypes（多为 Movie,Series），而 Other 类库的
+// 条目是 Type=Video —— 猜错就返回 0 条、点进库一片空白。这一层在 handleItems 的
+// 空结果兜底里解决，不需要伪造 CollectionType。
 func collectionType(c string) string {
 	switch strings.ToLower(strings.TrimSpace(c)) {
 	case "movie", "movies", "电影":
@@ -1550,7 +1655,9 @@ func (h *Handler) enrichMediaSources(r *http.Request, item map[string]any, guid 
 					title = lang + " " + strings.ToUpper(as.CodecName)
 				}
 				a["DisplayLanguage"] = lang
-				a["DisplayTitle"] = title
+				// fork: 对手机普遍无法直解的编码（DTS/TrueHD/FLAC…）在标题里加提示，
+				// 让用户能手动挑一条兼容音轨；不影响任何播放决策。
+				a["DisplayTitle"] = audioDisplayTitle(title, as.CodecName)
 				a["Title"] = title
 				fillMediaStream(a)
 				streams = append(streams, a)
@@ -2139,14 +2246,70 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 2) 本地 NAS 文件：media/range 透传
-	h.streamLocal(w, r, mediaGuid)
+	// fork: 上游 media/range 一律返回 application/octet-stream，这里用文件名
+	// 扩展名推导真实 MIME 以便纠正（部分播放器不看内容嗅探、只认 MIME）。
+	mimeHint := ""
+	if streamResp != nil && streamResp.FileStream.FileName != "" {
+		mimeHint = filepath.Ext(streamResp.FileStream.FileName)
+	}
+	h.streamLocal(w, r, mediaGuid, mimeHint)
+}
+
+// streamHead 处理取流端点的 HEAD 请求。
+//
+// fork 新增：上游实现里 GET 路由会一并匹配 HEAD，HEAD 不带 Range 时
+// RangeMedia 走完整 GET，于是整个文件（实测 6.7GB）被当作响应体往外推，
+// 而 HEAD 并不发送响应体 —— 请求永不返回，客户端超时并判定「无法播放」。
+// 这里改为向飞牛只请求 1 字节（bytes=0-0）拿头部与总长度，然后直接返回。
+func (h *Handler) streamHead(w http.ResponseWriter, r *http.Request, mediaGuid, mimeHint, clientRange string) {
+	hdr, _, body, err := h.fnOf(r.Context()).RangeMedia(r.Context(), mediaGuid, "bytes=0-0")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	body.Close()
+
+	total := parseTotalSize(hdr.Get("Content-Range"))
+
+	ct := hdr.Get("Content-Type")
+	if genericMime(ct) {
+		if m := mimeForExt(mimeHint); m != "" {
+			ct = m
+		}
+	}
+	if ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	if total > 0 {
+		if clientRange != "" {
+			if start, end, ok := parseClientRange(clientRange, total); ok {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
+				w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+				w.WriteHeader(http.StatusPartialContent)
+				return
+			}
+		}
+		w.Header().Set("Content-Length", strconv.FormatInt(total, 10))
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 // streamLocal 本地 NAS 文件：media/range 透传。
+// mimeHint 为按容器扩展名推导的 MIME（可为空），上游返回通用类型时用它纠正。
 // 兜底：若客户端带 Range 而上游忽略返回 200 全量（带 Content-Length），
 // 桥接自行裁剪回 206，保证官方客户端断点续传可用。
-func (h *Handler) streamLocal(w http.ResponseWriter, r *http.Request, mediaGuid string) {
+func (h *Handler) streamLocal(w http.ResponseWriter, r *http.Request, mediaGuid, mimeHint string) {
 	rangeHdr := r.Header.Get("Range")
+
+	// fork: HEAD 只取头部，绝不传体（见 streamHead 注释）
+	if r.Method == http.MethodHead {
+		h.streamHead(w, r, mediaGuid, mimeHint, rangeHdr)
+		return
+	}
+
 	hdr, status, body, err := h.fnOf(r.Context()).RangeMedia(r.Context(), mediaGuid, rangeHdr)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -2161,7 +2324,13 @@ func (h *Handler) streamLocal(w http.ResponseWriter, r *http.Request, mediaGuid 
 			if _, err := fmt.Sscanf(cl, "%d", &size); err == nil && size > 0 {
 				if start, end, ok := parseClientRange(rangeHdr, size); ok && start < size {
 					if _, err := io.CopyN(io.Discard, body, start); err == nil {
-						w.Header().Set("Content-Type", hdr.Get("Content-Type"))
+						ct := hdr.Get("Content-Type")
+						if genericMime(ct) {
+							if m := mimeForExt(mimeHint); m != "" {
+								ct = m
+							}
+						}
+						w.Header().Set("Content-Type", ct)
 						w.Header().Set("Accept-Ranges", "bytes")
 						w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
 						w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
@@ -2178,6 +2347,12 @@ func (h *Handler) streamLocal(w http.ResponseWriter, r *http.Request, mediaGuid 
 	for _, k := range []string{"Content-Type", "Content-Length", "Accept-Ranges", "Content-Range"} {
 		if v := hdr.Get(k); v != "" {
 			w.Header().Set(k, v)
+		}
+	}
+	// fork: 上游是通用 octet-stream 时，用容器扩展名推导的 MIME 覆盖
+	if genericMime(w.Header().Get("Content-Type")) {
+		if m := mimeForExt(mimeHint); m != "" {
+			w.Header().Set("Content-Type", m)
 		}
 	}
 	w.Header().Set("Access-Control-Allow-Origin", "*")

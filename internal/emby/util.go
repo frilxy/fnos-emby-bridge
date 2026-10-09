@@ -6,6 +6,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -119,4 +120,101 @@ func parseFPS(s string) float64 {
 		return 0
 	}
 	return f
+}
+
+// ---------------------------------------------------------------------------
+// 以下为 fork 新增（上游 ssabv/fnos-emby-bridge 无这些函数）
+// ---------------------------------------------------------------------------
+
+// mimeByExt 容器扩展名 → MIME。
+// 背景：上游 /v/api/v1/media/range 一律返回 application/octet-stream，
+// 部分播放器（不依赖内容嗅探、只看 MIME 的实现）会因此拒绝播放。
+var mimeByExt = map[string]string{
+	"mp4":  "video/mp4",
+	"m4v":  "video/mp4",
+	"mkv":  "video/x-matroska",
+	"webm": "video/webm",
+	"mov":  "video/quicktime",
+	"avi":  "video/x-msvideo",
+	"ts":   "video/mp2t",
+	"m2ts": "video/mp2t",
+	"flv":  "video/x-flv",
+	"wmv":  "video/x-ms-wmv",
+	"mpg":  "video/mpeg",
+	"mpeg": "video/mpeg",
+	"m2v":  "video/mpeg",
+	"rmvb": "application/vnd.rn-realmedia-vbr",
+}
+
+// mimeForExt 按扩展名（可带点，如 ".mkv"）返回 MIME；未知返回空串。
+func mimeForExt(ext string) string {
+	return mimeByExt[strings.ToLower(strings.TrimPrefix(strings.TrimSpace(ext), "."))]
+}
+
+// genericMime 判断 Content-Type 是否属于「没有信息量」的通用类型
+// （空、application/octet-stream 等）；这类值应当用扩展名推导的 MIME 覆盖。
+func genericMime(ct string) bool {
+	ct = strings.ToLower(strings.TrimSpace(ct))
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = strings.TrimSpace(ct[:i])
+	}
+	switch ct {
+	case "", "application/octet-stream", "binary/octet-stream", "application/binary":
+		return true
+	}
+	return false
+}
+
+// parseTotalSize 从 Content-Range "bytes 0-0/6721466674" 解析资源总长度。
+// 解析失败返回 0（调用方应退化为不设置 Content-Length）。
+func parseTotalSize(contentRange string) int64 {
+	i := strings.LastIndexByte(contentRange, '/')
+	if i < 0 {
+		return 0
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(contentRange[i+1:]), 10, 64)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+// hostileAudioCodecs 移动端/电视端普遍无法直接解码的音频编码。
+// DTS/杜比（TrueHD）需要授权，多数 Android 设备不带解码器；
+// FLAC/ALAC/PCM 一般也只在桌面端或软解播放器可用。
+// 说明：这里只用于「标题提示」，不参与任何播放决策。
+var hostileAudioCodecs = map[string]bool{
+	"dts": true, "dts-hd": true, "dtshd": true, "dts-hd ma": true, "dts:x": true,
+	"truehd": true, "mlp": true, "flac": true, "alac": true,
+	"pcm": true, "pcm_s16le": true, "pcm_s24le": true, "pcm_bluray": true,
+}
+
+// audioHintEnabled 音轨兼容性提示开关（默认开启，AUDIO_TRACK_HINT=0 关闭）。
+func audioHintEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("AUDIO_TRACK_HINT"))) {
+	case "0", "false", "off", "no":
+		return false
+	}
+	return true
+}
+
+// audioDisplayTitle 在音轨显示标题后追加兼容性提示，方便用户手动挑一条能直解的轨道。
+//
+// 刻意不做「自动切到兼容音轨」：备选轨常常是导演评论轨（实测霸王别姬、
+// 花样年华等文件即如此），自动切换会让用户听到错误音轨，风险高于收益。
+func audioDisplayTitle(title, codec string) string {
+	if !audioHintEnabled() {
+		return title
+	}
+	if !hostileAudioCodecs[strings.ToLower(strings.TrimSpace(codec))] {
+		return title
+	}
+	const tag = "需软解"
+	if strings.Contains(title, tag) {
+		return title
+	}
+	if title == "" {
+		return tag
+	}
+	return title + " · " + tag
 }

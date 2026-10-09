@@ -6,10 +6,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"fnos-emby-bridge/internal/emby"
 	"fnos-emby-bridge/internal/fn"
@@ -28,7 +30,9 @@ func TestBridgeAgainstMockFN(t *testing.T) {
 	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
 
 	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
-	bridge := httptest.NewServer(h.Routes())
+	// 用 Handler() 而非 Routes()：生产入口是 Handler()（含 /emby 剥离、大小写归一、
+	// 畸形绝对 URL 还原三层中间件），裸路由表测不到这些中间件的行为。
+	bridge := httptest.NewServer(h.Handler())
 	defer bridge.Close()
 
 	// 3. 验证 /System/Info
@@ -105,6 +109,52 @@ func TestBridgeAgainstMockFN(t *testing.T) {
 		t.Fatalf("stream empty")
 	}
 
+	// 8b. 回归（fork 修复）：HEAD 取流必须立即返回元数据，不能挂起。
+	// 上游实现把 GET 路由一并匹配 HEAD，HEAD 无 Range 时把整个文件当响应体
+	// 往外推、而 HEAD 不发送响应体，请求永不返回（真机表现为 curl 超时、
+	// 部分播放器探测失败后判定「无法播放」）。
+	headClient := &http.Client{Timeout: 5 * time.Second}
+	hreq, _ := http.NewRequest("HEAD", bridge.URL+"/Videos/fv_001/stream?api_key=k", nil)
+	hresp, err := headClient.Do(hreq)
+	if err != nil {
+		t.Fatalf("HEAD stream 未能及时返回（疑似挂起）: %v", err)
+	}
+	hresp.Body.Close()
+	if hresp.StatusCode != 200 {
+		t.Fatalf("HEAD stream status=%d", hresp.StatusCode)
+	}
+	if got := hresp.Header.Get("Accept-Ranges"); got != "bytes" {
+		t.Fatalf("HEAD stream accept-ranges=%q", got)
+	}
+	if cl := hresp.Header.Get("Content-Length"); cl == "" || cl == "0" {
+		t.Fatalf("HEAD stream content-length=%q", cl)
+	}
+	// 关键判据：HEAD 只能向飞牛要 1 字节，绝不能按「完整文件」拉上游。
+	// mock 只有 4KB，光看响应快慢区分不出上游实现差异，所以直接断言上游收到的 Range。
+	if got := mock.MockLastRangeHeader(); got != "bytes=0-0" {
+		t.Fatalf("HEAD 向上游请求的 Range=%q，应为 bytes=0-0（否则真机上 HEAD 会拉整个文件并挂死）", got)
+	}
+
+	// 8c. HEAD + Range 应回 206 且 Content-Range 合法
+	hreq2, _ := http.NewRequest("HEAD", bridge.URL+"/Videos/fv_001/stream?api_key=k", nil)
+	hreq2.Header.Set("Range", "bytes=0-99")
+	hresp2, err := headClient.Do(hreq2)
+	if err != nil {
+		t.Fatalf("HEAD(range) stream: %v", err)
+	}
+	hresp2.Body.Close()
+	if hresp2.StatusCode != 206 {
+		t.Fatalf("HEAD(range) status=%d", hresp2.StatusCode)
+	}
+	if cr := hresp2.Header.Get("Content-Range"); !strings.HasPrefix(cr, "bytes 0-99/") {
+		t.Fatalf("HEAD(range) content-range=%q", cr)
+	}
+	if got := mock.MockLastRangeHeader(); got != "bytes=0-0" {
+		t.Fatalf("HEAD(range) 向上游请求的 Range=%q，应为 bytes=0-0", got)
+	}
+
+	// 8d. 畸形绝对 URL 路径的回归测试见 TestMangledAbsoluteURLPathRepaired（独立函数）
+
 	// 9. 验证 /Items/{id}/Progress 回传
 	resp3, _ := http.Post(bridge.URL+"/Items/fv_001/Progress?api_key=k", "application/json",
 		strings.NewReader(`{"PositionTicks":1200000000}`)) // 120s
@@ -113,6 +163,126 @@ func TestBridgeAgainstMockFN(t *testing.T) {
 	}
 
 	t.Logf("all emby endpoints ok against mock fnos")
+}
+
+// 回归（fork 修复）：客户端把「绝对播放地址」拼到自己 base 后面，会产生
+// /embyhttp:/host/Videos/{id}/stream 这类畸形路径（Go 把请求行里的 // 归一成 /）。
+//
+// 上游行为：该路径不匹配任何路由 → 落到兜底 handler → 对 GET 返回
+// 200 + 空 QueryResult JSON。播放器拿到 49 字节 JSON 而非视频字节，
+// 而且状态码是 200，客户端连报错都没有，表现为「点开视频无法播放」。
+//
+// 修复：入站把 scheme+host 摘掉还原成真实路径，让请求进入 handleStream。
+// 独立成函数是为了能在上游代码上单独跑，确认它确实抓得到这个问题。
+func TestMangledAbsoluteURLPathRepaired(t *testing.T) {
+	fnSrv := httptest.NewServer(mock.NewHandler(false, ""))
+	defer fnSrv.Close()
+
+	client := fn.NewClient(fnSrv.URL)
+	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
+	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	bridge := httptest.NewServer(h.Handler())
+	defer bridge.Close()
+
+	mangled := &http.Request{
+		Method: "GET",
+		URL: &url.URL{
+			Scheme:   "http",
+			Host:     strings.TrimPrefix(bridge.URL, "http://"),
+			Path:     "/embyhttp:/192.168.10.229:8096/Videos/fv_001/stream",
+			RawQuery: "MediaSourceId=fv_001&Static=true",
+		},
+		Header: http.Header{},
+	}
+	mangled.Header.Set("Range", "bytes=0-100")
+
+	resp, err := http.DefaultClient.Do(mangled)
+	if err != nil {
+		t.Fatalf("畸形路径请求: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != 200 && resp.StatusCode != 206 {
+		t.Fatalf("畸形路径 status=%d body=%s", resp.StatusCode, body)
+	}
+	// 最关键的判据：绝不能是 JSON 兜底响应
+	if ct := resp.Header.Get("Content-Type"); strings.Contains(ct, "json") {
+		t.Fatalf("畸形路径落到了兜底(JSON)，未进入 handleStream: status=%d ct=%q body=%s",
+			resp.StatusCode, ct, body)
+	}
+	if len(body) == 0 {
+		t.Fatalf("畸形路径未返回视频字节: status=%d ct=%q", resp.StatusCode, resp.Header.Get("Content-Type"))
+	}
+	// 还原后仍应把客户端的 Range 正常透传给上游
+	if got := mock.MockLastRangeHeader(); got != "bytes=0-100" {
+		t.Fatalf("畸形路径还原后上游 Range=%q，应为 bytes=0-100", got)
+	}
+}
+
+// 回归（fork 修复）：飞牛 Other 类库（界面里叫「其他视频」）在 Emby 里没有对应类型，
+// 按 Emby 官方定义归为**混合内容**——即不声明 CollectionType
+// （"If CollectionType is null, it indicates a mixed movie/tv folder"）。
+//
+// 混合库会让客户端自行猜 IncludeItemTypes（多为 Movie,Series），而该类库条目是
+// Type=Video → 猜错就返回 0 条，表现为「点进媒体库一片空白，但首页能看到这些视频」。
+// 该问题由 handleItems 的库级浏览空结果兜底解决，不靠伪造 CollectionType。
+func TestOtherLibraryNotBlank(t *testing.T) {
+	fnSrv := httptest.NewServer(mock.NewHandler(false, "", mock.WithOtherLibrary()))
+	defer fnSrv.Close()
+
+	client := fn.NewClient(fnSrv.URL)
+	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
+	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	bridge := httptest.NewServer(h.Handler())
+	defer bridge.Close()
+
+	var views struct {
+		Items []map[string]any `json:"Items"`
+	}
+	var items struct {
+		Items            []map[string]any `json:"Items"`
+		TotalRecordCount int              `json:"TotalRecordCount"`
+	}
+
+	// 1) Other 类库应作为混合内容：不声明 CollectionType
+	body := getJSON(t, bridge.URL+"/Users/fnos-user/Views?api_key=k")
+	_ = json.Unmarshal(body, &views)
+	found := false
+	for _, v := range views.Items {
+		if v["Id"] != "lib_other" {
+			continue
+		}
+		found = true
+		if ct, ok := v["CollectionType"]; ok && ct != nil && ct != "" {
+			t.Fatalf("Other 类库应按混合内容处理（不声明 CollectionType），实际=%v；"+
+				"上报非空值（尤其 \"mixed\"）不在 Emby 的 CollectionType 响应枚举内，部分客户端会加载不了该库", ct)
+		}
+	}
+	if !found {
+		t.Fatalf("Views 里没有 lib_other：%s", body)
+	}
+
+	// 2) 客户端按猜错的类型（Movie,Series）请求时，库级浏览不能返回空白
+	body = getJSON(t, bridge.URL+"/Users/fnos-user/Items?ParentId=lib_other&IncludeItemTypes=Movie,Series&api_key=k")
+	_ = json.Unmarshal(body, &items)
+	if len(items.Items) == 0 {
+		t.Fatalf("IncludeItemTypes=Movie,Series 时 Other 库返回空白（应回退为该库真实内容）：%s", body)
+	}
+
+	// 3) 类型正确时（Video）走正常路径
+	body = getJSON(t, bridge.URL+"/Users/fnos-user/Items?ParentId=lib_other&IncludeItemTypes=Video&api_key=k")
+	_ = json.Unmarshal(body, &items)
+	if len(items.Items) == 0 {
+		t.Fatalf("IncludeItemTypes=Video 时 Other 库应有条目：%s", body)
+	}
+
+	// 4) 兜底只作用于库级浏览：不带 ParentId 的全局类型筛选仍应严格
+	body = getJSON(t, bridge.URL+"/Users/fnos-user/Items?IncludeItemTypes=MusicAlbum&api_key=k")
+	_ = json.Unmarshal(body, &items)
+	if len(items.Items) != 0 {
+		t.Fatalf("不带 ParentId 时不应触发空结果兜底：%s", body)
+	}
 }
 
 // 云盘直链路径：mock 返回夸克直链，桥接应直连 mock CDN（ChunkedProxy），透传字节。

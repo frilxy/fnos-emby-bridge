@@ -95,7 +95,7 @@ func main() {
 		if err := client.Login(ctx, user, fn.SHA256Hex(pass)); err != nil {
 			log.Printf("飞牛登录失败：%v（可在后台修改连接）", err)
 		} else {
-			log.Printf("飞牛登录成功，token=%s...", client.Token[:8])
+			log.Printf("飞牛登录成功，token=%s...", shortToken(client.Token))
 		}
 	}
 
@@ -127,7 +127,7 @@ func main() {
 				Base: base, User: user,
 				PassSet: pass != "",
 				OK:      client.Token != "",
-				Token:   client.Token[:8],
+				Token:   shortToken(client.Token),
 			}
 			if cc != nil {
 				if cc.Base != "" {
@@ -159,7 +159,7 @@ func main() {
 			if err := store.SetConnection(newBase, newUser, effPass); err != nil {
 				log.Printf("[admin] 连接配置落盘: %v", err)
 			}
-			log.Printf("[admin] 飞牛连接已切换：%s（token=%s...）", newBase, test.Token[:8])
+			log.Printf("[admin] 飞牛连接已切换：%s（token=%s...）", newBase, shortToken(test.Token))
 			return nil
 		},
 	})
@@ -215,6 +215,18 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("服务启动失败：%v", err)
 	}
+}
+
+// shortToken 取 token 前 8 位用于日志/后台展示。
+//
+// fork 修复：上游直接写 client.Token[:8]，当飞牛尚未登录成功（token 为空）时
+// 切片越界 panic。触发路径是后台 GET /admin/api/connection —— 也就是用户刚部署、
+// 还没配好连接时最需要打开的那一页：结果是面板打不开，配置填不进去，形成死循环。
+func shortToken(t string) string {
+	if len(t) <= 8 {
+		return t
+	}
+	return t[:8]
 }
 
 // withCORS 给所有响应加 CORS 头，方便浏览器/网页版 Emby 客户端跨域访问。
