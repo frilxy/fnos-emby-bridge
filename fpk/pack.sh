@@ -45,11 +45,20 @@ else
     cp -a "${SRC}/config" "${APPSTAGE}/config"
 
     ( cd "${APPSTAGE}" && find . -mindepth 1 -printf '%P\n' | LC_ALL=C sort ) > "${TMP}/applist"
-    tar --format=ustar --owner=0 --group=0 --numeric-owner -cf - \
+    # --no-recursion 必须加：否则 tar 会把列表里的目录名再递归展开一遍，
+    # 与显式列出的文件重复（成员出现两次、目录项还带尾斜杠）
+    tar --format=ustar --no-recursion --owner=0 --group=0 --numeric-owner -cf - \
         -C "${APPSTAGE}" -T "${TMP}/applist" | gzip -9n > "${PKG}/app.tgz"
 
+    # fnpack 会在 manifest 末尾写入 checksum = md5(app.tgz)，安装器可能校验它
+    # （实测确认就是这个值；每次构建因 app.tgz 内容不同而变化，属包内自洽校验）。
+    # 用 tar 打包时必须自己补上，否则可能有被安装器拒绝的风险。
+    sed -i '/^checksum[[:space:]]*=/d' "${PKG}/manifest"
+    printf '%-22s= %s\n' checksum "$(md5sum "${PKG}/app.tgz" | cut -d' ' -f1)" \
+        >> "${PKG}/manifest"
+
     ( cd "${PKG}" && find . -mindepth 1 -printf '%P\n' | LC_ALL=C sort ) > "${TMP}/list"
-    tar --format=ustar --owner=0 --group=0 --numeric-owner -cf - \
+    tar --format=ustar --no-recursion --owner=0 --group=0 --numeric-owner -cf - \
         -C "${PKG}" -T "${TMP}/list" | gzip -9n > "${OUT}"
 fi
 

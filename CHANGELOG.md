@@ -11,7 +11,12 @@
 - 后台界面标题/品牌区改用真图标（内嵌 data URI，不依赖静态资源路由）。
 - **打包迁到 GitHub Actions**：`Build` 工作流跑测试并产出 fpk，`Release` 工作流在
   `v*` tag 上自动构建并发版；`dist/` 不再入库。
-- `fpk/pack.sh`：没装飞牛官方 `fnpack` 时用标准 tar 复刻 fpk 结构（已校验两者的成员表、权限与文件哈希完全一致），CI 因此无需下载打包工具。
+- 新增 `fpk/pack.sh`：没装飞牛官方 `fnpack` 时用标准 `tar` 复刻 fpk 结构，CI 因此无需
+  下载打包工具。已逐项校验两条路径的产物等价：成员表（名称/类型/权限）与 `app.tgz`
+  内容哈希完全一致，`manifest` 除 `checksum` 外逐行相同。
+- 复刻时补上 fnpack 会写入的 `checksum = md5(app.tgz)`（实测确认就是这个值；
+  安装器可能校验它，缺了有被拒的风险），并给 `tar -T` 列表加 `--no-recursion`，
+  避免目录被递归展开导致成员重复。
 
 ## v1.0.8
 
