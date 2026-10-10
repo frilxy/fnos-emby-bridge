@@ -407,11 +407,51 @@ func TestClientCompatEndpoints(t *testing.T) {
 	}
 }
 
+// 回归（fork 修复）：/Movies/Recommendations 官方返回 RecommendationDto[]（数组）。
+//
+// 官方契约（dev.emby.media → MoviesService/getMoviesRecommendations）：
+//
+//	200 | RecommendationDto[] | Returning a RecommendationDto[] object.
+//
+// 此前该路径未注册 → 落到兜底返回 QueryResult 对象 {"Items":[],...}，
+// 客户端（小幻影视）按数组反序列化直接失败，界面表现「生成推荐影片失败」。
+func TestMovieRecommendationsShape(t *testing.T) {
+	fnSrv := httptest.NewServer(mock.NewHandler(false, ""))
+	defer fnSrv.Close()
+
+	client := fn.NewClient(fnSrv.URL)
+	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
+	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	bridge := httptest.NewServer(h.Handler())
+	defer bridge.Close()
+
+	// 大小写两种写法都要命中（客户端全程小写）
+	for _, p := range []string{"/Movies/Recommendations", "/movies/recommendations"} {
+		body := getJSON(t, bridge.URL+p+"?api_key=k")
+		if !strings.HasPrefix(strings.TrimSpace(string(body)), "[") {
+			t.Fatalf("%s 应返回 RecommendationDto[] 数组（Emby 官方契约；给对象客户端会解析失败）：%s", p, body)
+		}
+		var recs []map[string]any
+		if err := json.Unmarshal(body, &recs); err != nil {
+			t.Fatalf("%s 响应不是 JSON 数组：%s", p, body)
+		}
+		for i, rec := range recs {
+			for _, k := range []string{"Items", "RecommendationType", "BaselineItemName", "CategoryId"} {
+				if _, ok := rec[k]; !ok {
+					t.Fatalf("%s 第 %d 条 RecommendationDto 缺字段 %s：%s", p, i, k, body)
+				}
+			}
+		}
+	}
+}
+
 // 回归（fork 修复）：写操作的响应必须是 200 + UserItemDataDto 本体。
 //
 // 官方契约（betadev.emby.media → PlaystateService）：
-//   POST/DELETE /Users/{UserId}/PlayedItems/{Id} → 200 + UserItemDataDto
-//   "Operation successful. Returning a UserItemDataDto object."
+//
+//	POST/DELETE /Users/{UserId}/PlayedItems/{Id} → 200 + UserItemDataDto
+//	"Operation successful. Returning a UserItemDataDto object."
+//
 // 此前桥接返回 204 空响应，「标记未看」在 .NET 客户端（小幻影视）被判为操作失败；
 // FavoriteItems 则返回了自造的 {"Id":..,"UserData":{..}} 包装对象，同样不是官方模型。
 func TestWriteEndpointsReturnUserItemData(t *testing.T) {

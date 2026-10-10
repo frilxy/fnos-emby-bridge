@@ -3,6 +3,19 @@
 本项目（**飞牛影视 Emby 桥接**）的版本历史。每个版本的改动都附带**实机验证依据**
 （客户端日志 / 官方 API 文档）。
 
+## v1.0.12
+
+- **修复「生成推荐影片失败」**。`/Movies/Recommendations` 官方契约是
+  **`RecommendationDto[]`（数组）**，而桥接从未注册该路由，落到兜底返回了 QueryResult
+  对象 `{"Items":[],...}`，客户端按数组反序列化直接抛异常。
+  现在按官方契约返回数组，并给出真实内容：以用户**最近播放过的条目**为基线
+  （`RecommendationType = SimilarToRecentlyPlayed`），推荐它所属媒体库里的其它条目
+  （`BaselineItemName` / `CategoryId` / `Items` 均为官方 `RecommendationDto` 字段）。
+  没有观看历史时返回空数组——真实 Emby 对无历史用户同样如此。
+- 同一批检查确认 `/Users/{uid}/Suggestions` 官方就是 `QueryResult` 对象，兜底形状正确，
+  无需修改。
+- `routeSegmentCase` 补充 `movies` / `recommendations`，客户端发小写路径也能命中。
+
 ## v1.0.11
 
 - **后台账号密码改为安装时必须设定**。此前 Go 端内置默认密码 `admin123`（等于后台没有鉴权），

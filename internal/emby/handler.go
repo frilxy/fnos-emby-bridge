@@ -195,6 +195,11 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /Items/Resume", h.handleResume)
 	mux.HandleFunc("GET /Users/{uid}/Items/Resume", h.handleResume)
 	mux.HandleFunc("GET /Users/{uid}/Items/Latest", h.handleLatest)
+	// 推荐影片：官方契约是 **RecommendationDto[]（数组）**，不是 QueryResult 对象。
+	// 此前未注册 → 落到兜底返回 {"Items":[],...}，客户端按数组反序列化直接失败，
+	// 界面表现即「生成推荐影片失败」（小幻影视日志：The JSON value could not be
+	// converted to ...[]）。
+	mux.HandleFunc("GET /Movies/Recommendations", h.handleMovieRecommendations)
 	// 首页布局偏好（GET 读取 / POST 保存）
 	mux.HandleFunc("GET /DisplayPreferences/{key}", h.handleDisplayPrefsGet)
 	mux.HandleFunc("POST /DisplayPreferences/{key}", h.handleDisplayPrefsPost)
@@ -378,6 +383,8 @@ var routeSegmentCase = map[string]string{
 	"images": "Images", "primary": "Primary", "thememedia": "ThemeMedia",
 	"themesongs": "ThemeSongs", "themevideos": "ThemeVideos",
 	// fork 新增（与上面新增的路由配套，否则客户端发小写路径会落到兜底）
+	// 客户端全程小写调用（/emby/movies/recommendations 等）
+	"movies": "Movies", "recommendations": "Recommendations",
 	"userviews": "UserViews", "filters": "Filters", "plugins": "Plugins",
 	"groupingoptions": "GroupingOptions", "virtualfolders": "VirtualFolders",
 	"library": "Library", "counts": "Counts",
@@ -3671,6 +3678,110 @@ func resumeSnapshot(ctx context.Context, c *fn.Client) []fn.MediaItem {
 	}
 	resumeItems, resumeAt = all, time.Now()
 	return all
+}
+
+// handleMovieRecommendations 实现 GET /Movies/Recommendations。
+//
+// 官方契约（dev.emby.media → MoviesService/getMoviesRecommendations）：
+//
+//	200 | RecommendationDto[] | Returning a RecommendationDto[] object.
+//
+// RecommendationDto = { Items: BaseItemDto[], RecommendationType, BaselineItemName, CategoryId }。
+// 此前该路径未注册 → 落到兜底返回 QueryResult 对象，客户端按数组反序列化直接失败
+// （小幻影视界面表现：「生成推荐影片失败」）。
+//
+// 飞牛侧没有「相似影片」接口，所以只做站得住的一类：以用户最近播放过的条目为基线，
+// 推荐它**所属媒体库**里的其它条目（飞牛 item/list 按 create_time 倒序，新片优先），
+// RecommendationType 用官方枚举值 SimilarToRecentlyPlayed。
+// 没有任何播放记录时返回空数组 —— 真实 Emby 对无观看历史的用户同样返回空。
+func (h *Handler) handleMovieRecommendations(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	catLimit := queryInt(r.URL.Query(), "CategoryLimit", 5)
+	itemLimit := queryInt(r.URL.Query(), "ItemLimit", 10)
+	if catLimit <= 0 || catLimit > 20 {
+		catLimit = 5
+	}
+	if itemLimit <= 0 || itemLimit > 50 {
+		itemLimit = 10
+	}
+
+	recs := []map[string]any{}
+
+	// 全库扫一遍并按媒体库分组（MediaItem.AncestorGuid 即所属库）
+	client := h.fnOf(ctx)
+	byLib := map[string][]fn.MediaItem{}
+	var libs []string
+	if dbs, err := client.MediaDBList(ctx); err == nil {
+		for _, db := range dbs {
+			list, err := client.ItemListTyped(ctx, db.Guid, []string{"Episode", "Movie", "Video"}, 500)
+			if err != nil || len(list) == 0 {
+				continue
+			}
+			byLib[db.Guid] = list
+			libs = append(libs, db.Guid)
+		}
+	}
+
+	// 基线：有播放痕迹的条目，按「桥接记录的播放时刻」倒序（无记录时回退 watched_ts）
+	type baseline struct {
+		lib  string
+		item fn.MediaItem
+		at   int64
+	}
+	var bases []baseline
+	for _, lib := range libs {
+		for _, m := range byLib[lib] {
+			at := lastPlayedAt(m.Guid)
+			if m.Watched == 0 && m.IsWatched == 0 && m.Ts == 0 && at == 0 {
+				continue
+			}
+			if at == 0 {
+				at = m.WatchedTs
+			}
+			bases = append(bases, baseline{lib: lib, item: m, at: at})
+		}
+	}
+	sort.Slice(bases, func(i, j int) bool { return bases[i].at > bases[j].at })
+
+	used := map[string]bool{}
+	for _, b := range bases {
+		if len(recs) >= catLimit {
+			break
+		}
+		if used[b.item.Guid] {
+			continue
+		}
+		used[b.item.Guid] = true
+
+		items := make([]fn.MediaItem, 0, itemLimit)
+		for _, m := range byLib[b.lib] {
+			if m.Guid == b.item.Guid {
+				continue
+			}
+			items = append(items, m)
+			if len(items) >= itemLimit {
+				break
+			}
+		}
+		if len(items) == 0 {
+			continue
+		}
+
+		// 基线名直接复用条目转换结果，保证与列表页显示一致
+		name := ""
+		if bi := toEmbyItemsOrEmpty(r, []fn.MediaItem{b.item}, h); len(bi) > 0 {
+			name, _ = bi[0]["Name"].(string)
+		}
+
+		recs = append(recs, map[string]any{
+			"Items":              toEmbyItemsOrEmpty(r, items, h),
+			"RecommendationType": "SimilarToRecentlyPlayed",
+			"BaselineItemName":   name,
+			"CategoryId":         int64(len(recs) + 1),
+		})
+	}
+
+	writeJSON(w, http.StatusOK, recs)
 }
 
 // 首页布局偏好：内存态即可（重启丢失无妨，客户端会重新 POST）
