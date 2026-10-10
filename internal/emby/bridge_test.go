@@ -450,6 +450,13 @@ func TestItemsSortByAndOrder(t *testing.T) {
 		}
 	}
 
+	// 中文标题必须按**拼音序**，不是 Unicode 码点序。
+	// mock 里 "电影A"(dian) 与 "剧集B"(ju)：码点序会给出 [剧集B, 电影A]
+	// （剧 U+5267 < 电 U+7535），拼音序应为 [电影A, 剧集B]。
+	if len(asc) >= 2 && asc[0] != "fv_001" {
+		t.Fatalf("中文按标题升序不是拼音序（电影A 应排在 剧集B 前）：%v", asc)
+	}
+
 	// 按时间排序同样要生效（日期相同的情况下会退化为按标题，方向仍必须受 SortOrder 控制）
 	byDateAsc := ids("&SortBy=DateCreated&SortOrder=Ascending")
 	byDateDesc := ids("&SortBy=DateCreated&SortOrder=Descending")

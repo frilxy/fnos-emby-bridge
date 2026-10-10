@@ -36,6 +36,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/text/collate"
+	"golang.org/x/text/language"
 
 	"fnos-emby-bridge/internal/fn"
 )
@@ -1384,6 +1386,28 @@ func hasSortKey(sortBy string, keys ...string) bool {
 	return false
 }
 
+// titleCollatorPool 提供按标题排序用的本地化比较器。
+//
+// 直接按字节比较中文得到的是 Unicode 码点序（"大"U+5927 < "爱"U+7231 < "秘"U+79D8），
+// 而中文用户/其它客户端要的是**拼音序**（爱 ai < 大 da < 秘 mi）。
+// CLDR 里 zh 的默认排序规则就是拼音序，用 x/text 的 collate 即可得到正确结果，
+// 同时英文/其它语言也是本地化序（大小写不敏感等），与 .NET/ICU 客户端一致。
+//
+// collate.Collator 不是并发安全的，用 sync.Pool 每 goroutine 借一个。
+var titleCollatorPool = sync.Pool{
+	New: func() any { return collate.New(language.Chinese, collate.Loose) },
+}
+
+// titleCompare 按本地化（中文=拼音）规则比较两个标题，返回 -1/0/1。
+func titleCompare(a, b string) int {
+	c, _ := titleCollatorPool.Get().(*collate.Collator)
+	if c == nil {
+		c = collate.New(language.Chinese, collate.Loose)
+	}
+	defer titleCollatorPool.Put(c)
+	return c.CompareString(a, b)
+}
+
 // itemSortDate 取条目用于排序的日期（首播 → 发行 → 首映，取第一个能解析的）。
 // 飞牛没有"入库时间"字段，桥接给客户端的 DateCreated 也是用首播日期兜底的
 // （见 toEmbyItem），所以按时间排序与客户端界面显示的日期是一致的。
@@ -1441,9 +1465,7 @@ func sortMediaItems(items []fn.MediaItem, sortBy, sortOrder string) {
 	var less func(i, j int) bool
 	switch {
 	case hasSortKey(sortBy, "SortName", "Name"):
-		less = func(i, j int) bool {
-			return strings.ToLower(items[i].Title) < strings.ToLower(items[j].Title)
-		}
+		less = func(i, j int) bool { return titleCompare(items[i].Title, items[j].Title) < 0 }
 	case hasSortKey(sortBy, "DatePlayed"):
 		less = func(i, j int) bool { return itemSortPlayedAt(items[i]) < itemSortPlayedAt(items[j]) }
 	case hasSortKey(sortBy, "PremiereDate", "DateCreated", "AirDate", "StartDate"):
@@ -1451,7 +1473,7 @@ func sortMediaItems(items []fn.MediaItem, sortBy, sortOrder string) {
 			ti, tj := itemSortDate(items[i]), itemSortDate(items[j])
 			if ti.Equal(tj) {
 				// 日期缺失/相同的条目退化为按标题，避免顺序不稳定
-				return strings.ToLower(items[i].Title) < strings.ToLower(items[j].Title)
+				return titleCompare(items[i].Title, items[j].Title) < 0
 			}
 			return ti.Before(tj)
 		}
