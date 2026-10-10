@@ -82,9 +82,9 @@ var (
 	recordMu   sync.Mutex
 	records    []RecordEntry
 	loginMu    sync.Mutex
-	loginCount           = map[string]int{} // username → 真登录次数
+	loginCount = map[string]int{} // username → 真登录次数
 	rangeMu    sync.Mutex
-	lastRange            string // 最近一次 media/range 收到的 Range 头
+	lastRange  string // 最近一次 media/range 收到的 Range 头
 )
 
 // MockLastRangeHeader 返回最近一次 /v/api/v1/media/range 收到的 Range 头。
@@ -344,6 +344,16 @@ func NewHandler(cloudDirect bool, cdnBase string, opts ...Option) *http.ServeMux
 		_, _ = w.Write(buf)
 	})
 
+	// item/watched：标记/取消已看（桥接"播完自动标已看"会调用；POST 标记、DELETE 取消）
+	mux.HandleFunc("POST /v/api/v1/item/watched", func(w http.ResponseWriter, r *http.Request) {
+		mockSetWatched(r, 1)
+		writeResult(w, 0, "", map[string]any{})
+	})
+	mux.HandleFunc("DELETE /v/api/v1/item/watched", func(w http.ResponseWriter, r *http.Request) {
+		mockSetWatched(r, 0)
+		writeResult(w, 0, "", map[string]any{})
+	})
+
 	mux.HandleFunc("POST /v/api/v1/play/record", func(w http.ResponseWriter, r *http.Request) {
 		token := r.Header.Get("Authorization")
 		var req struct {
@@ -367,6 +377,37 @@ func NewHandler(cloudDirect bool, cdnBase string, opts ...Option) *http.ServeMux
 	})
 
 	return mux
+}
+
+// itemMu 保护 mockItems 的写操作（真实飞牛侧状态是会被改的）。
+var itemMu sync.Mutex
+
+// mockSetWatched 修改 mock 条目的 is_watched（并发安全）。
+func mockSetWatched(r *http.Request, v int) {
+	var req struct {
+		ItemGuid string `json:"item_guid"`
+	}
+	if b, err := io.ReadAll(r.Body); err == nil {
+		_ = json.Unmarshal(b, &req)
+	}
+	if req.ItemGuid == "" {
+		return
+	}
+	itemMu.Lock()
+	defer itemMu.Unlock()
+	if it, ok := mockItems[req.ItemGuid]; ok {
+		it["is_watched"] = v
+	}
+}
+
+// SetItemField 供测试直接改 mock 条目字段（例如把 ts 设成片尾，复现
+// "位置到片尾却仍未标已看"的「继续观看」残留）。
+func SetItemField(guid, key string, val any) {
+	itemMu.Lock()
+	defer itemMu.Unlock()
+	if it, ok := mockItems[guid]; ok {
+		it[key] = val
+	}
 }
 
 // writeResult 输出飞牛统一响应包 {"code":0,"msg":"","data":...}。

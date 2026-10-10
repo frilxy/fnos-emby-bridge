@@ -2787,10 +2787,16 @@ func (h *Handler) recordToFN(r *http.Request, itemID string, ticks int64, stoppe
 			resumeAt = time.Time{}
 			resumeMu.Unlock()
 		}
-		// 停止时位置接近结尾（≥92%）：标记已看完（飞牛 item/watched）
-		if stopped && dur > 0 && sec >= dur*92/100 {
+		// 看完判定：**任何一次**位置上报达到阈值就标记已看，不限于 Stopped。
+		//
+		// 实测小幻影视只发 Sessions/Playing/Progress、把位置推到片尾，从不发 Stopped ——
+		// 之前只在 stopped 时判定，于是位置记到了 100%（时长=位置）却永远不标已看，
+		// 条目一直挂在「继续观看」、状态也不变「已播放」。
+		// Emby 自身也是在播放进度达到约 90% 时判定为已播放，这里取 92% 与飞牛侧对齐。
+		if dur > 0 && sec*100 >= dur*watchedThresholdPercent {
 			if err := h.fnOf(r.Context()).WatchItem(r.Context(), itemID); err == nil {
-				log.Printf("[watched] %s 已看完（%.0f%%，%ds/%ds）", itemID, float64(sec)/float64(dur)*100, sec, dur)
+				log.Printf("[watched] %s 已看完（%.0f%%，%ds/%ds，stopped=%v）",
+					itemID, float64(sec)/float64(dur)*100, sec, dur, stopped)
 			}
 		}
 	}
@@ -3784,6 +3790,28 @@ func (h *Handler) handleResume(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// watchedThresholdPercent 看完判定阈值（%）。与飞牛播放器行为对齐：位置到达该比例
+// 即视为看完；Emby 自身用的也是约 90%。
+const watchedThresholdPercent = 92
+
+// nearEnd 判断条目位置是否已到片尾阈值。
+func nearEnd(m fn.MediaItem) bool {
+	dur := int64(m.Duration)
+	if dur <= 0 && m.Runtime > 0 {
+		dur = int64(m.Runtime) * 60
+	}
+	return dur > 0 && m.Ts*100 >= dur*watchedThresholdPercent
+}
+
+// markWatchedAsync 异步补标已看（自愈"位置到片尾却仍未看"的残留条目）。
+func markWatchedAsync(c *fn.Client, guid string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := c.WatchItem(ctx, guid); err == nil {
+		log.Printf("[watched] %s 自愈补标已看（位置已达片尾阈值）", guid)
+	}
+}
+
 // resumeSnapshot 取全库"继续观看"候选（ts>0 且未看完），按最后播放时间倒序，60s 缓存。
 func resumeSnapshot(ctx context.Context, c *fn.Client) []fn.MediaItem {
 	resumeMu.Lock()
@@ -3799,9 +3827,18 @@ func resumeSnapshot(ctx context.Context, c *fn.Client) []fn.MediaItem {
 				continue
 			}
 			for _, m := range list {
-				if m.Ts > 0 && m.Watched == 0 && m.IsWatched == 0 {
-					all = append(all, m)
+				if m.Ts == 0 || m.Watched != 0 || m.IsWatched != 0 {
+					continue
 				}
+				// 自愈：位置已到片尾（≥92%）却没标已看的条目。
+				// 早期版本只在 Sessions/Playing/Stopped 时判定"已看完"，而有的客户端
+				// （实测小幻影视）只发 Progress、从不发 Stopped，于是位置记到了 100%
+				// 却仍是未看状态 —— 这类条目既不该留在「继续观看」，也该补上已看标记。
+				if nearEnd(m) {
+					go markWatchedAsync(c, m.Guid)
+					continue
+				}
+				all = append(all, m)
 			}
 		}
 	}

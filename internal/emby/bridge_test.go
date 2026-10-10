@@ -407,6 +407,107 @@ func TestClientCompatEndpoints(t *testing.T) {
 	}
 }
 
+// 回归（fork 修复）：位置已到片尾却没标已看的条目，不应留在「继续观看」。
+//
+// 早期版本只在 Sessions/Playing/Stopped 时判定"已看完"，而有的客户端只发 Progress，
+// 于是留下"位置记到 100%、状态仍是未看"的残留 —— 条目一直挂在「继续观看」。
+// 桥接现在会在拉取「继续观看」时把这类条目排除，并异步补标已看。
+func TestResumeExcludesFinishedItems(t *testing.T) {
+	fnSrv := httptest.NewServer(mock.NewHandler(false, ""))
+	defer fnSrv.Close()
+
+	client := fn.NewClient(fnSrv.URL)
+	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
+	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	bridge := httptest.NewServer(h.Handler())
+	defer bridge.Close()
+
+	// 造出残留：位置 == 时长，但 is_watched 仍为 0
+	mock.SetItemField("fv_001", "ts", 5400)
+	mock.SetItemField("fv_001", "duration", 5400)
+	t.Cleanup(func() {
+		time.Sleep(300 * time.Millisecond) // 等异步补标完成
+		mock.SetItemField("fv_001", "ts", 0)
+		mock.SetItemField("fv_001", "is_watched", 0)
+	})
+
+	// 先用一次进度上报失效「继续观看」的 60s 快照缓存
+	resp, err := http.Post(bridge.URL+"/Sessions/Playing/Progress?api_key=k", "application/json",
+		strings.NewReader(`{"ItemId":"fv_001","PositionTicks":0}`))
+	if err != nil {
+		t.Fatalf("失效快照缓存失败：%v", err)
+	}
+	resp.Body.Close()
+
+	body := getJSON(t, bridge.URL+"/Users/u/Items/Resume?api_key=k")
+	var d struct {
+		Items []map[string]any `json:"Items"`
+	}
+	if err := json.Unmarshal(body, &d); err != nil {
+		t.Fatalf("Resume 返回不是 JSON：%s", body)
+	}
+	for _, it := range d.Items {
+		if fmt.Sprint(it["Id"]) == "fv_001" {
+			t.Fatalf("位置已到片尾（100%%）的条目不应出现在「继续观看」：%s", body)
+		}
+	}
+}
+
+// 回归（fork 修复）：播完判定不能只在 Stopped 时做。
+//
+// 实测小幻影视只发 Sessions/Playing/Progress、把位置推到片尾，从不发 Stopped。
+// 之前只在 stopped 时判定「已看完」，于是位置记到了 100%（时长 == 位置）却永远
+// 不标已看 —— 条目一直挂在「继续观看」，状态也不变「已播放」。
+func TestPlaybackProgressMarksWatched(t *testing.T) {
+	fnSrv := httptest.NewServer(mock.NewHandler(false, ""))
+	defer fnSrv.Close()
+
+	client := fn.NewClient(fnSrv.URL)
+	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
+	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	bridge := httptest.NewServer(h.Handler())
+	defer bridge.Close()
+
+	played := func(itemID string) bool {
+		body := getJSON(t, bridge.URL+"/Users/u/Items/"+itemID+"?api_key=k")
+		var it map[string]any
+		if err := json.Unmarshal(body, &it); err != nil {
+			t.Fatalf("取 %s 详情失败：%s", itemID, body)
+		}
+		ud, _ := it["UserData"].(map[string]any)
+		b, _ := ud["Played"].(bool)
+		return b
+	}
+
+	// mock 的条目是包级共享状态：用完把已看标记清掉，避免影响其它用例
+	t.Cleanup(func() {
+		req, _ := http.NewRequest(http.MethodDelete,
+			bridge.URL+"/Users/u/PlayedItems/fv_001?api_key=k", nil)
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			resp.Body.Close()
+		}
+	})
+
+	if played("fv_001") {
+		t.Fatal("前置条件不满足：fv_001 初始应为未播放")
+	}
+
+	// fv_001 时长 5400s；上报到片尾。注意用的是 **Progress**（stopped=false），
+	// 正是客户端实际的行为。
+	reqBody := fmt.Sprintf(`{"ItemId":"fv_001","PositionTicks":%d}`, int64(5400)*10_000_000)
+	resp, err := http.Post(bridge.URL+"/Sessions/Playing/Progress?api_key=k",
+		"application/json", strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("上报进度失败：%v", err)
+	}
+	resp.Body.Close()
+
+	if !played("fv_001") {
+		t.Fatalf("用 Sessions/Playing/Progress 上报到片尾后条目应变为已播放" +
+			"（此前只在 Stopped 时判定，而客户端从不发 Stopped）")
+	}
+}
+
 // 回归（fork 修复）：SortBy / SortOrder 必须生效。
 //
 // 客户端的「按标题 / 按时间 / 按评分」排序全部走这两个参数。桥接以前完全忽略它们，
