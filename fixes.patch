@@ -1,6 +1,6 @@
 diff -ruN a/.github/workflows/build.yml b/.github/workflows/build.yml
 --- a/.github/workflows/build.yml	1970-01-01 08:00:00.000000000 +0800
-+++ b/.github/workflows/build.yml	2026-10-10 15:47:56.274122174 +0800
++++ b/.github/workflows/build.yml	2026-10-10 16:21:06.347393003 +0800
 @@ -0,0 +1,34 @@
 +name: Build
 +
@@ -38,7 +38,7 @@ diff -ruN a/.github/workflows/build.yml b/.github/workflows/build.yml
 +          retention-days: 30
 diff -ruN a/.github/workflows/release.yml b/.github/workflows/release.yml
 --- a/.github/workflows/release.yml	1970-01-01 08:00:00.000000000 +0800
-+++ b/.github/workflows/release.yml	2026-10-10 15:47:56.274213938 +0800
++++ b/.github/workflows/release.yml	2026-10-10 16:21:06.347493297 +0800
 @@ -0,0 +1,85 @@
 +name: Release
 +
@@ -127,7 +127,7 @@ diff -ruN a/.github/workflows/release.yml b/.github/workflows/release.yml
 +            --jq '"Release: \(.url)\n附件: \([.assets[].name] | join(", "))"'
 diff -ruN a/cmd/fnos-emby-bridge/main.go b/cmd/fnos-emby-bridge/main.go
 --- a/cmd/fnos-emby-bridge/main.go	2026-09-29 23:36:45.000000000 +0800
-+++ b/cmd/fnos-emby-bridge/main.go	2026-10-10 15:47:56.270548015 +0800
++++ b/cmd/fnos-emby-bridge/main.go	2026-10-10 16:21:06.342521516 +0800
 @@ -10,7 +10,7 @@
  //	HOST        客户端访问本桥接的主机:端口（用于拼绝对媒体/海报 URL），默认 127.0.0.1:PORT
  //	SERVER_NAME 显示的服务器名，默认 fnos
@@ -204,7 +204,7 @@ diff -ruN a/cmd/fnos-emby-bridge/main.go b/cmd/fnos-emby-bridge/main.go
  	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 diff -ruN a/docker-compose.yml b/docker-compose.yml
 --- a/docker-compose.yml	2026-09-29 23:36:45.000000000 +0800
-+++ b/docker-compose.yml	2026-10-10 15:47:56.273507961 +0800
++++ b/docker-compose.yml	2026-10-10 16:21:06.345422780 +0800
 @@ -10,7 +10,8 @@
        # 连接和媒体库都可在后台填
        PORT: "8096"
@@ -217,7 +217,7 @@ diff -ruN a/docker-compose.yml b/docker-compose.yml
        - ./data:/data
 diff -ruN a/internal/admin/admin.go b/internal/admin/admin.go
 --- a/internal/admin/admin.go	2026-09-29 23:36:45.000000000 +0800
-+++ b/internal/admin/admin.go	2026-10-10 15:47:56.271158099 +0800
++++ b/internal/admin/admin.go	2026-10-10 16:21:06.343057741 +0800
 @@ -390,7 +390,7 @@
  func (s *Store) page(w http.ResponseWriter, r *http.Request) {
  	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -229,7 +229,7 @@ diff -ruN a/internal/admin/admin.go b/internal/admin/admin.go
  func (s *Store) login(w http.ResponseWriter, r *http.Request) {
 diff -ruN a/internal/admin/admin_html.go b/internal/admin/admin_html.go
 --- a/internal/admin/admin_html.go	2026-09-29 23:36:45.000000000 +0800
-+++ b/internal/admin/admin_html.go	2026-10-10 15:47:56.271307112 +0800
++++ b/internal/admin/admin_html.go	2026-10-10 16:21:06.343209257 +0800
 @@ -1,22 +1,33 @@
  package admin
  
@@ -286,7 +286,7 @@ diff -ruN a/internal/admin/admin_html.go b/internal/admin/admin_html.go
 +}
 diff -ruN a/internal/emby/bridge_test.go b/internal/emby/bridge_test.go
 --- a/internal/emby/bridge_test.go	2026-09-29 23:36:45.000000000 +0800
-+++ b/internal/emby/bridge_test.go	2026-10-10 15:47:56.271998049 +0800
++++ b/internal/emby/bridge_test.go	2026-10-10 16:21:06.343918774 +0800
 @@ -6,10 +6,12 @@
  	"io"
  	"net/http"
@@ -364,7 +364,7 @@ diff -ruN a/internal/emby/bridge_test.go b/internal/emby/bridge_test.go
  	// 9. 验证 /Items/{id}/Progress 回传
  	resp3, _ := http.Post(bridge.URL+"/Items/fv_001/Progress?api_key=k", "application/json",
  		strings.NewReader(`{"PositionTicks":1200000000}`)) // 120s
-@@ -115,6 +165,456 @@
+@@ -115,6 +165,513 @@
  	t.Logf("all emby endpoints ok against mock fnos")
  }
  
@@ -610,6 +610,63 @@ diff -ruN a/internal/emby/bridge_test.go b/internal/emby/bridge_test.go
 +	}
 +}
 +
++// 回归（fork 修复）：SortBy / SortOrder 必须生效。
++//
++// 客户端的「按标题 / 按时间 / 按评分」排序全部走这两个参数。桥接以前完全忽略它们，
++// 表现就是点了排序没反应 —— 列表顺序永远等于飞牛库内顺序。
++func TestItemsSortByAndOrder(t *testing.T) {
++	fnSrv := httptest.NewServer(mock.NewHandler(false, ""))
++	defer fnSrv.Close()
++
++	client := fn.NewClient(fnSrv.URL)
++	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
++	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
++	bridge := httptest.NewServer(h.Handler())
++	defer bridge.Close()
++
++	ids := func(q string) []string {
++		body := getJSON(t, bridge.URL+"/Users/u/Items?IncludeItemTypes=Movie,Series&Recursive=true&api_key=k"+q)
++		var d struct {
++			Items []map[string]any `json:"Items"`
++		}
++		if err := json.Unmarshal(body, &d); err != nil {
++			t.Fatalf("查询 %q 返回不是 JSON：%s", q, body)
++		}
++		out := make([]string, 0, len(d.Items))
++		for _, it := range d.Items {
++			out = append(out, fmt.Sprint(it["Id"]))
++		}
++		return out
++	}
++
++	asc := ids("&SortBy=SortName&SortOrder=Ascending")
++	desc := ids("&SortBy=SortName&SortOrder=Descending")
++	if len(asc) < 2 {
++		t.Fatalf("mock 条目不足（%v），无法验证排序", asc)
++	}
++	if strings.Join(asc, ",") == strings.Join(desc, ",") {
++		t.Fatalf("SortOrder 没生效：Ascending 与 Descending 返回同一顺序 %v", asc)
++	}
++	for i := range asc {
++		if asc[i] != desc[len(desc)-1-i] {
++			t.Fatalf("Descending 不是 Ascending 的逆序：asc=%v desc=%v", asc, desc)
++		}
++	}
++
++	// 按时间排序同样要生效（日期相同的情况下会退化为按标题，方向仍必须受 SortOrder 控制）
++	byDateAsc := ids("&SortBy=DateCreated&SortOrder=Ascending")
++	byDateDesc := ids("&SortBy=DateCreated&SortOrder=Descending")
++	if strings.Join(byDateAsc, ",") == strings.Join(byDateDesc, ",") {
++		t.Fatalf("按时间排序没生效：升序与降序相同 %v", byDateAsc)
++	}
++
++	// 不认识的排序键应保持原顺序（不能把现有行为改坏）
++	plain := ids("")
++	if got := ids("&SortBy=AlbumArtist"); strings.Join(got, ",") != strings.Join(plain, ",") {
++		t.Fatalf("未知排序键应保持原顺序：plain=%v got=%v", plain, got)
++	}
++}
++
 +// 回归（fork 修复）：SortBy=Random 必须真的随机。
 +//
 +// 客户端的「推荐影片」用
@@ -823,7 +880,7 @@ diff -ruN a/internal/emby/bridge_test.go b/internal/emby/bridge_test.go
  	// CDN 与飞牛同域：先建 mock 飞牛服务，再用其 URL 作为 cdnBase。
 diff -ruN a/internal/emby/fork_util_test.go b/internal/emby/fork_util_test.go
 --- a/internal/emby/fork_util_test.go	1970-01-01 08:00:00.000000000 +0800
-+++ b/internal/emby/fork_util_test.go	2026-10-10 15:47:56.271670993 +0800
++++ b/internal/emby/fork_util_test.go	2026-10-10 16:21:06.343581879 +0800
 @@ -0,0 +1,116 @@
 +package emby
 +
@@ -943,7 +1000,7 @@ diff -ruN a/internal/emby/fork_util_test.go b/internal/emby/fork_util_test.go
 +}
 diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
 --- a/internal/emby/handler.go	2026-09-29 23:36:45.000000000 +0800
-+++ b/internal/emby/handler.go	2026-10-10 15:47:56.272485664 +0800
++++ b/internal/emby/handler.go	2026-10-10 16:21:06.344399473 +0800
 @@ -23,6 +23,7 @@
  	"fmt"
  	"io"
@@ -1525,7 +1582,7 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  		// IncludeItemTypes 类型过滤（Emby 服务器 ASP.NET 大小写不敏感匹配；
  		// 客户端按类型查询如 IncludeItemTypes=Episode/Movie/Series，不过滤
  		// 会把混合列表原样返回=错误内容）。飞牛没有的实体类型 → 空列表。
-@@ -877,6 +1195,28 @@
+@@ -877,6 +1195,24 @@
  				all = kept
  			}
  		}
@@ -1540,40 +1597,135 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
 +				q.Get("IncludeItemTypes"), parentID, len(unfiltered))
 +			all = unfiltered
 +		}
-+		// fork 修复：SortBy=Random 必须真的随机。
++		// fork 修复：SortBy / SortOrder（Emby 标准排序）。
 +		//
-+		// 客户端的「推荐影片」用
-+		//   IncludeItemTypes=Movie,Series & SortBy=Random & Limit=30 & Recursive=true
-+		// 拉一屏（实测代理抓包确认，客户端并不调用 /Movies/Recommendations）。
-+		// 此前 SortBy 被完全忽略 → 返回飞牛库内固定顺序，这个查询稳定只给出前 30 个
-+		// 剧集、一部电影都没有，而且每次刷新一模一样 → 界面「生成推荐影片失败」。
-+		// 在类型过滤之后、分页之前打乱，保证一页里电影/剧集混合且每次不同。
-+		if isRandomSort(q.Get("SortBy")) {
-+			mrand.Shuffle(len(all), func(i, j int) { all[i], all[j] = all[j], all[i] })
-+		}
++		// 以前这两个参数被完全忽略 → 客户端里「按标题 / 按时间 / 按评分」排序点了没反应
++		// （列表顺序永远等于飞牛库内顺序）；客户端的「推荐影片」用的 SortBy=Random
++		// 也因此稳定返回同一批前 30 个剧集、一部电影都没有。
++		// 在类型过滤之后、分页之前排序，保证分页取到的是排序后的前 N 条。
++		sortMediaItems(all, q.Get("SortBy"), q.Get("SortOrder"))
  		total := len(all)
  		if start < 0 {
  			start = 0
-@@ -1030,6 +1370,18 @@
+@@ -1030,6 +1366,117 @@
  }
  
  // queryInt 从 query 取整数，缺省/非法返回 def。
 +// isRandomSort 判断 Emby 的 SortBy 是否要求随机。
-+// 客户端可能用逗号并列多个键（如 "Random,SortName"），任一为 Random 即视为随机。
 +func isRandomSort(sortBy string) bool {
-+	for _, s := range strings.Split(sortBy, ",") {
-+		if strings.EqualFold(strings.TrimSpace(s), "Random") {
-+			return true
++	return hasSortKey(sortBy, "Random")
++}
++
++// hasSortKey 判断 SortBy（客户端可能逗号并列多个键）里是否含某个键，大小写不敏感。
++func hasSortKey(sortBy string, keys ...string) bool {
++	for _, part := range strings.Split(sortBy, ",") {
++		part = strings.TrimSpace(part)
++		for _, k := range keys {
++			if strings.EqualFold(part, k) {
++				return true
++			}
 +		}
 +	}
 +	return false
++}
++
++// itemSortDate 取条目用于排序的日期（首播 → 发行 → 首映，取第一个能解析的）。
++// 飞牛没有"入库时间"字段，桥接给客户端的 DateCreated 也是用首播日期兜底的
++// （见 toEmbyItem），所以按时间排序与客户端界面显示的日期是一致的。
++func itemSortDate(m fn.MediaItem) time.Time {
++	for _, s := range []string{m.AirDate, m.ReleaseDate, m.FirstAirDate} {
++		if s == "" {
++			continue
++		}
++		for _, layout := range []string{
++			"2006-01-02",
++			"2006-01-02T15:04:05Z07:00",
++			"2006-01-02 15:04:05",
++		} {
++			if t, err := time.Parse(layout, s); err == nil {
++				return t
++			}
++		}
++	}
++	return time.Time{}
++}
++
++// itemSortPlayedAt 取条目用于"按播放时间"排序的时间戳（秒）。
++func itemSortPlayedAt(m fn.MediaItem) int64 {
++	if at := lastPlayedAt(m.Guid); at > 0 {
++		return at
++	}
++	return m.WatchedTs
++}
++
++// itemSeconds 条目时长（秒）：duration 优先，回退 runtime（分钟）。
++func itemSeconds(m fn.MediaItem) int {
++	if m.Duration > 0 {
++		return m.Duration
++	}
++	return m.Runtime * 60
++}
++
++// sortMediaItems 按 Emby 的 SortBy / SortOrder 就地排序。
++//
++// 客户端「按标题 / 按时间 / 按评分 / 按时长」等排序全部走这两个参数，而桥接以前
++// 完全忽略它们，表现就是排序点了没反应。这里覆盖客户端常用的键；
++// **不认识的键保持飞牛原顺序**，避免把现有行为改坏。
++// SortOrder 缺省或非 Descending 时为升序（与 Emby 语义一致）。
++func sortMediaItems(items []fn.MediaItem, sortBy, sortOrder string) {
++	if len(items) < 2 || strings.TrimSpace(sortBy) == "" {
++		return
++	}
++	if isRandomSort(sortBy) {
++		mrand.Shuffle(len(items), func(i, j int) { items[i], items[j] = items[j], items[i] })
++		return
++	}
++
++	desc := strings.EqualFold(strings.TrimSpace(sortOrder), "Descending")
++
++	var less func(i, j int) bool
++	switch {
++	case hasSortKey(sortBy, "SortName", "Name"):
++		less = func(i, j int) bool {
++			return strings.ToLower(items[i].Title) < strings.ToLower(items[j].Title)
++		}
++	case hasSortKey(sortBy, "DatePlayed"):
++		less = func(i, j int) bool { return itemSortPlayedAt(items[i]) < itemSortPlayedAt(items[j]) }
++	case hasSortKey(sortBy, "PremiereDate", "DateCreated", "AirDate", "StartDate"):
++		less = func(i, j int) bool {
++			ti, tj := itemSortDate(items[i]), itemSortDate(items[j])
++			if ti.Equal(tj) {
++				// 日期缺失/相同的条目退化为按标题，避免顺序不稳定
++				return strings.ToLower(items[i].Title) < strings.ToLower(items[j].Title)
++			}
++			return ti.Before(tj)
++		}
++	case hasSortKey(sortBy, "ProductionYear"):
++		less = func(i, j int) bool {
++			return yearOf(items[i].AirDate, items[i].ReleaseDate, items[i].FirstAirDate) <
++				yearOf(items[j].AirDate, items[j].ReleaseDate, items[j].FirstAirDate)
++		}
++	case hasSortKey(sortBy, "CommunityRating", "CriticRating"):
++		less = func(i, j int) bool { return voteOf(items[i].VoteAverage) < voteOf(items[j].VoteAverage) }
++	case hasSortKey(sortBy, "Runtime"):
++		less = func(i, j int) bool { return itemSeconds(items[i]) < itemSeconds(items[j]) }
++	default:
++		return // 不认识的排序键：保持飞牛原顺序
++	}
++
++	sort.SliceStable(items, func(i, j int) bool {
++		if desc {
++			return less(j, i)
++		}
++		return less(i, j)
++	})
 +}
 +
 +// queryInt 从查询参数取整数，缺失或非法时返回 def。
  func queryInt(q map[string][]string, key string, def int) int {
  	if v, ok := q[key]; ok && len(v) > 0 {
  		n := 0
-@@ -1056,7 +1408,7 @@
+@@ -1056,7 +1503,7 @@
  			"Type":                    "CollectionFolder",
  			"IsFolder":                true,
  			"CanDelete":               false,
@@ -1582,7 +1734,7 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  			"ImageTags":               map[string]any{"Primary": "Primary"},
  			"PrimaryImageAspectRatio": 0.6667,
  		}
-@@ -1072,7 +1424,25 @@
+@@ -1072,7 +1519,25 @@
  	})
  }
  
@@ -1609,7 +1761,7 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  func collectionType(c string) string {
  	switch strings.ToLower(strings.TrimSpace(c)) {
  	case "movie", "movies", "电影":
-@@ -1550,7 +1920,9 @@
+@@ -1550,7 +2015,9 @@
  					title = lang + " " + strings.ToUpper(as.CodecName)
  				}
  				a["DisplayLanguage"] = lang
@@ -1620,7 +1772,7 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  				a["Title"] = title
  				fillMediaStream(a)
  				streams = append(streams, a)
-@@ -2080,7 +2452,7 @@
+@@ -2080,7 +2547,7 @@
  	src := map[string]any{
  		"Id":                   id,
  		"MediaSourceId":        id,
@@ -1629,7 +1781,7 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  		"Protocol":             "Http",
  		"Type":                 "Virtual",
  		"IsRemote":             true,
-@@ -2139,14 +2511,70 @@
+@@ -2139,14 +2606,70 @@
  	}
  
  	// 2) 本地 NAS 文件：media/range 透传
@@ -1702,7 +1854,7 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  	hdr, status, body, err := h.fnOf(r.Context()).RangeMedia(r.Context(), mediaGuid, rangeHdr)
  	if err != nil {
  		http.Error(w, err.Error(), http.StatusBadGateway)
-@@ -2161,7 +2589,13 @@
+@@ -2161,7 +2684,13 @@
  			if _, err := fmt.Sscanf(cl, "%d", &size); err == nil && size > 0 {
  				if start, end, ok := parseClientRange(rangeHdr, size); ok && start < size {
  					if _, err := io.CopyN(io.Discard, body, start); err == nil {
@@ -1717,7 +1869,7 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  						w.Header().Set("Accept-Ranges", "bytes")
  						w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
  						w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
-@@ -2180,6 +2614,12 @@
+@@ -2180,6 +2709,12 @@
  			w.Header().Set(k, v)
  		}
  	}
@@ -1730,7 +1882,7 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  	w.Header().Set("Access-Control-Allow-Origin", "*")
  	if status == http.StatusNoContent {
  		w.WriteHeader(http.StatusNoContent)
-@@ -2300,6 +2740,38 @@
+@@ -2300,6 +2835,38 @@
  // Logo/Backdrop 用途），都没有时回退同一张海报。0.9.8 真机契约：海报走
  // GET {base}/v/api/v1/sys/img{poster_path}?w=400，只需 Cookie（无需 authx）。
  // 任何失败都回 1x1 透明 PNG（200），避免客户端破图。
@@ -1769,7 +1921,7 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  func (h *Handler) handleItemImage(w http.ResponseWriter, r *http.Request) {
  	id := r.PathValue("id")
  	// admin 后台自定义库图优先：命中直接 302（自定义 URL），不查飞牛
-@@ -2452,6 +2924,17 @@
+@@ -2452,6 +3019,17 @@
  
  // ---- 转换 ----
  
@@ -1787,7 +1939,7 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  // imageTags 生成 BaseItemDto.ImageTags：客户端只在 tag 非空时才发对应图片请求
  // （此前只填 Primary，Logo/Thumb 请求根本不会发出——Yamby "logo 没有了" 的根因）。
  // Primary=海报；Logo 用飞牛 logos 资源；Thumb/Backdrop/Art/Banner 用 backdrops
-@@ -2487,7 +2970,7 @@
+@@ -2487,7 +3065,7 @@
  	}
  	item := map[string]any{
  		"Id":                      info.Guid,
@@ -1796,7 +1948,7 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  		"Name":                    displayName(info),
  		"Type":                    itemType,
  		"SortName":                info.Item.Title,
-@@ -2545,7 +3028,9 @@
+@@ -2545,7 +3123,9 @@
  		"LocationType":        "FileSystem",
  		"UserData": map[string]any{
  			"Key":                   info.Guid,
@@ -1806,7 +1958,7 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  			"IsFavorite":            false,
  			"PlaybackPositionTicks": info.Ts * 10_000_000, // 续播位置（秒→ticks）
  		},
-@@ -2650,7 +3135,7 @@
+@@ -2650,7 +3230,7 @@
  	}
  	item := map[string]any{
  		"Id":                      m.Guid,
@@ -1815,7 +1967,7 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  		"Name":                    name,
  		"Type":                    itemType,
  		"IsFolder":                isFolder,
-@@ -2794,10 +3279,20 @@
+@@ -2794,10 +3374,20 @@
  	}
  	// UserData（官方 UserItemDataDto）：Played/PlayCount/续播位置/收藏——
  	// 飞牛 ts=续播位置秒，watched=1 已看完
@@ -1836,7 +1988,7 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  		"IsFavorite":            m.IsFavorite != 0,
  		"PlaybackPositionTicks": m.Ts * 10_000_000,
  	}
-@@ -2971,6 +3466,82 @@
+@@ -2971,6 +3561,82 @@
  	http.Error(w, "subtitle not available via bridge (embedded in container)", http.StatusNotFound)
  }
  
@@ -1919,7 +2071,7 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  // handleItemCounts 实现 GET /Items/{id}/Counts：客户端仪表盘统计。
  func (h *Handler) handleItemCounts(w http.ResponseWriter, r *http.Request) {
  	dbs, err := h.fnOf(r.Context()).MediaDBList(r.Context())
-@@ -2980,7 +3551,7 @@
+@@ -2980,7 +3646,7 @@
  	}
  	writeJSON(w, http.StatusOK, map[string]any{
  		"LibraryCount": len(dbs),
@@ -1928,7 +2080,7 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  	})
  }
  
-@@ -3133,6 +3704,110 @@
+@@ -3133,6 +3799,110 @@
  	return all
  }
  
@@ -2041,7 +2193,7 @@ diff -ruN a/internal/emby/handler.go b/internal/emby/handler.go
  
 diff -ruN a/internal/emby/util.go b/internal/emby/util.go
 --- a/internal/emby/util.go	2026-09-29 23:36:45.000000000 +0800
-+++ b/internal/emby/util.go	2026-10-10 15:47:56.271540040 +0800
++++ b/internal/emby/util.go	2026-10-10 16:21:06.343448557 +0800
 @@ -6,6 +6,7 @@
  	"io"
  	"math/rand"
@@ -2153,7 +2305,7 @@ diff -ruN a/internal/emby/util.go b/internal/emby/util.go
 +}
 diff -ruN a/internal/mock/fnos.go b/internal/mock/fnos.go
 --- a/internal/mock/fnos.go	2026-09-29 23:36:45.000000000 +0800
-+++ b/internal/mock/fnos.go	2026-10-10 15:47:56.273051329 +0800
++++ b/internal/mock/fnos.go	2026-10-10 16:21:06.344966556 +0800
 @@ -47,10 +47,18 @@
  			"duration": 2700, "runtime": 45, "can_play": 1, "is_watched": 0,
  			"season_number": 1, "episode_number": 1, "air_date": "2024-02-01", "overview": "一集剧",

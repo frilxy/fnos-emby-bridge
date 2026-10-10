@@ -1206,17 +1206,13 @@ func (h *Handler) handleItems(w http.ResponseWriter, r *http.Request) {
 				q.Get("IncludeItemTypes"), parentID, len(unfiltered))
 			all = unfiltered
 		}
-		// fork 修复：SortBy=Random 必须真的随机。
+		// fork 修复：SortBy / SortOrder（Emby 标准排序）。
 		//
-		// 客户端的「推荐影片」用
-		//   IncludeItemTypes=Movie,Series & SortBy=Random & Limit=30 & Recursive=true
-		// 拉一屏（实测代理抓包确认，客户端并不调用 /Movies/Recommendations）。
-		// 此前 SortBy 被完全忽略 → 返回飞牛库内固定顺序，这个查询稳定只给出前 30 个
-		// 剧集、一部电影都没有，而且每次刷新一模一样 → 界面「生成推荐影片失败」。
-		// 在类型过滤之后、分页之前打乱，保证一页里电影/剧集混合且每次不同。
-		if isRandomSort(q.Get("SortBy")) {
-			mrand.Shuffle(len(all), func(i, j int) { all[i], all[j] = all[j], all[i] })
-		}
+		// 以前这两个参数被完全忽略 → 客户端里「按标题 / 按时间 / 按评分」排序点了没反应
+		// （列表顺序永远等于飞牛库内顺序）；客户端的「推荐影片」用的 SortBy=Random
+		// 也因此稳定返回同一批前 30 个剧集、一部电影都没有。
+		// 在类型过滤之后、分页之前排序，保证分页取到的是排序后的前 N 条。
+		sortMediaItems(all, q.Get("SortBy"), q.Get("SortOrder"))
 		total := len(all)
 		if start < 0 {
 			start = 0
@@ -1371,14 +1367,113 @@ func queryGet(q map[string][]string, key string) string {
 
 // queryInt 从 query 取整数，缺省/非法返回 def。
 // isRandomSort 判断 Emby 的 SortBy 是否要求随机。
-// 客户端可能用逗号并列多个键（如 "Random,SortName"），任一为 Random 即视为随机。
 func isRandomSort(sortBy string) bool {
-	for _, s := range strings.Split(sortBy, ",") {
-		if strings.EqualFold(strings.TrimSpace(s), "Random") {
-			return true
+	return hasSortKey(sortBy, "Random")
+}
+
+// hasSortKey 判断 SortBy（客户端可能逗号并列多个键）里是否含某个键，大小写不敏感。
+func hasSortKey(sortBy string, keys ...string) bool {
+	for _, part := range strings.Split(sortBy, ",") {
+		part = strings.TrimSpace(part)
+		for _, k := range keys {
+			if strings.EqualFold(part, k) {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// itemSortDate 取条目用于排序的日期（首播 → 发行 → 首映，取第一个能解析的）。
+// 飞牛没有"入库时间"字段，桥接给客户端的 DateCreated 也是用首播日期兜底的
+// （见 toEmbyItem），所以按时间排序与客户端界面显示的日期是一致的。
+func itemSortDate(m fn.MediaItem) time.Time {
+	for _, s := range []string{m.AirDate, m.ReleaseDate, m.FirstAirDate} {
+		if s == "" {
+			continue
+		}
+		for _, layout := range []string{
+			"2006-01-02",
+			"2006-01-02T15:04:05Z07:00",
+			"2006-01-02 15:04:05",
+		} {
+			if t, err := time.Parse(layout, s); err == nil {
+				return t
+			}
+		}
+	}
+	return time.Time{}
+}
+
+// itemSortPlayedAt 取条目用于"按播放时间"排序的时间戳（秒）。
+func itemSortPlayedAt(m fn.MediaItem) int64 {
+	if at := lastPlayedAt(m.Guid); at > 0 {
+		return at
+	}
+	return m.WatchedTs
+}
+
+// itemSeconds 条目时长（秒）：duration 优先，回退 runtime（分钟）。
+func itemSeconds(m fn.MediaItem) int {
+	if m.Duration > 0 {
+		return m.Duration
+	}
+	return m.Runtime * 60
+}
+
+// sortMediaItems 按 Emby 的 SortBy / SortOrder 就地排序。
+//
+// 客户端「按标题 / 按时间 / 按评分 / 按时长」等排序全部走这两个参数，而桥接以前
+// 完全忽略它们，表现就是排序点了没反应。这里覆盖客户端常用的键；
+// **不认识的键保持飞牛原顺序**，避免把现有行为改坏。
+// SortOrder 缺省或非 Descending 时为升序（与 Emby 语义一致）。
+func sortMediaItems(items []fn.MediaItem, sortBy, sortOrder string) {
+	if len(items) < 2 || strings.TrimSpace(sortBy) == "" {
+		return
+	}
+	if isRandomSort(sortBy) {
+		mrand.Shuffle(len(items), func(i, j int) { items[i], items[j] = items[j], items[i] })
+		return
+	}
+
+	desc := strings.EqualFold(strings.TrimSpace(sortOrder), "Descending")
+
+	var less func(i, j int) bool
+	switch {
+	case hasSortKey(sortBy, "SortName", "Name"):
+		less = func(i, j int) bool {
+			return strings.ToLower(items[i].Title) < strings.ToLower(items[j].Title)
+		}
+	case hasSortKey(sortBy, "DatePlayed"):
+		less = func(i, j int) bool { return itemSortPlayedAt(items[i]) < itemSortPlayedAt(items[j]) }
+	case hasSortKey(sortBy, "PremiereDate", "DateCreated", "AirDate", "StartDate"):
+		less = func(i, j int) bool {
+			ti, tj := itemSortDate(items[i]), itemSortDate(items[j])
+			if ti.Equal(tj) {
+				// 日期缺失/相同的条目退化为按标题，避免顺序不稳定
+				return strings.ToLower(items[i].Title) < strings.ToLower(items[j].Title)
+			}
+			return ti.Before(tj)
+		}
+	case hasSortKey(sortBy, "ProductionYear"):
+		less = func(i, j int) bool {
+			return yearOf(items[i].AirDate, items[i].ReleaseDate, items[i].FirstAirDate) <
+				yearOf(items[j].AirDate, items[j].ReleaseDate, items[j].FirstAirDate)
+		}
+	case hasSortKey(sortBy, "CommunityRating", "CriticRating"):
+		less = func(i, j int) bool { return voteOf(items[i].VoteAverage) < voteOf(items[j].VoteAverage) }
+	case hasSortKey(sortBy, "Runtime"):
+		less = func(i, j int) bool { return itemSeconds(items[i]) < itemSeconds(items[j]) }
+	default:
+		return // 不认识的排序键：保持飞牛原顺序
+	}
+
+	sort.SliceStable(items, func(i, j int) bool {
+		if desc {
+			return less(j, i)
+		}
+		return less(i, j)
+	})
 }
 
 // queryInt 从查询参数取整数，缺失或非法时返回 def。

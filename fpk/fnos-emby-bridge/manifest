@@ -1,5 +1,5 @@
 appname               = fnos-emby-bridge
-version               = 1.0.13
+version               = 1.0.14
 display_name          = 飞牛影视 Emby 桥接
 desc                  = 把飞牛影视（fnOS）媒体库以 Emby 协议暴露出来，供 Infuse、VidHub、Yamby、小幻影视、爆米花等第三方客户端直接连接与播放。社区维护版，已修复一批客户端兼容问题。不做转码，播放取决于客户端解码能力。
 platform              = x86
@@ -11,4 +11,4 @@ desktop_uidir         = ui
 desktop_applaunchname = fnos-emby-bridge.Application
 service_port          = 8096
 ctl_stop              = true
-changelog             = 1.0.13：修复「生成推荐影片失败」——客户端用 IncludeItemTypes=Movie,Series&SortBy=Random 拉推荐，而桥接完全忽略 SortBy，稳定只返回前 30 个剧集、一部电影都没有且每次刷新一样。现已实现 SortBy=Random（类型过滤后、分页前打乱）。1.0.12：实现 /Movies/Recommendations（官方契约 RecommendationDto[] 数组）。1.0.11：后台账号密码改为安装向导必须设定，配置改放飞牛规范目录 TRIM_PKGETC。1.0.10：重新发布并附上构建产物。1.0.9：品牌统一为「飞牛影视 Emby 桥接」，打包迁到 GitHub Actions。
+changelog             = 1.0.14：实现完整的 SortBy / SortOrder —— 此前这两个参数被完全忽略，客户端「按标题 / 按时间 / 按评分 / 按时长」排序点了没反应。现支持 SortName、PremiereDate/DateCreated/AirDate、DatePlayed、ProductionYear、CommunityRating、Runtime、Random（大小写不敏感、支持逗号并列；未知键保持原顺序）。1.0.13：实现 SortBy=Random。1.0.12：实现 /Movies/Recommendations。1.0.11：后台账号密码改为安装向导必须设定，配置改放飞牛规范目录。1.0.10：重新发布并附上构建产物。1.0.9：品牌统一为「飞牛影视 Emby 桥接」。

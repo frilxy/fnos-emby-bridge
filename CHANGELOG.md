@@ -3,6 +3,33 @@
 本项目（**飞牛影视 Emby 桥接**）的版本历史。每个版本的改动都附带**实机验证依据**
 （客户端日志 / 官方 API 文档）。
 
+## v1.0.14
+
+- **实现完整的 `SortBy` / `SortOrder`**。此前这两个参数被**完全忽略**，所以在客户端里
+  「按标题 / 按时间」等排序点了没有任何反应——列表顺序永远等于飞牛库内顺序
+  （这也是 v1.0.13「推荐影片」问题的同一个根因）。
+
+  现在支持客户端常用的排序键（大小写不敏感，支持逗号并列如 `Random,SortName`；
+  **无法识别的键保持飞牛原顺序**，不改坏现有行为）：
+
+  | SortBy | 依据 |
+  |---|---|
+  | `SortName` / `Name` | 标题（忽略大小写） |
+  | `PremiereDate` / `DateCreated` / `AirDate` | 首播 → 发行 → 首映日期；日期相同退化为按标题 |
+  | `DatePlayed` | 最后播放时间（桥接记录优先，回退飞牛 `watched_ts`） |
+  | `ProductionYear` | 年份 |
+  | `CommunityRating` / `CriticRating` | 评分 |
+  | `Runtime` | 时长 |
+  | `Random` | 随机打乱 |
+
+  `SortOrder=Descending` 为降序，缺省为升序。
+
+  注：飞牛没有「入库时间」字段，桥接给客户端的 `DateCreated` 本来也是用首播日期兜底的
+  （见 `toEmbyItem`），所以按时间排序与界面显示的日期一致。
+
+- 回归测试 `TestItemsSortByAndOrder`：断言升序/降序互为逆序、按时间排序生效、
+  未知排序键保持原顺序。实测上游原版报「SortOrder 没生效：Ascending 与 Descending 返回同一顺序」。
+
 ## v1.0.13
 
 - **修复「生成推荐影片失败」**（真正的原因）。用代理抓包看到客户端「推荐影片」实际请求的是：

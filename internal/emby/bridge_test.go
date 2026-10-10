@@ -407,6 +407,63 @@ func TestClientCompatEndpoints(t *testing.T) {
 	}
 }
 
+// 回归（fork 修复）：SortBy / SortOrder 必须生效。
+//
+// 客户端的「按标题 / 按时间 / 按评分」排序全部走这两个参数。桥接以前完全忽略它们，
+// 表现就是点了排序没反应 —— 列表顺序永远等于飞牛库内顺序。
+func TestItemsSortByAndOrder(t *testing.T) {
+	fnSrv := httptest.NewServer(mock.NewHandler(false, ""))
+	defer fnSrv.Close()
+
+	client := fn.NewClient(fnSrv.URL)
+	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
+	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	bridge := httptest.NewServer(h.Handler())
+	defer bridge.Close()
+
+	ids := func(q string) []string {
+		body := getJSON(t, bridge.URL+"/Users/u/Items?IncludeItemTypes=Movie,Series&Recursive=true&api_key=k"+q)
+		var d struct {
+			Items []map[string]any `json:"Items"`
+		}
+		if err := json.Unmarshal(body, &d); err != nil {
+			t.Fatalf("查询 %q 返回不是 JSON：%s", q, body)
+		}
+		out := make([]string, 0, len(d.Items))
+		for _, it := range d.Items {
+			out = append(out, fmt.Sprint(it["Id"]))
+		}
+		return out
+	}
+
+	asc := ids("&SortBy=SortName&SortOrder=Ascending")
+	desc := ids("&SortBy=SortName&SortOrder=Descending")
+	if len(asc) < 2 {
+		t.Fatalf("mock 条目不足（%v），无法验证排序", asc)
+	}
+	if strings.Join(asc, ",") == strings.Join(desc, ",") {
+		t.Fatalf("SortOrder 没生效：Ascending 与 Descending 返回同一顺序 %v", asc)
+	}
+	for i := range asc {
+		if asc[i] != desc[len(desc)-1-i] {
+			t.Fatalf("Descending 不是 Ascending 的逆序：asc=%v desc=%v", asc, desc)
+		}
+	}
+
+	// 按时间排序同样要生效（日期相同的情况下会退化为按标题，方向仍必须受 SortOrder 控制）
+	byDateAsc := ids("&SortBy=DateCreated&SortOrder=Ascending")
+	byDateDesc := ids("&SortBy=DateCreated&SortOrder=Descending")
+	if strings.Join(byDateAsc, ",") == strings.Join(byDateDesc, ",") {
+		t.Fatalf("按时间排序没生效：升序与降序相同 %v", byDateAsc)
+	}
+
+	// 不认识的排序键应保持原顺序（不能把现有行为改坏）
+	plain := ids("")
+	if got := ids("&SortBy=AlbumArtist"); strings.Join(got, ",") != strings.Join(plain, ",") {
+		t.Fatalf("未知排序键应保持原顺序：plain=%v got=%v", plain, got)
+	}
+}
+
 // 回归（fork 修复）：SortBy=Random 必须真的随机。
 //
 // 客户端的「推荐影片」用
