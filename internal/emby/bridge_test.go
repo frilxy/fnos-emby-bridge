@@ -407,6 +407,56 @@ func TestClientCompatEndpoints(t *testing.T) {
 	}
 }
 
+// 回归（fork 修复）：SortBy=Random 必须真的随机。
+//
+// 客户端的「推荐影片」用
+//
+//	/Users/{uid}/Items?IncludeItemTypes=Movie,Series&SortBy=Random&Limit=30&Recursive=true
+//
+// 拉一屏（实测代理抓包确认）。此前桥接**完全忽略 SortBy**，返回飞牛库内固定顺序，
+// 于是这个查询稳定只给出前 30 个剧集、一部电影都没有，而且每次刷新一模一样 ——
+// 客户端因此报「生成推荐影片失败」。
+func TestSortByRandomShuffles(t *testing.T) {
+	fnSrv := httptest.NewServer(mock.NewHandler(false, ""))
+	defer fnSrv.Close()
+
+	client := fn.NewClient(fnSrv.URL)
+	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
+	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	bridge := httptest.NewServer(h.Handler())
+	defer bridge.Close()
+
+	const url = "/Users/u/Items?IncludeItemTypes=Movie,Series&SortBy=Random&Limit=1&Recursive=true&api_key=k"
+
+	// 不带 SortBy 时应当稳定返回同一条（作为对照，证明池子里确实有多条）
+	base := getJSON(t, bridge.URL+"/Users/u/Items?IncludeItemTypes=Movie,Series&Limit=1&Recursive=true&api_key=k")
+	var bd struct {
+		Items []map[string]any `json:"Items"`
+	}
+	if err := json.Unmarshal(base, &bd); err != nil || len(bd.Items) == 0 {
+		t.Fatalf("对照查询返回异常：%s", base)
+	}
+
+	// 带 Random 时限 1 连续取 24 次：池子至少 2 条时，全同的概率约 2^-19
+	seen := map[string]bool{}
+	for i := 0; i < 24; i++ {
+		body := getJSON(t, bridge.URL+url)
+		var d struct {
+			Items []map[string]any `json:"Items"`
+		}
+		if err := json.Unmarshal(body, &d); err != nil {
+			t.Fatalf("第 %d 次返回不是 JSON：%s", i, body)
+		}
+		if len(d.Items) != 1 {
+			t.Fatalf("SortBy=Random&Limit=1 应返回 1 条，实际 %d 条：%s", len(d.Items), body)
+		}
+		seen[fmt.Sprint(d.Items[0]["Id"])] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("SortBy=Random 连续 24 次都返回同一条 %v —— SortBy 没有生效（客户端「推荐影片」会因此固定不变且可能全是剧集）", seen)
+	}
+}
+
 // 回归（fork 修复）：/Movies/Recommendations 官方返回 RecommendationDto[]（数组）。
 //
 // 官方契约（dev.emby.media → MoviesService/getMoviesRecommendations）：

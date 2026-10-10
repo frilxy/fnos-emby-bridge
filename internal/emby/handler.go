@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	mrand "math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -1205,6 +1206,17 @@ func (h *Handler) handleItems(w http.ResponseWriter, r *http.Request) {
 				q.Get("IncludeItemTypes"), parentID, len(unfiltered))
 			all = unfiltered
 		}
+		// fork 修复：SortBy=Random 必须真的随机。
+		//
+		// 客户端的「推荐影片」用
+		//   IncludeItemTypes=Movie,Series & SortBy=Random & Limit=30 & Recursive=true
+		// 拉一屏（实测代理抓包确认，客户端并不调用 /Movies/Recommendations）。
+		// 此前 SortBy 被完全忽略 → 返回飞牛库内固定顺序，这个查询稳定只给出前 30 个
+		// 剧集、一部电影都没有，而且每次刷新一模一样 → 界面「生成推荐影片失败」。
+		// 在类型过滤之后、分页之前打乱，保证一页里电影/剧集混合且每次不同。
+		if isRandomSort(q.Get("SortBy")) {
+			mrand.Shuffle(len(all), func(i, j int) { all[i], all[j] = all[j], all[i] })
+		}
 		total := len(all)
 		if start < 0 {
 			start = 0
@@ -1358,6 +1370,18 @@ func queryGet(q map[string][]string, key string) string {
 }
 
 // queryInt 从 query 取整数，缺省/非法返回 def。
+// isRandomSort 判断 Emby 的 SortBy 是否要求随机。
+// 客户端可能用逗号并列多个键（如 "Random,SortName"），任一为 Random 即视为随机。
+func isRandomSort(sortBy string) bool {
+	for _, s := range strings.Split(sortBy, ",") {
+		if strings.EqualFold(strings.TrimSpace(s), "Random") {
+			return true
+		}
+	}
+	return false
+}
+
+// queryInt 从查询参数取整数，缺失或非法时返回 def。
 func queryInt(q map[string][]string, key string, def int) int {
 	if v, ok := q[key]; ok && len(v) > 0 {
 		n := 0

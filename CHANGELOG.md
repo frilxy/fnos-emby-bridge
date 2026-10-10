@@ -3,6 +3,25 @@
 本项目（**飞牛影视 Emby 桥接**）的版本历史。每个版本的改动都附带**实机验证依据**
 （客户端日志 / 官方 API 文档）。
 
+## v1.0.13
+
+- **修复「生成推荐影片失败」**（真正的原因）。用代理抓包看到客户端「推荐影片」实际请求的是：
+
+  ```
+  GET /Users/{uid}/Items?IncludeItemTypes=Movie,Series&...&SortBy=Random&Limit=30&Recursive=true
+  ```
+
+  它**并不调用** `/Movies/Recommendations`（v1.0.12 修的那个端点，抓包里只有我自己的自检请求）。
+  而桥接**完全忽略 `SortBy`**：返回的是飞牛库内固定顺序，这个查询稳定只给出前 30 个**剧集**、
+  一部电影都没有，而且每次刷新返回**完全一样**的列表 → 客户端认为「生成推荐」失败。
+
+  现已实现 `SortBy=Random`（在类型过滤之后、分页之前打乱候选集），
+  于是同一查询每页都是电影/剧集混合且每次刷新都不同。
+  回归测试 `TestSortByRandomShuffles` 连续 24 次取样断言不全相同；修复前实测 24 次全为同一条。
+
+- 顺带说明：v1.0.12 的 `/Movies/Recommendations` 仍保留（官方契约就是
+  `RecommendationDto[]`，其它客户端会用），只是不是本客户端这条路径。
+
 ## v1.0.12
 
 - **修复「生成推荐影片失败」**。`/Movies/Recommendations` 官方契约是
