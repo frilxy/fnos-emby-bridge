@@ -1,5 +1,5 @@
 appname               = fnos-emby-bridge
-version               = 1.0.16
+version               = 1.0.17
 display_name          = 飞牛影视 Emby 桥接
 desc                  = 把飞牛影视（fnOS）媒体库以 Emby 协议暴露出来，供 Infuse、VidHub、Yamby、小幻影视、爆米花等第三方客户端直接连接与播放。社区维护版，已修复一批客户端兼容问题。不做转码，播放取决于客户端解码能力。
 platform              = x86
@@ -11,4 +11,4 @@ desktop_uidir         = ui
 desktop_applaunchname = fnos-emby-bridge.Application
 service_port          = 8096
 ctl_stop              = true
-changelog             = 1.0.16：修复「播完不标已看、一直留在继续观看」——此前只在 Sessions/Playing/Stopped 时判定看完，而有的客户端只发 Progress，导致位置记到 100% 却仍是未看。现改为任何一次位置上报达到 92% 即标记已看，并对已存在的"位置到片尾仍未看"残留做自愈（排除出继续观看并异步补标）。1.0.15：中文标题按拼音序。1.0.14：实现完整的 SortBy / SortOrder。1.0.13：实现 SortBy=Random。1.0.12：实现 /Movies/Recommendations。1.0.11：后台账号密码改为安装向导必须设定。
+changelog             = 1.0.17：桌面入口从「跳转新页面」改为在飞牛桌面内嵌打开（app/ui/config 的 type 由 url 改为 iframe）。1.0.16：修复播完不标已看（任何一次位置上报达 92% 即标记，并对已有残留自愈）。1.0.15：中文标题按拼音序。1.0.14：实现完整的 SortBy / SortOrder。1.0.13：实现 SortBy=Random。1.0.12：实现 /Movies/Recommendations。1.0.11：后台账号密码改为安装向导必须设定。

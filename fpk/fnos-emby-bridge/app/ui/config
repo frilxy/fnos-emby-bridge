@@ -3,7 +3,7 @@
         "fnos-emby-bridge.Application": {
             "title": "飞牛影视 Emby 桥接",
             "icon": "images/icon_{0}.png",
-            "type": "url",
+            "type": "iframe",
             "protocol": "http",
             "port": "8096",
             "url": "/admin",
