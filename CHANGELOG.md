@@ -3,6 +3,16 @@
 本项目（**飞牛影视 Emby 桥接**）的版本历史。每个版本的改动都附带**实机验证依据**
 （客户端日志 / 官方 API 文档）。
 
+## b005（预发布，构建号）
+
+- **修复播放 401**：`streamURL` 之前只读 `X-Emby-Token`/query，漏掉
+  `X-Emby-Authorization: MediaBrowser ..., Token="..."`；现在统一走 `h.apiKey()`，
+  生成的流 URL 会带 `api_key`，MPV/播放器直连不再 401。
+- **修复 PlaybackInfo 崩溃**：`PlaySessionId` 用 `id[:12]`，短 id 会 slice 越界；已加保护。
+- **电视图片兜底调整**：Primary 先找同剧/季的 parent 图，再退回自己的 backdrop；
+  不再用“库内第一张图”给 TV 兜底，避免电视节目显示成别的剧海报。
+- 包含 b004 的图片公开/会话 client/playinfo 兜底。
+
 ## b004（预发布，构建号）
 
 针对「演员图正常、内容图全空」的修复（演员图走 tag 直连，不经过 item 详情，说明问题在

@@ -3364,10 +3364,9 @@ func fillItemCommon(item map[string]any) {
 // 导致播放器本地立即失败、零网络请求——"点了播放没反应/播不了"的真凶），
 // 同时补官方字段 DirectStreamUrl（官方服务器直连场景必有）。
 func (h *Handler) streamURL(r *http.Request, id string) string {
-	token := r.Header.Get("X-Emby-Token")
-	if token == "" {
-		token = r.URL.Query().Get("api_key")
-	}
+	// 必须用 h.apiKey：客户端常用 X-Emby-Authorization: MediaBrowser ..., Token="..."
+	// 只读 X-Emby-Token 会漏掉 token，MPV 直连流 URL 时就会 401。
+	token := h.apiKey(r)
 	q := "MediaSourceId=" + id + "&Static=true"
 	if token != "" {
 		q += "&api_key=" + token
@@ -3462,10 +3461,18 @@ func (h *Handler) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		// PlaySessionId 必须每次随机（官方为 GUID）。固定值会让 Yamby 把第二次
 		// 播放判定为"会话已存在"而忽略点击——"第一次能播、第二次按钮无反应"
-		"PlaySessionId": fmt.Sprintf("fnos-%s-%08x", id[:12], randUint32()),
+		"PlaySessionId": fmt.Sprintf("fnos-%s-%08x", shortID(id), randUint32()),
 		"ErrorCode":     nil,
 		"MediaSources":  item["MediaSources"],
 	})
+}
+
+// shortID 截断条目 id 用于 PlaySessionId；短 id（mock/非标准）不能越界切片。
+func shortID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
 }
 
 // handleStream 透传飞牛的 media/range 字节流给 Emby 客户端。
@@ -3894,10 +3901,8 @@ func (h *Handler) handleItemImage(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	// 条目自身没有对应图时：先用横版图兜底竖版位，再沿 parent 链找季/剧/库的图。
-	if p == "" && imgType != "logo" {
-		p = item.BackdropPath()
-	}
+	// 条目自身没有对应图时，先沿 parent 链找季/剧的图（同一作品），
+	// 竖版位不要优先拿横版图（否则电视节目海报会变成宽图/错图）。
 	if p == "" && item.ParentGuid != "" {
 		g := item.ParentGuid
 		for i := 0; i < 2 && g != "" && g != item.Guid; i++ {
@@ -3925,7 +3930,11 @@ func (h *Handler) handleItemImage(w http.ResponseWriter, r *http.Request) {
 			g = par.ParentGuid
 		}
 	}
-	if p == "" && (item.Type == "MediaDB" || item.Type == "Directory" || item.Type == "TV") {
+	if p == "" && imgType == "primary" {
+		p = item.BackdropPath()
+	}
+	// 只有库/目录才用"库内第一张图"兜底；TV 不借别的剧海报，避免张冠李戴。
+	if p == "" && (item.Type == "MediaDB" || item.Type == "Directory") {
 		// 库/剧等容器自身无海报：回退库内第一个有海报的作品
 		if list, err := h.allItems(r.Context(), h.imageClient(r), id); err == nil {
 			for _, it := range list {
