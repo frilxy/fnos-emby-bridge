@@ -248,26 +248,30 @@ func TestGenresFiltersAndDictionary(t *testing.T) {
 	}
 }
 
-func TestLatestTVReturnsEpisodes(t *testing.T) {
+func TestLatestTVDefaultsToSeries(t *testing.T) {
 	bridge, token := newV11Bridge(t, mock.WithTVLibrary())
+	// 默认 Latest 返回剧容器（客户端 TV 行才显示竖版封面，而不是每集的横版剧照）
 	body := getWithToken(t, bridge.URL+"/Users/u/Items/Latest?ParentId=lib_tv", token)
 	var items []map[string]any
 	if err := json.Unmarshal(body, &items); err != nil {
 		t.Fatalf("Latest 应返回纯数组：%v (%s)", err, body)
 	}
+	if len(items) != 1 || fmt.Sprint(items[0]["Type"]) != "Series" {
+		t.Fatalf("TV 库 Latest 默认应返回 Series，实际 %v（%s）", idsOf(items), body)
+	}
+
+	// 显式要 Episode 时仍返回最新集
+	body = getWithToken(t, bridge.URL+"/Users/u/Items/Latest?ParentId=lib_tv&IncludeItemTypes=Episode", token)
+	if err := json.Unmarshal(body, &items); err != nil {
+		t.Fatalf("Latest Episode decode: %v (%s)", err, body)
+	}
 	if len(items) != 2 {
-		t.Fatalf("TV 库 Latest 应返回 2 集，实际 %v（%s）", idsOf(items), body)
+		t.Fatalf("显式 IncludeItemTypes=Episode 应返回 2 集，实际 %v", idsOf(items))
 	}
 	for _, it := range items {
 		if fmt.Sprint(it["Type"]) != "Episode" {
-			t.Fatalf("TV 库 Latest 应返回 Episode，实际 %v", it["Type"])
+			t.Fatalf("显式 Episode 查询应返回 Episode，实际 %v", it["Type"])
 		}
-		if fmt.Sprint(it["SeriesId"]) != "fv_tv2" {
-			t.Fatalf("Latest 集缺 SeriesId：%v", it["SeriesId"])
-		}
-	}
-	if fmt.Sprint(items[0]["Id"]) != "fv_ep2" { // create_time 更大
-		t.Fatalf("Latest 应按入库时间倒序，首条应是 fv_ep2：%v", idsOf(items))
 	}
 }
 
@@ -314,6 +318,7 @@ func TestExternalSubtitleDelivery(t *testing.T) {
 func TestImageLongPathAndBackdropTags(t *testing.T) {
 	bridge, token := newV11Bridge(t, mock.WithTVLibrary())
 	mock.SetItemField("fv_tv2", "backdrops", []string{"/a.webp", "/b.webp"})
+	mock.SetItemField("fv_tv2", "poster", "")
 
 	body := getWithToken(t, bridge.URL+"/Items/fv_tv2", token)
 	var it map[string]any
@@ -321,6 +326,10 @@ func TestImageLongPathAndBackdropTags(t *testing.T) {
 	tags, _ := it["BackdropImageTags"].([]any)
 	if len(tags) != 2 {
 		t.Fatalf("多背景图应给 2 个 BackdropImageTags：%v", it["BackdropImageTags"])
+	}
+	itags, _ := it["ImageTags"].(map[string]any)
+	if fmt.Sprint(itags["Primary"]) == "" {
+		t.Fatalf("TV 没有 poster 时也必须声明 ImageTags.Primary（否则客户端不请求封面）：%v", itags)
 	}
 
 	req, _ := http.NewRequest(http.MethodGet, bridge.URL+"/Items/fv_tv2/Images/Backdrop/1/tag/jpg/400/600", nil)
