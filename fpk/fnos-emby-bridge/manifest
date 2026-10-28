@@ -1,5 +1,5 @@
 appname               = fnos-emby-bridge
-version               = 1.1.1
+version               = 1.1.2-b001
 display_name          = 飞牛影视 Emby 桥接
 desc                  = 把飞牛影视（fnOS）媒体库以 Emby 协议暴露出来，供 Infuse、VidHub、Yamby、小幻影视、爆米花等第三方客户端直接连接与播放。社区维护版，已修复一批客户端兼容问题。不做转码，播放取决于客户端解码能力。
 platform              = x86
@@ -11,4 +11,4 @@ desktop_uidir         = ui
 desktop_applaunchname = fnos-emby-bridge.Application
 service_port          = 8096
 ctl_stop              = true
-changelog             = 1.1.1：修复小幻影视 token 刷新 401 循环（新增 /Users/{id}/Authenticate 免鉴权入口）、部分条目详情 404（play/info 兜底、play/list 优先 item_guid）。1.1.0：新增搜索、真实入库时间、完整排序/筛选、类型/年份/分级元数据、Latest/NextUp、按用户 Resume、外挂字幕、多背景图与图片缓存、评分/隐藏继续观看、多用户身份与全站鉴权、读缓存与请求合并。1.0.17：桌面入口改为 iframe。1.0.16：修复播完不标已看。1.0.15：中文拼音排序。1.0.14：SortBy/SortOrder。
+changelog             = 1.1.2-b001：预发布版改用 b+三位构建号（b001/b002…，每次修改递增）；含 1.1.1 的小幻影视刷新/详情修复。1.1.1：修复小幻影视 token 刷新 401 循环（新增 /Users/{id}/Authenticate 免鉴权入口）、部分条目详情 404（play/info 兜底、play/list 优先 item_guid）。1.1.0：新增搜索、真实入库时间、完整排序/筛选、类型/年份/分级元数据、Latest/NextUp、按用户 Resume、外挂字幕、多背景图与图片缓存、评分/隐藏继续观看、多用户身份与全站鉴权、读缓存与请求合并。1.0.17：桌面入口改为 iframe。1.0.16：修复播完不标已看。1.0.15：中文拼音排序。1.0.14：SortBy/SortOrder。

@@ -10,6 +10,7 @@ on:
   push:
     tags:
       - 'v*'
+      - 'b*'
   workflow_dispatch:
     inputs:
       tag:
@@ -43,10 +44,16 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${INPUT_TAG:-$REF_NAME}"
-          VER="$(sed -n 's/^version[[:space:]]*=[[:space:]]*//p' fpk/fnos-emby-bridge/manifest | head -1)"
+          VER="$(sed -n 's/^version[[:space:]]*= *//p' fpk/fnos-emby-bridge/manifest | head -1)"
           echo "tag=${TAG}  manifest version=${VER}"
-          if [ "v${VER}" != "${TAG}" ]; then
-            echo "::error::tag ${TAG} 与 manifest 里的版本 v${VER} 不一致——请先改 manifest 再打 tag"
+          if [[ "${TAG}" =~ ^b[0-9]{3}$ ]]; then
+            # 预发布构建号：tag=b001，manifest=1.1.2-b001
+            case "${VER}" in
+              *-"${TAG}") ;;
+              *) echo "::error::tag ${TAG} 与 manifest ${VER} 不一致（应形如 1.1.2-${TAG}）"; exit 1 ;;
+            esac
+          elif [ "${TAG}" != "${VER}" ] && [ "${TAG}" != "v${VER}" ]; then
+            echo "::error::tag ${TAG} 与 manifest 里的版本 ${VER} 不一致——请先改 manifest 再打 tag"
             exit 1
           fi
 
@@ -58,7 +65,7 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${INPUT_TAG:-$REF_NAME}"
-          VER="${TAG#v}"
+          VER="$(sed -n 's/^version[[:space:]]*= *//p' fpk/fnos-emby-bridge/manifest | head -1)"
           ASSET="dist/fnos-emby-bridge-${VER}.fpk"
           [ -f "$ASSET" ] || { echo "::error::缺少构建产物 $ASSET"; exit 1; }
 

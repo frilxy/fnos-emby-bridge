@@ -21,14 +21,20 @@ OUT="${2:-$(cd "${ROOT}/.." && pwd)/dist/${APP}.fpk}"
 
 mkdir -p "$(dirname "${OUT}")"
 
+PACKED=0
 if command -v fnpack >/dev/null 2>&1; then
     echo "==> fnpack build（飞牛官方工具）"
     rm -f "${ROOT}/${APP}.fpk"
-    ( cd "${ROOT}" && fnpack build --directory "./${APP}" >/dev/null )
-    [ -f "${ROOT}/${APP}.fpk" ] || { echo "fnpack 没有产出 ${APP}.fpk" >&2; exit 1; }
-    mv -f "${ROOT}/${APP}.fpk" "${OUT}"
-else
-    echo "==> 用标准 tar 复刻 fpk 结构（未安装 fnpack）"
+    # 旧版 fnpack 会拒绝带预发布后缀的版本（如 1.1.2-b001）；失败时退回 tar 复刻。
+    if ( cd "${ROOT}" && fnpack build --directory "./${APP}" >/dev/null 2>&1 ) && [ -f "${ROOT}/${APP}.fpk" ]; then
+        mv -f "${ROOT}/${APP}.fpk" "${OUT}"
+        PACKED=1
+    else
+        echo "    fnpack 不接受当前版本号，退回标准 tar 复刻"
+    fi
+fi
+if [ "${PACKED}" -eq 0 ]; then
+    echo "==> 用标准 tar 复刻 fpk 结构"
     TMP="$(mktemp -d)"
     trap 'rm -rf "${TMP}"' EXIT
     PKG="${TMP}/pkg"
