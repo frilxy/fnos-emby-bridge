@@ -3817,7 +3817,7 @@ func (h *Handler) handleItemImage(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(png1x1())
 	}
 	// 人物头像（无状态）：People.PrimaryImageTag 是 base64url(飞牛 profile_path)
-	if len(tag) >= 8 {
+	if len(tag) >= 8 && !strings.HasPrefix(tag, "h") {
 		if b, err := base64.URLEncoding.DecodeString(tag); err == nil && len(b) > 0 && b[0] == '/' {
 			h.serveSysImg(w, r, string(b), maxW, maxH)
 			return
@@ -3921,16 +3921,9 @@ func (h *Handler) serveSysImg(w http.ResponseWriter, r *http.Request, p string, 
 	if wParam < 32 {
 		wParam = 32
 	}
-	// ETag/Cache-Control：客户端按 tag/URL 缓存图片；同图重复请求直接 304。
-	hsh := fnv.New64a()
-	_, _ = hsh.Write([]byte(p + "|" + strconv.Itoa(wParam)))
-	etag := fmt.Sprintf(`"%x"`, hsh.Sum64())
-	w.Header().Set("ETag", etag)
-	w.Header().Set("Cache-Control", "public, max-age=86400")
-	if inm := r.Header.Get("If-None-Match"); inm != "" && inm == etag {
-		w.WriteHeader(http.StatusNotModified)
-		return
-	}
+	// 不做 304：部分客户端（含小幻影视）对图片条件请求处理不一致，会把 304
+	// 当成空响应显示为空白。图片 URL 已用 tag 哈希做缓存失效，这里只给较短缓存。
+	w.Header().Set("Cache-Control", "public, max-age=3600")
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet,
 		h.fnOf(r.Context()).BaseURL+"/v/api/v1/sys/img"+p+"?w="+strconv.Itoa(wParam), nil)
 	if err != nil {
@@ -3954,11 +3947,33 @@ func (h *Handler) serveSysImg(w http.ResponseWriter, r *http.Request, p string, 
 		return
 	}
 	defer resp.Body.Close()
-	if ct := resp.Header.Get("Content-Type"); ct != "" {
-		w.Header().Set("Content-Type", ct)
+	ct := resp.Header.Get("Content-Type")
+	if ct == "" || !strings.HasPrefix(strings.ToLower(ct), "image/") {
+		ct = imageContentType(p)
+		log.Printf("[poster] sys/img %q 返回非图片 Content-Type=%q，按扩展名改用 %s", p, resp.Header.Get("Content-Type"), ct)
+	}
+	w.Header().Set("Content-Type", ct)
+	if resp.ContentLength > 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
 	}
 	w.WriteHeader(http.StatusOK)
 	copyStream(w, resp.Body)
+}
+
+// imageContentType 按路径扩展名兜底 Content-Type。
+func imageContentType(p string) string {
+	switch strings.ToLower(filepath.Ext(p)) {
+	case ".png":
+		return "image/png"
+	case ".webp":
+		return "image/webp"
+	case ".gif":
+		return "image/gif"
+	case ".avif":
+		return "image/avif"
+	default:
+		return "image/jpeg"
+	}
 }
 
 // ---- 转换 ----
@@ -4018,14 +4033,14 @@ func (h *Handler) genreDTOs(r *http.Request, ids []int) ([]string, []map[string]
 func backdropImageTags(m fn.MediaItem) []string {
 	paths := m.BackdropPaths()
 	if len(paths) == 0 {
-		if m.PosterPath() != "" || m.LogoPath() != "" {
-			return []string{"0"}
+		if p := firstNonEmpty(m.PosterPath(), m.LogoPath()); p != "" {
+			return []string{imageTagFor(p)}
 		}
 		return []string{}
 	}
 	tags := make([]string, 0, len(paths))
-	for i := range paths {
-		tags = append(tags, strconv.Itoa(i))
+	for _, p := range paths {
+		tags = append(tags, imageTagFor(p))
 	}
 	return tags
 }
@@ -4069,22 +4084,44 @@ func providerInfo(m fn.MediaItem) (map[string]any, []any) {
 	return ids, urls
 }
 
+// imageTagFor 返回图片 tag：用图片路径的短哈希做缓存键。
+// 这样海报/背景图变化时客户端 URL 会变，不会一直命中旧的 1×1/占位图缓存。
+func imageTagFor(p string) string {
+	if p == "" {
+		return ""
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(p))
+	return fmt.Sprintf("h%x", h.Sum64())
+}
+
 // imageTags 生成 BaseItemDto.ImageTags：客户端只在 tag 非空时才发对应图片请求
 // （此前只填 Primary，Logo/Thumb 请求根本不会发出——Yamby "logo 没有了" 的根因）。
 // Primary=海报；Logo 用飞牛 logos 资源；Thumb/Backdrop/Art/Banner 用 backdrops
 // （集 poster 本身即 1920×1080 横版剧照，回退海报裁剪显示）。
 func imageTags(m fn.MediaItem) map[string]any {
-	tags := map[string]any{"Primary": "Primary"}
+	tags := map[string]any{}
+	if p := m.PosterPath(); p != "" {
+		tags["Primary"] = imageTagFor(p)
+	}
 	// Logo：剧用自有 logos；季/集无自有资源但 handleItemImage 会回退所属剧的
 	// logos，同样声明（客户端只有看到 tag 才会发请求——季/集详情页标题图）
-	if m.LogoPath() != "" || m.Type == "Season" || m.Type == "Episode" {
-		tags["Logo"] = "Logo"
+	if p := m.LogoPath(); p != "" {
+		tags["Logo"] = imageTagFor(p)
+	} else if m.Type == "Season" || m.Type == "Episode" {
+		tags["Logo"] = "logo"
 	}
-	if m.BackdropPath() != "" || m.PosterPath() != "" {
-		tags["Thumb"] = "Thumb"
-		tags["Backdrop"] = "Backdrop"
-		tags["Art"] = "Art"
-		tags["Banner"] = "Banner"
+	if p := m.BackdropPath(); p != "" {
+		tags["Backdrop"] = imageTagFor(p)
+		tags["Thumb"] = tags["Backdrop"]
+		tags["Art"] = tags["Backdrop"]
+		tags["Banner"] = tags["Backdrop"]
+	} else if m.PosterPath() != "" {
+		t := imageTagFor(m.PosterPath())
+		tags["Backdrop"] = t
+		tags["Thumb"] = t
+		tags["Art"] = t
+		tags["Banner"] = t
 	}
 	return tags
 }
