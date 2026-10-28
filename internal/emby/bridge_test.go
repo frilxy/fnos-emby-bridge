@@ -30,6 +30,7 @@ func TestBridgeAgainstMockFN(t *testing.T) {
 	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
 
 	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	h.AllowAnonymous = true // 旧测试用例不带有效 token；鉴权由 TestAuthRequired 覆盖
 	// 用 Handler() 而非 Routes()：生产入口是 Handler()（含 /emby 剥离、大小写归一、
 	// 畸形绝对 URL 还原三层中间件），裸路由表测不到这些中间件的行为。
 	bridge := httptest.NewServer(h.Handler())
@@ -181,6 +182,7 @@ func TestMangledAbsoluteURLPathRepaired(t *testing.T) {
 	client := fn.NewClient(fnSrv.URL)
 	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
 	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	h.AllowAnonymous = true // 旧测试用例不带有效 token；鉴权由 TestAuthRequired 覆盖
 	bridge := httptest.NewServer(h.Handler())
 	defer bridge.Close()
 
@@ -234,6 +236,7 @@ func TestOtherLibraryNotBlank(t *testing.T) {
 	client := fn.NewClient(fnSrv.URL)
 	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
 	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	h.AllowAnonymous = true // 旧测试用例不带有效 token；鉴权由 TestAuthRequired 覆盖
 	bridge := httptest.NewServer(h.Handler())
 	defer bridge.Close()
 
@@ -297,6 +300,7 @@ func TestClientCompatEndpoints(t *testing.T) {
 	client := fn.NewClient(fnSrv.URL)
 	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
 	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	h.AllowAnonymous = true // 旧测试用例不带有效 token；鉴权由 TestAuthRequired 覆盖
 	bridge := httptest.NewServer(h.Handler())
 	defer bridge.Close()
 
@@ -419,6 +423,7 @@ func TestResumeExcludesFinishedItems(t *testing.T) {
 	client := fn.NewClient(fnSrv.URL)
 	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
 	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	h.AllowAnonymous = true // 旧测试用例不带有效 token；鉴权由 TestAuthRequired 覆盖
 	bridge := httptest.NewServer(h.Handler())
 	defer bridge.Close()
 
@@ -465,6 +470,7 @@ func TestPlaybackProgressMarksWatched(t *testing.T) {
 	client := fn.NewClient(fnSrv.URL)
 	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
 	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	h.AllowAnonymous = true // 旧测试用例不带有效 token；鉴权由 TestAuthRequired 覆盖
 	bridge := httptest.NewServer(h.Handler())
 	defer bridge.Close()
 
@@ -519,6 +525,7 @@ func TestItemsSortByAndOrder(t *testing.T) {
 	client := fn.NewClient(fnSrv.URL)
 	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
 	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	h.AllowAnonymous = true // 旧测试用例不带有效 token；鉴权由 TestAuthRequired 覆盖
 	bridge := httptest.NewServer(h.Handler())
 	defer bridge.Close()
 
@@ -588,6 +595,7 @@ func TestSortByRandomShuffles(t *testing.T) {
 	client := fn.NewClient(fnSrv.URL)
 	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
 	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	h.AllowAnonymous = true // 旧测试用例不带有效 token；鉴权由 TestAuthRequired 覆盖
 	bridge := httptest.NewServer(h.Handler())
 	defer bridge.Close()
 
@@ -637,6 +645,7 @@ func TestMovieRecommendationsShape(t *testing.T) {
 	client := fn.NewClient(fnSrv.URL)
 	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
 	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	h.AllowAnonymous = true // 旧测试用例不带有效 token；鉴权由 TestAuthRequired 覆盖
 	bridge := httptest.NewServer(h.Handler())
 	defer bridge.Close()
 
@@ -676,6 +685,7 @@ func TestWriteEndpointsReturnUserItemData(t *testing.T) {
 	client := fn.NewClient(fnSrv.URL)
 	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
 	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	h.AllowAnonymous = true // 旧测试用例不带有效 token；鉴权由 TestAuthRequired 覆盖
 	bridge := httptest.NewServer(h.Handler())
 	defer bridge.Close()
 
@@ -736,6 +746,7 @@ func TestUserDataRequiredFields(t *testing.T) {
 	client := fn.NewClient(fnSrv.URL)
 	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
 	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	h.AllowAnonymous = true // 旧测试用例不带有效 token；鉴权由 TestAuthRequired 覆盖
 	bridge := httptest.NewServer(h.Handler())
 	defer bridge.Close()
 
@@ -829,6 +840,7 @@ func TestBridgeCloudDirectLink(t *testing.T) {
 	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
 
 	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	h.AllowAnonymous = true // 旧测试用例不带有效 token；鉴权由 TestAuthRequired 覆盖
 	bridge := httptest.NewServer(h.Routes())
 	defer bridge.Close()
 
@@ -898,6 +910,7 @@ func TestChunkedClampWhenUpstreamIgnoresRange(t *testing.T) {
 	client := fn.NewClient(fnSrv.URL)
 	_ = client.Login(t.Context(), "u", fn.SHA256Hex("p"))
 	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	h.AllowAnonymous = true // 旧测试用例不带有效 token；鉴权由 TestAuthRequired 覆盖
 	bridge := httptest.NewServer(h.Routes())
 	defer bridge.Close()
 
@@ -936,6 +949,7 @@ func TestBridgeNewContract(t *testing.T) {
 		t.Fatalf("login: %v", err)
 	}
 	h := emby.NewHandler(client, "fnos-test", "127.0.0.1:8096")
+	h.AllowAnonymous = true // 旧测试用例不带有效 token；鉴权由 TestAuthRequired 覆盖
 	bridge := httptest.NewServer(h.Routes())
 	defer bridge.Close()
 

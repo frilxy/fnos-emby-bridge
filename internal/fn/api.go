@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
+	"time"
 )
 
 // flexStr 兼容飞牛字段在 string / []string 间漂移（mediadb posters 是数组，item posters 是字符串）。
@@ -15,7 +18,8 @@ func (f *flexStr) UnmarshalJSON(b []byte) error {
 	if len(b) > 0 && b[0] == '[' {
 		var arr []string
 		if err := json.Unmarshal(b, &arr); err != nil {
-			return err
+			*f = ""
+			return nil // 形态不符时忽略，不让整条 item 解析失败
 		}
 		if len(arr) > 0 {
 			*f = flexStr(arr[0])
@@ -24,10 +28,179 @@ func (f *flexStr) UnmarshalJSON(b []byte) error {
 	}
 	var s string
 	if err := json.Unmarshal(b, &s); err != nil {
-		return err
+		*f = ""
+		return nil
 	}
 	*f = flexStr(s)
 	return nil
+}
+
+// flexStrs 兼容 string / []string，并保留全部值（背景图/海报可能有多个）。
+type flexStrs []string
+
+func (f *flexStrs) UnmarshalJSON(b []byte) error {
+	if len(b) == 0 || string(b) == "null" {
+		*f = nil
+		return nil
+	}
+	if b[0] == '[' {
+		var arr []string
+		if err := json.Unmarshal(b, &arr); err != nil {
+			*f = nil
+			return nil // 形态不符时忽略
+		}
+		out := make([]string, 0, len(arr))
+		for _, s := range arr {
+			if s = strings.TrimSpace(s); s != "" {
+				out = append(out, s)
+			}
+		}
+		*f = out
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		*f = nil
+		return nil
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		*f = nil
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(s, "\n") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	*f = out
+	return nil
+}
+
+// First 返回第一个非空值（无值返回空串）。
+func (f flexStrs) First() string {
+	for _, s := range f {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// flexInt 兼容 number / numeric string（id、集数等）。
+type flexInt int
+
+func (f *flexInt) UnmarshalJSON(b []byte) error {
+	if len(b) == 0 || string(b) == "null" {
+		*f = 0
+		return nil
+	}
+	s := strings.Trim(string(b), `"`)
+	if s == "" {
+		*f = 0
+		return nil
+	}
+	var n int
+	if _, err := fmt.Sscanf(s, "%d", &n); err != nil {
+		*f = 0
+		return nil
+	}
+	*f = flexInt(n)
+	return nil
+}
+
+// flexInts 兼容数字数组 / 字符串数组 / 单值（genres 在不同版本形态不同）。
+type flexInts []int
+
+func (f *flexInts) UnmarshalJSON(b []byte) error {
+	if len(b) == 0 || string(b) == "null" {
+		*f = nil
+		return nil
+	}
+	if b[0] == '[' {
+		var raw []json.RawMessage
+		if err := json.Unmarshal(b, &raw); err != nil {
+			return err
+		}
+		out := make([]int, 0, len(raw))
+		for _, r := range raw {
+			var n int
+			if _, err := fmt.Sscanf(strings.Trim(string(r), `"`), "%d", &n); err == nil && n > 0 {
+				out = append(out, n)
+			}
+		}
+		*f = out
+		return nil
+	}
+	var n int
+	if _, err := fmt.Sscanf(strings.Trim(string(b), `"`), "%d", &n); err == nil && n > 0 {
+		*f = []int{n}
+		return nil
+	}
+	*f = nil
+	return nil
+}
+
+// flexTime 把飞牛的入库时间（秒 / 毫秒 / 日期串）统一成 unix 秒。
+type flexTime int64
+
+func (f *flexTime) UnmarshalJSON(b []byte) error {
+	if len(b) == 0 || string(b) == "null" {
+		*f = 0
+		return nil
+	}
+	s := strings.TrimSpace(string(b))
+	if s == "" {
+		*f = 0
+		return nil
+	}
+	if s[0] == '"' {
+		var str string
+		if err := json.Unmarshal(b, &str); err != nil {
+			return err
+		}
+		str = strings.TrimSpace(str)
+		if str == "" {
+			*f = 0
+			return nil
+		}
+		var n int64
+		if _, err := fmt.Sscanf(str, "%d", &n); err == nil {
+			*f = flexTime(normalizeEpoch(n))
+			return nil
+		}
+		for _, layout := range []string{
+			"2006-01-02 15:04:05", "2006-01-02T15:04:05Z07:00",
+			"2006-01-02T15:04:05", "2006-01-02", time.RFC3339,
+		} {
+			if t, err := time.Parse(layout, str); err == nil {
+				*f = flexTime(t.Unix())
+				return nil
+			}
+		}
+		*f = 0
+		return nil
+	}
+	var n int64
+	if _, err := fmt.Sscanf(s, "%d", &n); err != nil {
+		*f = 0
+		return nil
+	}
+	*f = flexTime(normalizeEpoch(n))
+	return nil
+}
+
+// normalizeEpoch 判断时间戳单位：>1e12 视为毫秒，>1e8 视为秒，其余视为无效。
+func normalizeEpoch(n int64) int64 {
+	switch {
+	case n > 1_000_000_000_000:
+		return n / 1000
+	case n > 100_000_000:
+		return n
+	default:
+		return 0
+	}
 }
 
 // MediaDB 对应 GET /v/api/v1/mediadb/list 的库条目。
@@ -42,47 +215,79 @@ type MediaDB struct {
 
 // MediaItem 对应 item/list / season/list / item/{guid} 的条目（仅留桥接所需字段）。
 type MediaItem struct {
-	Guid             string  `json:"guid"`
-	ParentGuid       string  `json:"parent_guid"`
-	AncestorGuid     string  `json:"ancestor_guid"`
-	AncestorName     string  `json:"ancestor_name"`
-	AncestorCategory string  `json:"ancestor_category"`
-	Title            string  `json:"title"`
-	TvTitle          string  `json:"tv_title"`
-	ParentTitle      string  `json:"parent_title"`
-	Type             string  `json:"type"` // MediaDB/TV/Season/Episode/Movie/Video/Directory
-	Poster           flexStr `json:"poster"`
-	Posters          flexStr `json:"posters"`
-	PosterWidth      int     `json:"poster_width"`
-	PosterHeight     int     `json:"poster_height"`
-	Runtime          int     `json:"runtime"`  // 分钟
-	Duration         int     `json:"duration"` // 秒
-	IsFavorite       int     `json:"is_favorite"`
-	Watched          int     `json:"watched"`
-	IsWatched        int     `json:"is_watched"`
-	WatchedTs        int64   `json:"watched_ts"`
-	Ts               int64   `json:"ts"` // 续播位置（秒，真机确认）
-	VoteAverage      string  `json:"vote_average"`
-	Status           string  `json:"status"` // TV: "Returning Series"/"Ended"；其余 "1"
-	SeasonNumber     int     `json:"season_number"`
-	EpisodeNumber    int     `json:"episode_number"`
-	NumberOfSeasons  int     `json:"number_of_seasons"`
-	NumberOfEpisodes int     `json:"number_of_episodes"`
+	Guid             string   `json:"guid"`
+	ParentGuid       string   `json:"parent_guid"`
+	AncestorGuid     string   `json:"ancestor_guid"`
+	AncestorName     string   `json:"ancestor_name"`
+	AncestorCategory string   `json:"ancestor_category"`
+	Title            string   `json:"title"`
+	TvTitle          string   `json:"tv_title"`
+	OriginalTitle    string   `json:"original_title"`
+	ParentTitle      string   `json:"parent_title"`
+	Type             string   `json:"type"` // MediaDB/TV/Season/Episode/Movie/Video/Directory
+	Poster           flexStr  `json:"poster"`
+	Posters          flexStrs `json:"posters"`
+	PosterList       flexStrs `json:"poster_list"`
+	PosterWidth      int      `json:"poster_width"`
+	PosterHeight     int      `json:"poster_height"`
+	Runtime          int      `json:"runtime"`  // 分钟
+	Duration         int      `json:"duration"` // 秒
+	IsFavorite       int      `json:"is_favorite"`
+	Watched          int      `json:"watched"`
+	IsWatched        int      `json:"is_watched"`
+	WatchedTs        int64    `json:"watched_ts"`
+	Ts               int64    `json:"ts"` // 续播位置（秒，真机确认）
+	VoteAverage      string   `json:"vote_average"`
+	Status           string   `json:"status"` // TV: "Returning Series"/"Ended"；其余 "1"
+	SeasonNumber     int      `json:"season_number"`
+	EpisodeNumber    int      `json:"episode_number"`
+	NumberOfSeasons  int      `json:"number_of_seasons"`
+	NumberOfEpisodes int      `json:"number_of_episodes"`
 	// LocalNumberOfEpisodes 本地已有集数（季条目真机返回，episode_number 亦为本季集数）
 	LocalNumberOfEpisodes int    `json:"local_number_of_episodes"`
+	LocalNumberOfSeasons  int    `json:"local_number_of_seasons"`
 	AirDate               string `json:"air_date"`
 	ReleaseDate           string `json:"release_date"`
 	FirstAirDate          string `json:"first_air_date"`
+	LastAirDate           string `json:"last_air_date"`
 	Overview              string `json:"overview"`
 	CanPlay               int    `json:"can_play"`
 	FileName              string `json:"file_name"`
+	PlayError             string `json:"play_error"`
 	// Logo/剧照（0.9.8 真机契约：剧条目带 logos/backdrops 横竖版资源，
 	// 集 poster 即 1920×1080 横版剧照）
-	Logos     flexStr `json:"logos"`
-	Backdrops flexStr `json:"backdrops"`
-	TrimID    string  `json:"trim_id"` // 飞牛 TMDB 刮削 ID
-	ImdbID    string  `json:"imdb_id"`
+	Logos     flexStrs `json:"logos"`
+	Backdrops flexStrs `json:"backdrops"`
+	TrimID    string   `json:"trim_id"` // 飞牛 TMDB/IMDb 刮削 ID（tm/t t 前缀）
+	ImdbID    string   `json:"imdb_id"`
+	DoubanID  flexInt  `json:"douban_id"`
+	// CreateTime 入库时间（秒/毫秒/日期串，部分版本 item/list 带）
+	CreateTime flexTime `json:"create_time"`
+	// Genres 是飞牛的 genre id（不是名称），需配合 /tag/genres 映射
+	Genres              flexInts `json:"genres"`
+	ContentRatings      flexStr  `json:"content_ratings"`
+	ProductionCountries flexStrs `json:"production_countries"`
+	// SeriesGuid/NumberOfItem 仅部分接口返回；SeriesGuid 用于平铺集补剧归属
+	SeriesGuid   string            `json:"series_guid"`
+	NumberOfItem int               `json:"number_of_item"`
+	MediaStream  *MediaStreamBrief `json:"media_stream"`
 }
+
+// MediaStreamBrief 对应 item/list 里的 media_stream 摘要（列表卡片筛选/画质标识用）。
+type MediaStreamBrief struct {
+	Resolutions    flexStrs `json:"resolutions"`
+	AudioType      string   `json:"audio_type"`
+	ColorRangeType string   `json:"color_range_type"`
+}
+
+// CreatedAt 返回入库时间（unix 秒，0=未知）。
+func (m MediaItem) CreatedAt() int64 { return int64(m.CreateTime) }
+
+// GenreIDs 返回 genre id 列表（副本）。
+func (m MediaItem) GenreIDs() []int { return append([]int(nil), m.Genres...) }
+
+// CountryList 返回国家/地区列表（副本）。
+func (m MediaItem) CountryList() []string { return append([]string(nil), m.ProductionCountries...) }
 
 // StreamFile 对应 stream/list 返回的 files 元素：同一集的多媒体版本。
 type StreamFile struct {
@@ -124,14 +329,25 @@ func (m MediaItem) PosterPath() string {
 	if m.Poster != "" {
 		return string(m.Poster)
 	}
-	return string(m.Posters)
+	if p := m.Posters.First(); p != "" {
+		return p
+	}
+	return m.PosterList.First()
 }
 
+// LogoPaths 返回全部 Logo（通常只有一张）。
+func (m MediaItem) LogoPaths() []string { return append([]string(nil), m.Logos...) }
+
 // LogoPath 取 Logo 图路径（剧条目专属，透明底标题字）。
-func (m MediaItem) LogoPath() string { return string(m.Logos) }
+func (m MediaItem) LogoPath() string { return m.Logos.First() }
+
+// BackdropPaths 返回全部横版图（背景图轮播/多图索引用）。
+func (m MediaItem) BackdropPaths() []string {
+	return append([]string(nil), m.Backdrops...)
+}
 
 // BackdropPath 取横版剧照路径（剧条目专属；集的 poster 本身即横版）。
-func (m MediaItem) BackdropPath() string { return string(m.Backdrops) }
+func (m MediaItem) BackdropPath() string { return m.Backdrops.First() }
 
 // PlayInfo 对应 POST /v/api/v1/play/info 响应（真机验证）。
 type PlayInfo struct {
@@ -144,24 +360,39 @@ type PlayInfo struct {
 	AudioGuid    string `json:"audio_guid"`
 	SubtitleGuid string `json:"subtitle_guid"`
 	Ts           int64  `json:"ts"` // 续播秒
-	Item         struct {
-		Guid        string  `json:"guid"`
-		Title       string  `json:"title"`
-		TvTitle     string  `json:"tv_title"`
-		ParentTitle string  `json:"parent_title"`
-		Posters     flexStr `json:"posters"`
-		Poster      flexStr `json:"poster"`
-		Runtime     int     `json:"runtime"`  // 分钟
-		Duration    int     `json:"duration"` // 秒（部分版本返回）
-		IsWatched   int     `json:"is_watched"`
-		WatchedTs   int64   `json:"watched_ts"`
-		SeasonNum   int     `json:"season_number"`
-		EpisodeNum  int     `json:"episode_number"`
-		AirDate     string  `json:"air_date"`
-		Overview    string  `json:"overview"`
-		CanPlay     int     `json:"can_play"`
-		Type        string  `json:"type"`
-	} `json:"item"`
+	// PlayConfig 片头/片尾跳过点（秒，null=未设置），用于章节/跳过标记
+	PlayConfig PlayConfig `json:"play_config"`
+	Item       PlayItem   `json:"item"`
+}
+
+// PlayConfig 飞牛播放器的片头/片尾跳过配置。
+type PlayConfig struct {
+	SkipOpening flexInt `json:"skip_opening"`
+	SkipEnding  flexInt `json:"skip_ending"`
+}
+
+// PlayItem 是 play/info.item 的详情字段。
+type PlayItem struct {
+	Guid          string   `json:"guid"`
+	Title         string   `json:"title"`
+	TvTitle       string   `json:"tv_title"`
+	OriginalTitle string   `json:"original_title"`
+	ParentTitle   string   `json:"parent_title"`
+	Posters       flexStrs `json:"posters"`
+	Poster        flexStr  `json:"poster"`
+	Backdrops     flexStrs `json:"backdrops"`
+	Runtime       int      `json:"runtime"`  // 分钟
+	Duration      int      `json:"duration"` // 秒（部分版本返回）
+	IsWatched     int      `json:"is_watched"`
+	WatchedTs     int64    `json:"watched_ts"`
+	SeasonNum     int      `json:"season_number"`
+	EpisodeNum    int      `json:"episode_number"`
+	AirDate       string   `json:"air_date"`
+	ReleaseDate   string   `json:"release_date"`
+	Overview      string   `json:"overview"`
+	CanPlay       int      `json:"can_play"`
+	Type          string   `json:"type"`
+	PlayError     string   `json:"play_error"`
 }
 
 // StreamList 对应 GET /v/api/v1/stream/list/{guid}：同一条目全部可播版本。
@@ -755,4 +986,286 @@ func (c *Client) UnwatchItem(ctx context.Context, itemGuid string) error {
 		return fmt.Errorf("item/watched DELETE: %w", err)
 	}
 	return nil
+}
+
+// ---- 查询/筛选/历史/字幕（v1.1 新增） ----
+
+// ItemListQuery 是 item/list 的通用入口：body 由调用方组装（可带 tags 过滤）。
+// 返回列表与总数（兼容 total / total_count 两种字段名）。
+func (c *Client) ItemListQuery(ctx context.Context, body map[string]interface{}) ([]MediaItem, int, error) {
+	res, err := c.do(ctx, "POST", "item/list", body)
+	if err != nil {
+		return nil, 0, fmt.Errorf("item/list: %w", err)
+	}
+	var out struct {
+		List       []MediaItem `json:"list"`
+		Total      int         `json:"total"`
+		TotalCount int         `json:"total_count"`
+	}
+	if err := json.Unmarshal(res.Data, &out); err != nil {
+		return nil, 0, fmt.Errorf("item/list decode: %w", err)
+	}
+	total := out.Total
+	if total == 0 {
+		total = out.TotalCount
+	}
+	if out.List == nil {
+		out.List = []MediaItem{}
+	}
+	return out.List, total, nil
+}
+
+// Search 调 GET /v/api/v1/search/list?q=：返回影片/剧/人物等混合结果。
+// 真机口径：只接受 q、无分页、data 直接是数组；个别版本只认 POST body，做一次降级重试。
+func (c *Client) Search(ctx context.Context, q string) ([]MediaItem, error) {
+	q = strings.TrimSpace(q)
+	if q == "" {
+		return []MediaItem{}, nil
+	}
+	res, err := c.doPath(ctx, "GET", "/v/api/v1/search/list?q="+url.QueryEscape(q), nil)
+	if err != nil {
+		if res2, err2 := c.doPath(ctx, "POST", "/v/api/v1/search/list", map[string]interface{}{"q": q}); err2 == nil {
+			res = res2
+			err = nil
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("search/list: %w", err)
+	}
+	raws, err := decodeItemArray(res.Data)
+	if err != nil {
+		return nil, fmt.Errorf("search/list decode: %w", err)
+	}
+	out := make([]MediaItem, 0, len(raws))
+	for _, raw := range raws {
+		out = append(out, parseLooseItem(raw))
+	}
+	return out, nil
+}
+
+// PlayList 调 GET /v/api/v1/play/list：播放历史/继续观看，返回按最近播放排序的条目。
+// 响应 data 通常是数组（个别版本包一层 {list:...}）；字段有 snake_case 也有 camelCase。
+func (c *Client) PlayList(ctx context.Context) ([]MediaItem, error) {
+	res, err := c.doPath(ctx, "GET", "/v/api/v1/play/list", nil)
+	if err != nil {
+		return nil, fmt.Errorf("play/list: %w", err)
+	}
+	raws, err := decodeItemArray(res.Data)
+	if err != nil {
+		return nil, fmt.Errorf("play/list decode: %w", err)
+	}
+	out := make([]MediaItem, 0, len(raws))
+	for _, raw := range raws {
+		out = append(out, parseLooseItem(raw))
+	}
+	return out, nil
+}
+
+// decodeItemArray 兼容 data 为数组或 {list:[...]} / {data:[...]} 两种形态。
+func decodeItemArray(data json.RawMessage) ([]json.RawMessage, error) {
+	var arr []json.RawMessage
+	if err := json.Unmarshal(data, &arr); err == nil {
+		return arr, nil
+	}
+	var obj struct {
+		List []json.RawMessage `json:"list"`
+		Data []json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(data, &obj); err != nil {
+		return nil, err
+	}
+	if obj.List != nil {
+		return obj.List, nil
+	}
+	return obj.Data, nil
+}
+
+// parseLooseItem 把 snake_case / camelCase 混合的条目归一成 MediaItem。
+func parseLooseItem(raw json.RawMessage) MediaItem {
+	var m MediaItem
+	_ = json.Unmarshal(raw, &m) // snake_case 直接命中
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil {
+		return m
+	}
+	str := func(keys ...string) string {
+		for _, k := range keys {
+			if v, ok := obj[k]; ok {
+				var s string
+				if json.Unmarshal(v, &s) == nil && s != "" {
+					return s
+				}
+			}
+		}
+		return ""
+	}
+	num := func(keys ...string) int64 {
+		for _, k := range keys {
+			if v, ok := obj[k]; ok {
+				var n int64
+				if json.Unmarshal(v, &n) == nil {
+					return n
+				}
+				var f float64
+				if json.Unmarshal(v, &f) == nil {
+					return int64(f)
+				}
+				var s string
+				if json.Unmarshal(v, &s) == nil {
+					var x int64
+					if _, err := fmt.Sscanf(s, "%d", &x); err == nil {
+						return x
+					}
+				}
+			}
+		}
+		return 0
+	}
+	if m.Guid == "" {
+		m.Guid = str("guid", "item_guid", "itemGuid", "id")
+	}
+	if m.Guid == "" {
+		return m
+	}
+	if m.Title == "" {
+		m.Title = str("title", "name")
+	}
+	if m.TvTitle == "" {
+		m.TvTitle = str("tv_title", "tvTitle")
+	}
+	if m.Type == "" {
+		m.Type = str("type", "item_type", "itemType")
+	}
+	if m.ParentGuid == "" {
+		m.ParentGuid = str("parent_guid", "parentGuid")
+	}
+	if m.AncestorGuid == "" {
+		m.AncestorGuid = str("ancestor_guid", "ancestorGuid")
+	}
+	if m.AncestorName == "" {
+		m.AncestorName = str("ancestor_name", "ancestorName")
+	}
+	if m.Poster == "" {
+		m.Poster = flexStr(str("poster", "poster_path", "posterPath"))
+	}
+	if m.Ts == 0 {
+		m.Ts = num("ts", "position", "playback_position", "playPosition")
+	}
+	if m.Watched == 0 {
+		m.Watched = int(num("watched", "is_watched", "isWatched"))
+	}
+	if m.IsWatched == 0 {
+		m.IsWatched = int(num("is_watched", "isWatched", "watched"))
+	}
+	if m.Duration == 0 {
+		m.Duration = int(num("duration"))
+	}
+	if m.Runtime == 0 {
+		m.Runtime = int(num("runtime"))
+	}
+	if m.SeasonNumber == 0 {
+		m.SeasonNumber = int(num("season_number", "seasonNumber"))
+	}
+	if m.EpisodeNumber == 0 {
+		m.EpisodeNumber = int(num("episode_number", "episodeNumber"))
+	}
+	if m.WatchedTs == 0 {
+		m.WatchedTs = num("watched_ts", "watchedTs")
+	}
+	if m.Overview == "" {
+		m.Overview = str("overview", "description")
+	}
+	return m
+}
+
+// Genre 是 /tag/genres 的 {id,value} 元素。
+type Genre struct {
+	ID    int    `json:"id"`
+	Value string `json:"value"`
+}
+
+// TagGenres 调 GET /v/api/v1/tag/genres?lan=：genre id → 中文名。
+func (c *Client) TagGenres(ctx context.Context, lang string) ([]Genre, error) {
+	if lang == "" {
+		lang = "zh-CN"
+	}
+	res, err := c.doPath(ctx, "GET", "/v/api/v1/tag/genres?lan="+url.QueryEscape(lang), nil)
+	if err != nil {
+		return nil, fmt.Errorf("tag/genres: %w", err)
+	}
+	var out []Genre
+	if err := json.Unmarshal(res.Data, &out); err != nil {
+		return nil, fmt.Errorf("tag/genres decode: %w", err)
+	}
+	return out, nil
+}
+
+// TagOptions 是 /tag/list 返回的当前库可用筛选维度。
+type TagOptions struct {
+	Genres            []int    `json:"genres"`
+	Resolutions       []string `json:"resolutions"`
+	ColorRange        []string `json:"color_range"`
+	AudioType         []string `json:"audio_type"`
+	Locate            []string `json:"locate"`
+	Decades           []string `json:"decades"`
+	RecognitionStatus []int    `json:"recognition_status"`
+}
+
+// TagList 调 GET /v/api/v1/tag/list?ancestor_guid=&is_favorite=0&lan=
+// 注意：genre id 是按库的（同名类型在不同库 id 不同），所以按库拉取。
+func (c *Client) TagList(ctx context.Context, ancestorGuid, typ string) (*TagOptions, error) {
+	q := url.Values{}
+	q.Set("is_favorite", "0")
+	q.Set("lan", "zh-CN")
+	if ancestorGuid != "" {
+		q.Set("ancestor_guid", ancestorGuid)
+	}
+	if typ != "" {
+		q.Set("type", typ)
+	}
+	res, err := c.doPath(ctx, "GET", "/v/api/v1/tag/list?"+q.Encode(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("tag/list: %w", err)
+	}
+	var out TagOptions
+	if err := json.Unmarshal(res.Data, &out); err != nil {
+		return nil, fmt.Errorf("tag/list decode: %w", err)
+	}
+	return &out, nil
+}
+
+// SubtitleFile 调 GET /v/api/v1/subtitle/dl/{guid} 取外挂字幕原文件。
+// 返回内容与 Content-Type（服务端未给类型时按扩展名/文本兜底）。
+func (c *Client) SubtitleFile(ctx context.Context, subtitleGuid string) ([]byte, string, error) {
+	path := "/v/api/v1/subtitle/dl/" + url.PathEscape(subtitleGuid)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+path, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("Authx", authx(path, ""))
+	if c.Token != "" {
+		req.Header.Set("Authorization", c.Token)
+		req.Header.Set("Cookie", "Trim-MC-token="+c.Token+"; mode=relay")
+	} else {
+		req.Header.Set("Cookie", "mode=relay")
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("subtitle/dl: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
+		return nil, "", fmt.Errorf("subtitle/dl status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	if err != nil {
+		return nil, "", fmt.Errorf("subtitle/dl read: %w", err)
+	}
+	ct := resp.Header.Get("Content-Type")
+	if ct == "" || strings.Contains(ct, "octet-stream") {
+		ct = "text/plain; charset=utf-8"
+	}
+	return data, ct, nil
 }

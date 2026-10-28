@@ -3,6 +3,47 @@
 本项目（**飞牛影视 Emby 桥接**）的版本历史。每个版本的改动都附带**实机验证依据**
 （客户端日志 / 官方 API 文档）。
 
+## v1.1.0（预发布）
+
+这一版把「能看」补齐到 Emby 客户端常用的查询/筛选/字幕/多用户语义。12 项：
+
+- **搜索**：`/Items?SearchTerm=` 与 `/Users/{uid}/Items?SearchTerm=` 接飞牛
+  `GET /v/api/v1/search/list?q=`；按 IncludeItemTypes 过滤、桥接侧分页；兼容只认
+  POST body 的版本。
+- **真实入库时间**：解析 `item/list` / `item/{guid}` 的 `create_time`（秒/毫秒/日期串），
+  写入 `DateCreated`；缺失才回退首播日期，不再用 `time.Now()`。
+- **排序语义**：`SortBy` 支持多键（如 `ProductionYear,PremiereDate`），
+  `DateCreated` 与 `PremiereDate` 分离，新增 `PlayCount`；`Random` 首页随机、
+  翻页复用同一 seed（避免分页重复/漏项）；`/Shows/{id}/Seasons|Episodes` 也支持 SortBy。
+- **元数据**：解析并输出 `Genres`/`GenreItems`、`OriginalTitle`、`OfficialRating`
+  （content_ratings）、`ProductionLocations`（production_countries）、`EndDate`
+  （last_air_date）、`ProviderIds`（IMDb/TMDB/豆瓣）与外部链接。
+- **筛选**：`Genres`、`Years`、`OfficialRatings`、`Countries`、`Is4K`、`IsHD`、
+  `Filters`（IsPlayed/IsUnplayed/IsResumable/IsFavorite/Likes）、`ExcludeItemTypes`、
+  `Ids`、`NameStartsWith`、`MinCommunityRating`；`/Genres`、`/Years`、
+  `/OfficialRatings`、`/Items/Filters` 返回真实字典。
+- **Latest / NextUp**：TV 库的 `Latest` 返回最新**集**（带 SeriesId）；
+  `/Shows/NextUp` 无 SeriesId 时也能跨剧返回"下一集"。
+- **继续观看**：优先用 `GET /v/api/v1/play/list`，失败回退全库扫描；缓存按用户隔离，
+  不再共用 admin 客户端；支持 ParentId/StartIndex/Limit。
+- **外挂字幕**：`/Videos/{id}/{msId}/Subtitles/{index}/Stream.{fmt}` 从
+  `stream/list.subtitle_streams` 找外挂轨，代理 `/v/api/v1/subtitle/dl/{guid}`；
+  内嵌字幕仍由客户端直读容器（返回 404）。
+- **图片**：支持官方完整路径
+  `/Items/{id}/Images/{type}/{index}/{tag}/{format}/{maxWidth}/{maxHeight}/...`、
+  多背景图（BackdropImageTags/索引）、ETag/Cache-Control/304。
+- **评分 / 隐藏继续观看**：`POST/DELETE /Users/{uid}/Items/{id}/Rating?Likes=`、
+  `POST /Users/{uid}/Items/{id}/HideFromResume?Hide=` 落本地用户状态，并在
+  UserData.Likes / Resume 中生效。
+- **多用户与鉴权**：User.Id/Name 按飞牛账号派生，`/Users/Me`、`/Users/Public` 反映真实
+  登录用户；除握手/登录/品牌/本地化外，媒体端点默认要求有效 token（无 token/错误 token
+  返回 401）；兼容 `X-Emby-Authorization` 头。排障可用 `ALLOW_ANON=1` 临时放开。
+- **缓存与请求合并**：媒体库/详情/play-info/stream-list/search/tag 字典加 TTL 缓存与
+  singleflight；写进度/已看/收藏/评分后失效相关缓存。
+
+> 测试：`go test ./...` 覆盖上述行为（`internal/emby/v11_features_test.go`）；发布前请按
+> Release 说明里的"测试方法"在真实客户端上再验一遍。
+
 ## v1.0.17
 
 - **桌面入口改为在飞牛桌面内嵌打开**。`app/ui/config` 里入口的 `type` 由 `url`（跳转新标签页）

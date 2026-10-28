@@ -16,6 +16,19 @@
 > `4K HEVC Main10 + TrueHD Atmos`、`DTS-HD MA` 这类格式手机端普遍解不动——那是设计边界，
 > 不是 bug。需要任何格式都能播，请用真正的 Jellyfin/Emby，或让客户端走软解。
 
+## v1.1 新增
+
+- **搜索**：`SearchTerm` 接飞牛 `/search/list`，不再"搜什么都返回整库"。
+- **排序/筛选**：多键排序、真实 `DateCreated`（入库时间）、`Genres`/`Years`/`OfficialRatings`/
+  `Is4K`/`IsHD`/已看/未看/可续播/喜欢筛选；`/Genres`、`/Years`、`/Items/Filters` 返回真实字典。
+- **首页**：TV 库 `Latest` 返回最新集；`/Shows/NextUp` 支持跨剧"下一集"；`Resume` 改用
+  `/play/list` 并按用户隔离。
+- **字幕**：外挂字幕（`subtitle_streams.is_external=1`）可通过 Emby 字幕端点加载。
+- **图片**：支持官方完整图片路径、多背景图、ETag/Cache-Control。
+- **用户**：真实用户 Id/Name；`Rating`（喜欢/不喜欢）与 `HideFromResume` 落本地状态。
+- **鉴权**：媒体端点默认要求有效 token（登录后自动带）；`ALLOW_ANON=1` 可临时放开排障。
+- **性能**：媒体库/详情/播放信息/流列表/搜索/标签字典加 TTL 缓存与请求合并。
+
 ---
 
 ## 安装
@@ -77,6 +90,7 @@ services:
 | 客户端 | 说明 |
 |---|---|
 | Infuse / VidHub | 类型选 **Emby**；能直通 HEVC / DTS / TrueHD |
+| 全部客户端 | v1.1 起媒体端点要求登录 token（客户端正常登录即可）；图片/流地址也会带 `api_key` |
 | Yamby / 小幻影视 | 已验证可用；能否播放取决于设备解码能力 |
 | 爆米花 / Findroid | 可用 |
 
@@ -93,6 +107,7 @@ services:
 | `ADMIN_USER` / `ADMIN_PASS` | 后台账号密码 |
 | `HOST` | 绝对 URL 兜底主机（正常走请求 Host，一般不用设） |
 | `AUDIO_TRACK_HINT` | 本 fork 新增，`0` 关闭音轨兼容性提示 |
+| `ALLOW_ANON` | 排障用：`1` 时允许无 token 访问媒体端点（默认严格鉴权，不建议长期开启） |
 
 > 飞牛影视实际端口是 **8005**（上游 `main.go` 注释里的示例端口是错的）。
 > 容器/应用内不要用 `127.0.0.1` 访问飞牛影视。
@@ -143,6 +158,7 @@ GitHub Actions：
 - 上游契约基于**飞牛影视 0.9.8 / mediasrv 0.8.42**，飞牛影视升级后接口可能变化。
 - 仅提供 **x86_64** 包（静态编译）。
 - 后台配置以**明文**保存飞牛密码（上游设计如此），请勿把 8096 暴露到公网。
+- 媒体端点默认要求有效 token；如果客户端无法登录，可临时设 `ALLOW_ANON=1` 排障，但不要长期开启。
 
 ---
 

@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	mrand "math/rand"
@@ -73,6 +74,23 @@ type Handler struct {
 
 	// 库自定义图解析（admin 后台配置；guid -> 图片 URL，空串=未自定义）
 	libImage func(guid string) string
+
+	// AllowAnonymous 仅用于测试/完全信任内网；默认 false。
+	// 为 true 时无 token 的请求回落 admin 客户端（保持旧行为）。
+	AllowAnonymous bool
+
+	// 读请求缓存（库列表/详情/play-info/stream-list/tag 字典）
+	cache *ttlCache
+	// 桥接侧用户状态（Likes / HiddenFromResume）
+	state *userStateStore
+
+	// genre id -> 名称字典（按语言缓存 10 分钟）
+	genreMu  sync.Mutex
+	genreAt  time.Time
+	genreMap map[int]string
+
+	// Random 排序的分页种子：首页随机、后续分页复用同一 seed
+	randSeeds sync.Map
 }
 
 // embySession 一个客户端登录会话：持有该用户自己的飞牛 token。
@@ -111,7 +129,8 @@ func NewHandler(fnClient *fn.Client, serverName, host string) *Handler {
 	}
 	return &Handler{FN: fnClient, ServerName: serverName, Host: host,
 		ServerID: serverID(base, serverName),
-		lim115:   newRateLimiter(1), sessions: map[string]*embySession{}}
+		lim115:   newRateLimiter(1), sessions: map[string]*embySession{},
+		cache: newTTLCache(), state: newUserStateStore("bridge-userstate.json")}
 }
 
 // serverID 生成稳定的 32 位 hex 服务器标识（GUID 形态）。
@@ -216,7 +235,10 @@ func (h *Handler) Routes() *http.ServeMux {
 	// Backdrop/Banner/Art...，参照 Emby-In-One 透传集合），只注册 Primary 的话
 	// Logo 等落兜底变 1x1 透明图 → "剧的 logo 没有"
 	mux.HandleFunc("GET /Items/{id}/Images/{imgType}", h.handleItemImage)
-	mux.HandleFunc("GET /Items/{id}/Images/{imgType}/{imgIndex}", h.handleItemImage)
+	// 官方 ImageService 完整路径：/Images/{type}/{index}/{tag}/{format}/{maxWidth}/{maxHeight}/...
+	// 只注册短路径时，长路径会落到兜底变 1x1 透明图（部分客户端取图失败）。
+	mux.HandleFunc("GET /Items/{id}/Images/{imgType}/{rest...}", h.handleItemImage)
+	mux.HandleFunc("GET /Users/{uid}/Items/{id}/Images/{imgType}/{rest...}", h.handleItemImage)
 
 	// fork 新增：Emby 里返回**数组**的端点。
 	//
@@ -262,11 +284,11 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /ScheduledTasks/Running/{id}", h.handleEmptyArray)
 	// Yamby 媒体库筛选维度（Genres/Persons/Tags/Years/OfficialRatings）与 Upcoming：
 	// QueryResult 列表语义，fallback 形态已对；显式注册避免每次命中兜底日志
-	mux.HandleFunc("GET /Genres", h.handleEmptyList)
+	mux.HandleFunc("GET /Genres", h.handleGenres)
 	mux.HandleFunc("GET /Persons", h.handleEmptyList)
 	mux.HandleFunc("GET /Tags", h.handleEmptyList)
-	mux.HandleFunc("GET /Years", h.handleEmptyList)
-	mux.HandleFunc("GET /OfficialRatings", h.handleEmptyList)
+	mux.HandleFunc("GET /Years", h.handleYears)
+	mux.HandleFunc("GET /OfficialRatings", h.handleOfficialRatings)
 	mux.HandleFunc("GET /Shows/Upcoming", h.handleEmptyList)
 	mux.HandleFunc("GET /LiveTv/Channels", h.handleEmptyList)
 	// 收藏（详情页❤️，真机抓包飞牛 PUT/DELETE item/favorite）：
@@ -285,9 +307,14 @@ func (h *Handler) Routes() *http.ServeMux {
 	// 相似推荐（剧/电影详情页"更多类似"区块）：飞牛无对应数据，返回空列表
 	mux.HandleFunc("GET /Items/{id}/Similar", h.handleEmptyList)
 	mux.HandleFunc("GET /Items/{id}/Counts", h.handleItemCounts)
-	// 外挂字幕下载（Emby-In-One 确认路径 /Videos/{itemId}/{msId}/Subtitles/{index}/Stream.{fmt}）：
-	// 飞牛无字幕内容接口，内嵌字幕由客户端直连容器读取；此处注册避免兜底 JSON 被当字幕解析
+	// 外挂字幕：从飞牛 stream/list 的 subtitle_streams 找到外部字幕，
+	// 再代理 /v/api/v1/subtitle/dl/{guid}；内嵌字幕仍由客户端直读容器。
 	mux.HandleFunc("GET /Videos/{id}/{msId}/Subtitles/{index}/{rest}", h.handleSubtitleStream)
+	mux.HandleFunc("GET /Videos/{id}/Subtitles/{index}/{rest}", h.handleSubtitleStream)
+	// 评分（喜欢/不喜欢）与"从继续观看移除"：飞牛无对应状态，落桥接本地。
+	mux.HandleFunc("POST /Users/{uid}/Items/{id}/Rating", h.handleRating)
+	mux.HandleFunc("DELETE /Users/{uid}/Items/{id}/Rating", h.handleRating)
+	mux.HandleFunc("POST /Users/{uid}/Items/{id}/HideFromResume", h.handleHideFromResume)
 	// 媒体统计（客户端设置页/仪表盘显示）——已在上方媒体库块改为 handleItemCountsAll
 	// 特别收录：web 客户端 getSpecialFeatures 直接 items.slice(...)，必须纯数组
 	mux.HandleFunc("GET /Users/{uid}/Items/{id}/SpecialFeatures", h.handleEmptyArray)
@@ -322,12 +349,13 @@ func (h *Handler) handleFallback(w http.ResponseWriter, r *http.Request) {
 		id := m[1]
 		ctx := r.Context()
 		if r.Method == http.MethodPost {
-			if info, err := h.fnOf(ctx).PlayInfoByGuid(ctx, id); err == nil {
+			if info, err := h.playInfo(ctx, h.fnOf(ctx), id); err == nil {
 				_ = h.fnOf(ctx).RecordProgress(ctx, id, info.MediaGuid, playInfoSeconds(info), playInfoSeconds(info))
 			}
 			_ = h.fnOf(ctx).WatchItem(ctx, id)
-			touchProgress(id)
-			writeJSON(w, http.StatusOK, h.userItemDataDTOOf(ctx, id, true))
+			touchProgress(h.sessionUserName(r), id)
+			h.invalidateItem(h.fnOf(ctx), id)
+			writeJSON(w, http.StatusOK, h.userItemDataDTOOf(ctx, id, true, h.sessionUserName(r)))
 			return
 		}
 		if r.Method == http.MethodDelete {
@@ -335,13 +363,11 @@ func (h *Handler) handleFallback(w http.ResponseWriter, r *http.Request) {
 			if err := h.fnOf(ctx).UnwatchItem(ctx, id); err != nil {
 				log.Printf("[watched] 取消已看 %s: %v", id, err)
 			}
-			if info, err := h.fnOf(ctx).PlayInfoByGuid(ctx, id); err == nil {
+			if info, err := h.playInfo(ctx, h.fnOf(ctx), id); err == nil {
 				_ = h.fnOf(ctx).RecordProgress(ctx, id, info.MediaGuid, 0, playInfoSeconds(info))
 			}
-			resumeMu.Lock()
-			resumeAt = time.Time{}
-			resumeMu.Unlock()
-			writeJSON(w, http.StatusOK, h.userItemDataDTOOf(ctx, id, false))
+			h.invalidateResume(h.sessionUserName(r))
+			writeJSON(w, http.StatusOK, h.userItemDataDTOOf(ctx, id, false, h.sessionUserName(r)))
 			return
 		}
 	}
@@ -367,7 +393,7 @@ func (h *Handler) Handler() http.Handler {
 	// withSession 按请求 token 选定飞牛会话注入 ctx——多用户进度/收藏隔离的入口
 	// repairMangledURLPath 紧随日志之后、最先改写路径：先把 "/embyhttp:/host/..."
 	// 还原成 "/Videos/..."，后续大小写归一与 /emby 剥离才能作用于真实路径。
-	return logRequests(repairMangledURLPath(normalizePathCase(stripEmbyPrefix(h.withSession(h.Routes())))))
+	return logRequests(repairMangledURLPath(normalizePathCase(stripEmbyPrefix(h.withSession(h.requireAuth(h.Routes()))))))
 }
 
 // routeSegmentCase 已知路由静态段 小写→规范大小写（与 Routes() 注册一致）。
@@ -394,6 +420,10 @@ var routeSegmentCase = map[string]string{
 	"localization": "Localization", "options": "Options",
 	"additionalparts": "AdditionalParts", "localtrailers": "LocalTrailers",
 	"ancestors": "Ancestors", "criticreviews": "CriticReviews",
+	"genres": "Genres", "rating": "Rating", "hidefromresume": "HideFromResume",
+	"subtitles": "Subtitles", "search": "Search", "hints": "Hints",
+	"years": "Years", "officialratings": "OfficialRatings", "persons": "Persons",
+	"studios": "Studios", "tags": "Tags", "playlists": "Playlists", "collections": "Collections",
 }
 
 // normalizePathCase 把路径中命中已知路由段的段重写为规范大小写，
@@ -582,18 +612,101 @@ func stripAbsoluteURLPrefix(p string) (string, bool) {
 // ---- 工具：从 query/header 取 api_key ----
 
 func (h *Handler) apiKey(r *http.Request) string {
-	if v := r.Header.Get("Authorization"); v != "" {
-		return strings.TrimPrefix(v, "Token ")
-	}
 	if v := r.Header.Get("X-Emby-Token"); v != "" {
-		return v
+		return strings.TrimSpace(v)
+	}
+	for _, key := range []string{"Authorization", "X-Emby-Authorization"} {
+		v := strings.TrimSpace(r.Header.Get(key))
+		if v == "" {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(v), "token ") {
+			return strings.TrimSpace(v[len("token "):])
+		}
+		// Emby 的 X-Emby-Authorization 形如：
+		// MediaBrowser Client="x", Device="y", DeviceId="z", Version="1", Token="..."
+		for _, part := range strings.FieldsFunc(v, func(c rune) bool { return c == ',' || c == ';' }) {
+			part = strings.TrimSpace(part)
+			if strings.HasPrefix(strings.ToLower(part), "token=") {
+				return strings.Trim(strings.TrimSpace(part[len("token="):]), `"`)
+			}
+		}
 	}
 	return r.URL.Query().Get("api_key")
 }
 
-// validClient 校验请求是否带了 api_key（Emby 客户端总是带）。
+// validClient 校验请求是否带有效 token（AllowAnonymous 时兼容旧行为）。
 func (h *Handler) validClient(r *http.Request) bool {
-	return h.apiKey(r) != ""
+	if h.AllowAnonymous {
+		return true
+	}
+	_, ok := h.sessionFor(r)
+	return ok
+}
+
+// sessionFor 按请求 token 查会话（不创建、不回落 admin）。
+func (h *Handler) sessionFor(r *http.Request) (*embySession, bool) {
+	tk := h.apiKey(r)
+	if tk == "" {
+		return nil, false
+	}
+	h.sessMu.Lock()
+	defer h.sessMu.Unlock()
+	h.loadSessionsLocked()
+	s, ok := h.sessions[tk]
+	return s, ok
+}
+
+// sessionUserName 返回当前请求对应的用户名（无会话时 AllowAnonymous 用 admin）。
+func (h *Handler) sessionUserName(r *http.Request) string {
+	if s, ok := h.sessionFor(r); ok {
+		return s.UserName
+	}
+	if h.AllowAnonymous {
+		return "admin"
+	}
+	return ""
+}
+
+// userIDFor 由用户名派生稳定 Emby UserId（32 位 hex，符合 Emby 形态）。
+func userIDFor(name string) string {
+	if name == "" {
+		name = "admin"
+	}
+	return fn.SHA256Hex("fnos-emby-bridge|user|" + name)[:32]
+}
+
+// isAdminUser 目前把 admin 视为管理员（后续可接飞牛用户角色）。
+func isAdminUser(name string) bool { return name == "admin" }
+
+// isPublicPath 是无需 token 的端点（发现、登录、品牌、本地化）。
+func isPublicPath(p string) bool {
+	p = strings.ToLower(strings.TrimSuffix(p, "/"))
+	switch p {
+	case "", "/", "/system/info", "/system/info/public",
+		"/users/authenticatebyname", "/users/public",
+		"/branding/configuration", "/localization/options",
+		"/localization/countries", "/localization/parentalratings":
+		return true
+	}
+	return strings.HasPrefix(p, "/branding/") || strings.HasPrefix(p, "/localization/")
+}
+
+// requireAuth 对媒体端点强制有效 Emby token，避免无 token 请求回落到 admin 会话。
+// 公开端点（握手/登录/品牌/本地化）仍放行；OPTIONS 交给 CORS 层。
+func (h *Handler) requireAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if h.AllowAnonymous || r.Method == http.MethodOptions || isPublicPath(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if _, ok := h.sessionFor(r); ok {
+			next.ServeHTTP(w, r)
+			return
+		}
+		log.Printf("[auth] 401 %s %s（无有效 token）", r.Method, r.URL.Path)
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"Error": "Unauthorized"})
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -691,13 +804,13 @@ func (h *Handler) handleFavorite(w http.ResponseWriter, r *http.Request) {
 	if err := h.fnOf(r.Context()).SetFavorite(r.Context(), id, on); err != nil {
 		log.Printf("[favorite] %s %s: %v", r.Method, id, err)
 	}
+	h.invalidateItem(h.fnOf(r.Context()), id)
 	played := false
-	if m, err := h.fnOf(r.Context()).ItemDetail(r.Context(), id); err == nil && m != nil {
+	if m, err := h.itemDetail(r.Context(), h.fnOf(r.Context()), id); err == nil && m != nil {
 		played = m.Watched != 0 || m.IsWatched != 0
 	}
-	dto := h.userItemDataDTOOf(r.Context(), id, played)
+	dto := h.userItemDataDTOOf(r.Context(), id, played, h.sessionUserName(r))
 	dto["IsFavorite"] = on // 刚改过，以入参为准（ItemDetail 可能还没反映）
-	dto["Likes"] = on
 	writeJSON(w, http.StatusOK, dto)
 }
 
@@ -723,26 +836,25 @@ func (h *Handler) handleUpdateUserData(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case req.Played != nil && *req.Played:
-		if info, err := h.fnOf(ctx).PlayInfoByGuid(ctx, id); err == nil {
+		if info, err := h.playInfo(ctx, h.fnOf(ctx), id); err == nil {
 			_ = h.fnOf(ctx).RecordProgress(ctx, id, info.MediaGuid, playInfoSeconds(info), playInfoSeconds(info))
 		}
 		_ = h.fnOf(ctx).WatchItem(ctx, id)
-		touchProgress(id)
+		touchProgress(h.sessionUserName(r), id)
+		h.invalidateItem(h.fnOf(ctx), id)
 	case req.Played != nil: // 显式 false = 取消已看
 		if err := h.fnOf(ctx).UnwatchItem(ctx, id); err != nil {
 			log.Printf("[userdata] 取消已看 %s: %v", id, err)
 		}
-		if info, err := h.fnOf(ctx).PlayInfoByGuid(ctx, id); err == nil {
+		if info, err := h.playInfo(ctx, h.fnOf(ctx), id); err == nil {
 			_ = h.fnOf(ctx).RecordProgress(ctx, id, info.MediaGuid, 0, playInfoSeconds(info))
 		}
-		resumeMu.Lock()
-		resumeAt = time.Time{}
-		resumeMu.Unlock()
+		h.invalidateResume(h.sessionUserName(r))
 	case req.PlaybackPositionTicks != nil:
-		if info, err := h.fnOf(ctx).PlayInfoByGuid(ctx, id); err == nil {
+		if info, err := h.playInfo(ctx, h.fnOf(ctx), id); err == nil {
 			_ = h.fnOf(ctx).RecordProgress(ctx, id, info.MediaGuid,
 				*req.PlaybackPositionTicks/10_000_000, playInfoSeconds(info))
-			touchProgress(id)
+			touchProgress(h.sessionUserName(r), id)
 		}
 	}
 
@@ -750,18 +862,18 @@ func (h *Handler) handleUpdateUserData(w http.ResponseWriter, r *http.Request) {
 		if err := h.fnOf(ctx).SetFavorite(ctx, id, *req.IsFavorite); err != nil {
 			log.Printf("[userdata] 收藏 %s: %v", id, err)
 		}
+		h.invalidateItem(h.fnOf(ctx), id)
 	}
 
 	played := false
 	if req.Played != nil {
 		played = *req.Played
-	} else if m, err := h.fnOf(ctx).ItemDetail(ctx, id); err == nil && m != nil {
+	} else if m, err := h.itemDetail(ctx, h.fnOf(ctx), id); err == nil && m != nil {
 		played = m.Watched != 0 || m.IsWatched != 0
 	}
-	dto := h.userItemDataDTOOf(ctx, id, played)
+	dto := h.userItemDataDTOOf(ctx, id, played, h.sessionUserName(r))
 	if req.IsFavorite != nil {
 		dto["IsFavorite"] = *req.IsFavorite // 刚改过，以入参为准
-		dto["Likes"] = *req.IsFavorite
 	}
 	writeJSON(w, http.StatusOK, dto)
 }
@@ -791,10 +903,10 @@ func (h *Handler) userItemDataDTO(guid string, played, favorite bool, positionTi
 
 // userItemDataDTOOf 在 userItemDataDTO 基础上补齐当前收藏状态与续播位置。
 // 标记已看/未看的响应要反映**操作后**的真实状态——客户端会直接拿它刷新界面。
-func (h *Handler) userItemDataDTOOf(ctx context.Context, guid string, played bool) map[string]any {
+func (h *Handler) userItemDataDTOOf(ctx context.Context, guid string, played bool, user string) map[string]any {
 	favorite := false
 	position := int64(0)
-	if m, err := h.fnOf(ctx).ItemDetail(ctx, guid); err == nil && m != nil {
+	if m, err := h.itemDetail(ctx, h.fnOf(ctx), guid); err == nil && m != nil {
 		favorite = m.IsFavorite != 0
 		if played {
 			total := int64(m.Duration)
@@ -806,7 +918,11 @@ func (h *Handler) userItemDataDTOOf(ctx context.Context, guid string, played boo
 			}
 		}
 	}
-	return h.userItemDataDTO(guid, played, favorite, position)
+	dto := h.userItemDataDTO(guid, played, favorite, position)
+	if like, ok := h.state.Like(user, guid); ok {
+		dto["Likes"] = like
+	}
+	return dto
 }
 
 // handleRefresh 元数据刷新：POST /Items/{id}/Refresh → 飞牛 item/refresh。
@@ -815,6 +931,8 @@ func (h *Handler) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	if err := h.fnOf(r.Context()).RefreshItem(r.Context(), id); err != nil {
 		log.Printf("[refresh] %s: %v", id, err)
 	}
+	h.cache.Clear()
+	h.invalidateResume(h.sessionUserName(r))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1081,28 +1199,19 @@ func (h *Handler) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"Error": err.Error()})
 		return
 	}
+	uid := userIDFor(req.UserName)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"User": map[string]any{"Name": req.UserName, "Id": "fnos-user", "ServerId": h.ServerID,
+		"User": map[string]any{"Name": req.UserName, "Id": uid, "ServerId": h.ServerID,
 			// Configuration 必须存在：官方 web 客户端登录后读 User.Configuration.ProfilePin
 			// （undefined 直接 TypeError 中断登录流程）
 			"Configuration": userConfiguration(),
-			"Policy": map[string]any{
-				"IsAdministrator":                true,
-				"EnableAllFolders":               true,
-				"EnableContentDeletion":          false,
-				"EnableRemoteAccess":             true,
-				"EnableLiveTvAccess":             false,
-				"EnableMediaPlayback":            true,
-				"EnableAudioPlaybackTranscoding": false,
-				"EnableVideoPlaybackTranscoding": false,
-				"EnablePlaybackRemuxing":         false,
-				"RemoteClientBitrateLimit":       0,
-			}},
+			"Policy":        userPolicy(req.UserName),
+		},
 		"SessionInfo": map[string]any{
-			"UserId":   "fnos-user",
+			"UserId":   uid,
 			"UserName": req.UserName,
 			"Client":   "Emby",
-			"Id":       "fnos-session",
+			"Id":       "fnos-" + uid[:12],
 			"ServerId": h.ServerID,
 		},
 		"ServerId":    h.ServerID,
@@ -1113,116 +1222,129 @@ func (h *Handler) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleUsersMe(w http.ResponseWriter, r *http.Request) {
-	if !h.validClient(r) {
+	name := h.sessionUserName(r)
+	if name == "" {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{})
 		return
 	}
 	// 官方 web 客户端读 user.Configuration.LatestItemsExcludes.includes(...)，
 	// 这些字段必须是数组（undefined 直接 TypeError 打断首页 sections）
 	writeJSON(w, http.StatusOK, map[string]any{
-		"Name":          "fnos",
-		"Id":            "fnos-user",
+		"Name":          name,
+		"Id":            userIDFor(name),
+		"ServerId":      h.ServerID,
 		"Configuration": userConfiguration(),
-		"Policy": map[string]any{
-			"MaxSimultaneousStreamingConnections": 10,
-			"EnableMediaPlayback":                 true,
-			"IsAdministrator":                     true,
-		},
+		"Policy":        userPolicy(name),
 	})
+}
+
+// userPolicy 生成用户策略；多用户以用户名区分，admin 为管理员。
+func userPolicy(name string) map[string]any {
+	return map[string]any{
+		"IsAdministrator":                     isAdminUser(name),
+		"EnableAllFolders":                    true,
+		"EnableContentDeletion":               false,
+		"EnableRemoteAccess":                  true,
+		"EnableLiveTvAccess":                  false,
+		"EnableMediaPlayback":                 true,
+		"EnableAudioPlaybackTranscoding":      false,
+		"EnableVideoPlaybackTranscoding":      false,
+		"EnablePlaybackRemuxing":              false,
+		"RemoteClientBitrateLimit":            0,
+		"MaxSimultaneousStreamingConnections": 10,
+	}
 }
 
 // handleUsersByID 实现 GET /Users/{uid}：web 客户端 getUser(userId) 调用，
 // 响应同 /Users/Me（Configuration 结构必须完整）。
 func (h *Handler) handleUsersByID(w http.ResponseWriter, r *http.Request) {
-	h.handleUsersMe(w, r)
+	uid := r.PathValue("uid")
+	if name := h.sessionUserName(r); name == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{})
+	} else if uid != "" && uid != "fnos-user" && uid != userIDFor(name) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"Error": "user not found"})
+	} else {
+		h.handleUsersMe(w, r)
+	}
 }
 
 // handleUsersPublic 实现 GET /Users/Public：官方 UserDto 纯数组（注意不是 QueryResult）。
 func (h *Handler) handleUsersPublic(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, []map[string]any{
-		{
-			"Name":                  "admin",
-			"Id":                    "fnos-user",
+	names := map[string]bool{}
+	h.sessMu.Lock()
+	h.loadSessionsLocked()
+	for _, s := range h.sessions {
+		if s != nil && s.UserName != "" {
+			names[s.UserName] = true
+		}
+	}
+	h.sessMu.Unlock()
+	if len(names) == 0 {
+		names["admin"] = true
+	}
+	out := make([]map[string]any, 0, len(names))
+	for name := range names {
+		out = append(out, map[string]any{
+			"Name":                  name,
+			"Id":                    userIDFor(name),
 			"ServerId":              h.ServerID,
 			"HasPassword":           true,
 			"HasConfiguredPassword": true,
-		},
-	})
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i]["Name"].(string) < out[j]["Name"].(string) })
+	writeJSON(w, http.StatusOK, out)
 }
 
-// handleItems 实现 Emby 的"列媒体库"。
-// 0.9.8 真机契约：GET mediadb/list 直接列库（无需 SEED_GUIDS）；
-// 库级浏览 POST item/list {ancestor_guid, tags.type, page/page_size}。
-// 支持 Emby 标准分页参数 StartIndex/Limit（桥接层裁剪，TotalRecordCount 为全量数）。
+// handleItems 实现 Emby 的"列媒体库/查询"。
+//
+// v1.1 起支持：
+//   - SearchTerm（/search/list）
+//   - 多键 SortBy + DateCreated/PremiereDate 分离 + 稳定 Random
+//   - Genres/Years/OfficialRatings/Is4K/IsHD/IsUnplayed/IsResumable/Likes 筛选
+//   - IncludeItemTypes/ExcludeItemTypes/Ids/NameStartsWith
+//   - 按用户的 DatePlayed、Resume 隐藏项
 func (h *Handler) handleItems(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
+	ctx := r.Context()
+	client := h.fnOf(ctx)
+	user := h.sessionUserName(r)
 	parentID := queryGet(q, "ParentId")
 	start := queryInt(q, "StartIndex", 0)
+	if start < 0 {
+		start = 0
+	}
 	limit := queryInt(q, "Limit", 0) // 0 = 不限
 
 	writeItems := func(all []fn.MediaItem) {
-		unfiltered := all
-		// IncludeItemTypes 类型过滤（Emby 服务器 ASP.NET 大小写不敏感匹配；
-		// 客户端按类型查询如 IncludeItemTypes=Episode/Movie/Series，不过滤
-		// 会把混合列表原样返回=错误内容）。飞牛没有的实体类型 → 空列表。
-		if types := strings.ToUpper(strings.TrimSpace(q.Get("IncludeItemTypes"))); types != "" {
-			want := map[string]bool{}
-			mapped := false
-			for _, t := range strings.Split(types, ",") {
-				switch strings.TrimSpace(t) {
-				case "SERIES", "TVSHOW":
-					want["TV"], mapped = true, true
-				case "MOVIE":
-					want["Movie"], mapped = true, true
-				case "EPISODE":
-					want["Episode"], mapped = true, true
-				case "SEASON":
-					want["Season"], mapped = true, true
-				case "VIDEO":
-					want["Video"], mapped = true, true
-				case "FOLDER", "FOLDERITEM":
-					want["MediaDB"], want["Directory"], want["TV"], want["Season"] = true, true, true, true
-					mapped = true
-				}
-			}
-			if !mapped {
-				all = nil // 请求的类型飞牛全部不存在（MusicAlbum/PhotoAlbum 等）
-			} else {
-				var kept []fn.MediaItem
-				for _, it := range all {
-					if want[it.Type] {
-						kept = append(kept, it)
-					}
-				}
-				all = kept
-			}
+		all = cloneItems(all)
+		filtered, mapped, folderTypes := filterItemTypes(all,
+			queryGet(q, "IncludeItemTypes"), queryGet(q, "ExcludeItemTypes"))
+		if !mapped {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"Items": []any{}, "TotalRecordCount": 0, "StartIndex": start,
+			})
+			return
 		}
-		// fork 新增：库级浏览的空结果兜底。
-		// 飞牛的库类别（TV/Movie/Other/Live）与 Emby 的类型体系不是一一对应，
-		// 客户端按 CollectionType 猜出来的 IncludeItemTypes 可能整个对不上，
-		// 表现为「点进媒体库一片空白，但首页能正常看到这些视频」。
-		// 此时忽略类型过滤、返回该库的真实内容，比返回空列表更有用。
-		// 仅在带 ParentId 的库级浏览生效，不影响全局筛选（如"所有电影"）。
-		if len(all) == 0 && len(unfiltered) > 0 && parentID != "" {
-			log.Printf("[items] IncludeItemTypes=%q 过滤后为空，库 %s 回退为不过滤（%d 条）",
-				q.Get("IncludeItemTypes"), parentID, len(unfiltered))
-			all = unfiltered
+		// 库级浏览的空结果兜底：只对"客户端按 Movie/Series 猜类型、而库是 Other/Video"
+		// 这种已知错配生效；不要把它变成"任何类型查不到就把别的类型塞回去"。
+		if len(filtered) == 0 && len(all) > 0 && parentID != "" && folderTypes &&
+			queryGet(q, "SearchTerm") == "" && queryGet(q, "Filters") == "" &&
+			queryGet(q, "Genres") == "" && queryGet(q, "Years") == "" {
+			log.Printf("[items] IncludeItemTypes=%q 在库 %s 过滤为空，回退为容器列表（%d 条）",
+				queryGet(q, "IncludeItemTypes"), parentID, len(all))
+			filtered = all
 		}
-		// fork 修复：SortBy / SortOrder（Emby 标准排序）。
-		//
-		// 以前这两个参数被完全忽略 → 客户端里「按标题 / 按时间 / 按评分」排序点了没反应
-		// （列表顺序永远等于飞牛库内顺序）；客户端的「推荐影片」用的 SortBy=Random
-		// 也因此稳定返回同一批前 30 个剧集、一部电影都没有。
-		// 在类型过滤之后、分页之前排序，保证分页取到的是排序后的前 N 条。
-		sortMediaItems(all, q.Get("SortBy"), q.Get("SortOrder"))
-		total := len(all)
-		if start < 0 {
-			start = 0
+		filtered = h.filterItems(ctx, client, user, filtered, q)
+		if len(filtered) > 1 {
+			sortMediaItems(filtered, queryGet(q, "SortBy"), queryGet(q, "SortOrder"),
+				user, h.randomSeedFor(r, q, user, start))
 		}
+		total := len(filtered)
 		if start > total {
 			start = total
 		}
-		page := all[start:]
+		page := filtered[start:]
 		if limit > 0 && len(page) > limit {
 			page = page[:limit]
 		}
@@ -1233,114 +1355,613 @@ func (h *Handler) handleItems(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// 首页"播放列表/合集"等 section：客户端带 IncludeItemTypes=Playlist/BoxSet
-	// 查询（无 ParentId）。飞牛无对应实体，之前直接把全库条目当合集返回（错误内容）。
-	if types := strings.ToUpper(q.Get("IncludeItemTypes")); strings.Contains(types, "PLAYLIST") ||
-		strings.Contains(types, "BOXSET") || strings.Contains(types, "COLLECTION") ||
-		strings.Contains(types, "PERSON") || strings.Contains(types, "GENRE") {
+	types := strings.ToUpper(queryGet(q, "IncludeItemTypes"))
+	if strings.Contains(types, "PLAYLIST") || strings.Contains(types, "BOXSET") ||
+		strings.Contains(types, "COLLECTION") || strings.Contains(types, "GENRE") {
 		writeItems(nil)
 		return
 	}
 
-	// 人物页"作品"网格：详情页点演员 → /Users/{uid}/Items?PersonIds={person_guid}
-	// （飞牛端点 person/item/list，真机抓包）
-	if pids := queryGet(q, "PersonIds"); pids != "" {
-		guid := strings.TrimSpace(strings.Split(pids, ",")[0])
-		list, _, err := h.fnOf(r.Context()).PersonItemList(r.Context(), guid, "", 1, 200)
-		if err != nil {
-			list = nil
-		}
-		writeItems(list)
-		return
-	}
-
-	// 收藏列表：Filters=IsFavorite（详情页❤️标记后客户端收藏页拉取）
-	if strings.Contains(strings.ToUpper(q.Get("Filters")), "ISFAVORITE") {
-		list, _, err := h.fnOf(r.Context()).FavoriteList(r.Context(), 1, 200)
-		if err != nil {
-			list = nil
-		}
-		writeItems(list)
-		return
-	}
-
-	// 已观看列表：Filters=IsPlayed（客户端"已观看"页/筛选）
-	// 全库可播条目里筛 watched/is_watched，最近看的在前（watched_ts 降序）
-	if strings.Contains(strings.ToUpper(q.Get("Filters")), "ISPLAYED") {
-		var list []fn.MediaItem
-		if dbs, err := h.fnOf(r.Context()).MediaDBList(r.Context()); err == nil {
-			for _, db := range dbs {
-				els, err := h.fnOf(r.Context()).ItemListTyped(r.Context(), db.Guid, []string{"Episode", "Movie", "Video"}, 0)
-				if err != nil {
-					continue
-				}
-				for _, m := range els {
-					if m.Watched != 0 || m.IsWatched != 0 {
-						list = append(list, m)
-					}
-				}
+	var (
+		all []fn.MediaItem
+		err error
+	)
+	switch {
+	case strings.TrimSpace(queryGet(q, "SearchTerm")) != "":
+		all, err = h.searchItems(ctx, client, user, queryGet(q, "SearchTerm"))
+	case strings.TrimSpace(queryGet(q, "Ids")) != "":
+		for _, id := range strings.Split(queryGet(q, "Ids"), ",") {
+			if id = strings.TrimSpace(id); id == "" {
+				continue
+			}
+			if det, e := h.itemDetail(ctx, client, id); e == nil && det != nil {
+				all = append(all, *det)
 			}
 		}
-		sort.Slice(list, func(i, j int) bool { return list[i].WatchedTs > list[j].WatchedTs })
-		writeItems(list)
-		return
+	case strings.TrimSpace(queryGet(q, "PersonIds")) != "":
+		for _, pid := range strings.Split(queryGet(q, "PersonIds"), ",") {
+			if pid = strings.TrimSpace(pid); pid == "" {
+				continue
+			}
+			list, _, e := client.PersonItemList(ctx, pid, "", 1, 200)
+			if e == nil {
+				all = append(all, list...)
+			}
+		}
+	case strings.Contains(strings.ToUpper(queryGet(q, "Filters")), "ISFAVORITE") && parentID == "":
+		all, err = h.favoriteItems(ctx, client, 500)
+	case parentID == "" && (strings.Contains(strings.ToUpper(queryGet(q, "Filters")), "ISPLAYED") ||
+		strings.Contains(strings.ToUpper(queryGet(q, "Filters")), "ISUNPLAYED") ||
+		strings.Contains(strings.ToUpper(queryGet(q, "Filters")), "ISRESUMABLE") ||
+		strings.Contains(strings.ToUpper(queryGet(q, "Filters")), "LIKES")):
+		all, err = h.playableItems(ctx, client)
+	default:
+		if parentID != "" {
+			all, err = h.browseParent(ctx, client, parentID, q)
+		} else {
+			all, err = h.browseAll(ctx, client, q)
+		}
 	}
-
-	if parentID != "" {
-		recursive := strings.EqualFold(q.Get("Recursive"), "true")
-		// 按父条目类型分派（真机确认 item/{guid} 对库/剧/季都有返回）：
-		//   MediaDB(库) → 只列容器级（剧/电影）——"点进库看到整剧，点进剧才是季"
-		//   TV(剧) → 季列表；Season(季) → 集列表；其他 → 自动双模式回退
-		listMode := ""
-		if det, err := h.fnOf(r.Context()).ItemDetail(r.Context(), parentID); err == nil && det != nil {
-			listMode = det.Type
-		}
-		var (
-			list []fn.MediaItem
-			err  error
-		)
-		switch listMode {
-		case "MediaDB":
-			list, err = h.fnOf(r.Context()).ItemListContainers(r.Context(), parentID, 0)
-		default: // TV/Season/未知（ItemDetail 失败时保持旧行为）
-			list, err = h.fnOf(r.Context()).ItemList(r.Context(), parentID)
-		}
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"Error": err.Error(), "Items": []any{}})
-			return
-		}
-		// Recursive=true：官方返回剧下全部集（Hills 剧详情"继续播放"区块、
-		// "共 x 集"统计的数据源）——逐季平铺展开；非递归保持季/集列表
-		if recursive && len(list) > 0 && list[0].Type == "Season" {
-			list = h.seriesEpisodes(r.Context(), parentID)
-		}
-		// 官方默认排序：季按季号、集按集号升序（飞牛按添加时间 DESC，需重排）
-		switch listMode {
-		case "TV":
-			sort.Slice(list, func(i, j int) bool { return list[i].SeasonNumber < list[j].SeasonNumber })
-		case "Season":
-			sort.Slice(list, func(i, j int) bool { return list[i].EpisodeNumber < list[j].EpisodeNumber })
-		}
-		writeItems(list)
-		return
-	}
-
-	// 根级：mediadb/list 列出全部库，聚合各库条目
-	dbs, err := h.fnOf(r.Context()).MediaDBList(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"Error": err.Error(), "Items": []any{}})
 		return
 	}
+	writeItems(all)
+}
+
+// cloneItems 复制切片：缓存里的切片不能被排序/过滤原地修改。
+func cloneItems(in []fn.MediaItem) []fn.MediaItem {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]fn.MediaItem, len(in))
+	copy(out, in)
+	return out
+}
+
+// filterItemTypes 把 Emby 的 IncludeItemTypes/ExcludeItemTypes 映射到飞牛 type。
+// 返回 (过滤后列表, 是否存在可识别类型, 是否只查容器类)。
+func filterItemTypes(all []fn.MediaItem, include, exclude string) ([]fn.MediaItem, bool, bool) {
+	want := map[string]bool{}
+	mapped := false
+	folderOnly := true
+	for _, t := range strings.Split(strings.ToUpper(include), ",") {
+		switch strings.TrimSpace(t) {
+		case "":
+			continue
+		case "SERIES", "TVSHOW":
+			want["TV"], mapped = true, true
+		case "MOVIE":
+			want["Movie"], mapped = true, true
+		case "EPISODE":
+			want["Episode"], mapped, folderOnly = true, true, false
+		case "SEASON":
+			want["Season"], mapped, folderOnly = true, true, false
+		case "VIDEO":
+			want["Video"], mapped = true, true
+		case "PERSON":
+			want["Person"], mapped, folderOnly = true, true, false
+		case "FOLDER", "FOLDERITEM":
+			want["MediaDB"], want["Directory"], want["TV"], want["Season"] = true, true, true, true
+			mapped = true
+		}
+	}
+	out := all
+	if include != "" {
+		if !mapped {
+			return nil, false, false
+		}
+		out = make([]fn.MediaItem, 0, len(all))
+		for _, it := range all {
+			if want[it.Type] {
+				out = append(out, it)
+			}
+		}
+	}
+	ex := map[string]bool{}
+	for _, t := range strings.Split(strings.ToUpper(exclude), ",") {
+		switch strings.TrimSpace(t) {
+		case "SERIES", "TVSHOW":
+			ex["TV"] = true
+		case "MOVIE":
+			ex["Movie"] = true
+		case "EPISODE":
+			ex["Episode"] = true
+		case "SEASON":
+			ex["Season"] = true
+		case "VIDEO":
+			ex["Video"] = true
+		case "PERSON":
+			ex["Person"] = true
+		}
+	}
+	if len(ex) > 0 {
+		kept := out[:0]
+		for _, it := range out {
+			if !ex[it.Type] {
+				kept = append(kept, it)
+			}
+		}
+		out = kept
+	}
+	return out, true, folderOnly
+}
+
+// wantsEpisode 判断查询是否明确要剧集（库级递归时走 Episode 查询）。
+func wantsEpisode(q map[string][]string) bool {
+	v := strings.ToUpper(queryGet(q, "IncludeItemTypes"))
+	return strings.Contains(v, "EPISODE") || strings.Contains(v, "VIDEO")
+}
+
+// browseParent 按父条目类型分派：库→容器/集，剧→季，季→集。
+func (h *Handler) browseParent(ctx context.Context, client *fn.Client, parentID string, q map[string][]string) ([]fn.MediaItem, error) {
+	det, _ := h.itemDetail(ctx, client, parentID)
+	listMode := ""
+	if det != nil {
+		listMode = det.Type
+	}
+	recursive := strings.EqualFold(queryGet(q, "Recursive"), "true")
+	switch listMode {
+	case "MediaDB":
+		if recursive && wantsEpisode(q) {
+			list, err := h.typedItems(ctx, client, parentID, []string{"Episode"}, 0)
+			if err != nil {
+				return nil, err
+			}
+			h.enrichEpisodeSeries(ctx, client, list, 80)
+			return list, nil
+		}
+		return h.typedItems(ctx, client, parentID, []string{"Movie", "TV", "Directory", "Video"}, 0)
+	default:
+		list, err := h.allItems(ctx, client, parentID)
+		if err != nil {
+			return nil, err
+		}
+		if recursive && len(list) > 0 && list[0].Type == "Season" {
+			list = h.seriesEpisodes(ctx, parentID)
+			h.enrichEpisodeSeries(ctx, client, list, 80)
+		}
+		if queryGet(q, "SortBy") == "" {
+			switch listMode {
+			case "TV":
+				sort.Slice(list, func(i, j int) bool { return list[i].SeasonNumber < list[j].SeasonNumber })
+			case "Season":
+				sort.Slice(list, func(i, j int) bool { return list[i].EpisodeNumber < list[j].EpisodeNumber })
+			}
+		}
+		return list, nil
+	}
+}
+
+// browseAll 根级：聚合全部库；递归查集时按 Episode 类型拉取。
+func (h *Handler) browseAll(ctx context.Context, client *fn.Client, q map[string][]string) ([]fn.MediaItem, error) {
+	dbs, err := h.mediaDBs(ctx, client)
+	if err != nil {
+		return nil, err
+	}
+	recursive := strings.EqualFold(queryGet(q, "Recursive"), "true")
 	var all []fn.MediaItem
 	for _, db := range dbs {
-		list, err := h.fnOf(r.Context()).ItemList(r.Context(), db.Guid)
-		if err != nil {
-			log.Printf("库 %q item/list: %v", db.Guid, err)
+		var list []fn.MediaItem
+		var e error
+		if recursive && wantsEpisode(q) {
+			list, e = h.typedItems(ctx, client, db.Guid, []string{"Episode"}, 0)
+		} else {
+			list, e = h.typedItems(ctx, client, db.Guid, []string{"Movie", "TV", "Directory", "Video"}, 0)
+		}
+		if e != nil {
+			log.Printf("库 %q item/list: %v", db.Guid, e)
 			continue
 		}
 		all = append(all, list...)
 	}
-	writeItems(all)
+	if recursive && wantsEpisode(q) {
+		h.enrichEpisodeSeries(ctx, client, all, 100)
+	}
+	return all, nil
+}
+
+// mediaDBs 列媒体库（60s 缓存）。
+func (h *Handler) mediaDBs(ctx context.Context, client *fn.Client) ([]fn.MediaDB, error) {
+	v, err := h.cache.Do("mediadb:"+client.BaseURL+"|"+client.Token, 60*time.Second,
+		func() (any, error) { return client.MediaDBList(ctx) })
+	if err != nil {
+		return nil, err
+	}
+	list, _ := v.([]fn.MediaDB)
+	return list, nil
+}
+
+// typedItems 按 tags.type 拉库内条目（15s 缓存，返回副本）。
+func (h *Handler) typedItems(ctx context.Context, client *fn.Client, guid string, types []string, limit int) ([]fn.MediaItem, error) {
+	key := "items:" + client.Token + ":" + guid + ":" + strings.Join(types, ",") + ":" + strconv.Itoa(limit)
+	v, err := h.cache.Do(key, 15*time.Second, func() (any, error) {
+		return client.ItemListTyped(ctx, guid, types, limit)
+	})
+	if err != nil {
+		return nil, err
+	}
+	list, _ := v.([]fn.MediaItem)
+	return cloneItems(list), nil
+}
+
+// allItems 拉 guid 下全部条目（15s 缓存，返回副本）。
+func (h *Handler) allItems(ctx context.Context, client *fn.Client, guid string) ([]fn.MediaItem, error) {
+	v, err := h.cache.Do("allitems:"+client.Token+":"+guid, 15*time.Second,
+		func() (any, error) { return client.ItemList(ctx, guid) })
+	if err != nil {
+		return nil, err
+	}
+	list, _ := v.([]fn.MediaItem)
+	return cloneItems(list), nil
+}
+
+// itemDetail 单条目详情（30s 缓存）。返回指针，调用方只读。
+func (h *Handler) itemDetail(ctx context.Context, client *fn.Client, guid string) (*fn.MediaItem, error) {
+	v, err := h.cache.Do("detail:"+client.Token+":"+guid, 30*time.Second, func() (any, error) {
+		return client.ItemDetail(ctx, guid)
+	})
+	if err != nil {
+		return nil, err
+	}
+	it, _ := v.(*fn.MediaItem)
+	return it, nil
+}
+
+// playInfo 播放信息（30s 缓存）。
+func (h *Handler) playInfo(ctx context.Context, client *fn.Client, guid string) (*fn.PlayInfo, error) {
+	v, err := h.cache.Do("playinfo:"+client.Token+":"+guid, 30*time.Second, func() (any, error) {
+		return client.PlayInfoByGuid(ctx, guid)
+	})
+	if err != nil {
+		return nil, err
+	}
+	pi, _ := v.(*fn.PlayInfo)
+	return pi, nil
+}
+
+// streamList 媒体流列表（30s 缓存）。
+func (h *Handler) streamList(ctx context.Context, client *fn.Client, guid string) (*fn.StreamList, error) {
+	v, err := h.cache.Do("streamlist:"+client.Token+":"+guid, 30*time.Second, func() (any, error) {
+		return client.StreamListByGuid(ctx, guid)
+	})
+	if err != nil {
+		return nil, err
+	}
+	sl, _ := v.(*fn.StreamList)
+	return sl, nil
+}
+
+// invalidateItem 清理某条目/用户的读写缓存（进度、已看、收藏变化后调用）。
+func (h *Handler) invalidateItem(client *fn.Client, guid string) {
+	h.cache.Delete("detail:" + client.Token + ":" + guid)
+	h.cache.Delete("playinfo:" + client.Token + ":" + guid)
+	h.cache.Delete("streamlist:" + client.Token + ":" + guid)
+	h.cache.DeletePrefix("items:" + client.Token + ":")
+	h.cache.DeletePrefix("allitems:" + client.Token + ":")
+	h.cache.DeletePrefix("search:")
+}
+
+// genreNames 返回 genre id → 名称（10 分钟缓存）。
+func (h *Handler) genreNames(ctx context.Context, client *fn.Client) map[int]string {
+	h.genreMu.Lock()
+	defer h.genreMu.Unlock()
+	if h.genreMap != nil && time.Since(h.genreAt) < 10*time.Minute {
+		return h.genreMap
+	}
+	genres, err := client.TagGenres(ctx, "zh-CN")
+	if err != nil {
+		if h.genreMap != nil {
+			return h.genreMap
+		}
+		return map[int]string{}
+	}
+	m := make(map[int]string, len(genres))
+	for _, g := range genres {
+		if g.ID > 0 && g.Value != "" {
+			m[g.ID] = g.Value
+		}
+	}
+	h.genreMap = m
+	h.genreAt = time.Now()
+	return m
+}
+
+// enrichEpisodeSeries 给平铺的集补 SeriesGuid（限量，避免详情请求风暴）。
+func (h *Handler) enrichEpisodeSeries(ctx context.Context, client *fn.Client, items []fn.MediaItem, max int) {
+	for i := range items {
+		if items[i].Type != "Episode" || items[i].SeriesGuid != "" {
+			continue
+		}
+		if max <= 0 {
+			break
+		}
+		max--
+		items[i].SeriesGuid = h.seriesIDForEpisode(ctx, client, items[i])
+	}
+}
+
+// seriesIDForEpisode 由集→季→剧解析 SeriesGuid（10 分钟缓存）。
+func (h *Handler) seriesIDForEpisode(ctx context.Context, client *fn.Client, m fn.MediaItem) string {
+	if m.SeriesGuid != "" {
+		return m.SeriesGuid
+	}
+	if m.ParentGuid == "" {
+		return ""
+	}
+	v, err := h.cache.Do("seriesof:"+client.Token+":"+m.ParentGuid, 10*time.Minute, func() (any, error) {
+		det, err := client.ItemDetail(ctx, m.ParentGuid)
+		if err != nil {
+			return "", err
+		}
+		if det.Type == "TV" {
+			return det.Guid, nil
+		}
+		return det.ParentGuid, nil
+	})
+	if err != nil {
+		return ""
+	}
+	s, _ := v.(string)
+	return s
+}
+
+// playableItems 聚合全库可播条目（集/电影/视频），供已看/未看/可续播筛选。
+func (h *Handler) playableItems(ctx context.Context, client *fn.Client) ([]fn.MediaItem, error) {
+	dbs, err := h.mediaDBs(ctx, client)
+	if err != nil {
+		return nil, err
+	}
+	var all []fn.MediaItem
+	for _, db := range dbs {
+		list, e := h.typedItems(ctx, client, db.Guid, []string{"Episode", "Movie", "Video"}, 0)
+		if e != nil {
+			continue
+		}
+		all = append(all, list...)
+	}
+	return all, nil
+}
+
+// searchItems 调 /search/list 并做缓存（按用户，结果带用户观看状态）。
+func (h *Handler) searchItems(ctx context.Context, client *fn.Client, user, term string) ([]fn.MediaItem, error) {
+	term = strings.TrimSpace(term)
+	key := "search:" + user + ":" + term
+	v, err := h.cache.Do(key, 60*time.Second, func() (any, error) {
+		return client.Search(ctx, term)
+	})
+	if err != nil {
+		return nil, err
+	}
+	list, _ := v.([]fn.MediaItem)
+	return cloneItems(list), nil
+}
+
+// favoriteItems 分页拉收藏（最多 max 条），避免固定 200 条截断。
+func (h *Handler) favoriteItems(ctx context.Context, client *fn.Client, max int) ([]fn.MediaItem, error) {
+	var all []fn.MediaItem
+	for page := 1; page <= 10; page++ {
+		list, total, err := client.FavoriteList(ctx, page, 100)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, list...)
+		if len(list) == 0 || len(all) >= total || len(all) >= max {
+			break
+		}
+	}
+	if len(all) > max {
+		all = all[:max]
+	}
+	return all, nil
+}
+
+// filterItems 应用 Emby 查询参数里的筛选条件。
+func (h *Handler) filterItems(ctx context.Context, client *fn.Client, user string, items []fn.MediaItem, q map[string][]string) []fn.MediaItem {
+	filters := strings.ToUpper(queryGet(q, "Filters"))
+	favOnly := strings.Contains(filters, "ISFAVORITE")
+	playedOnly := strings.Contains(filters, "ISPLAYED") && !strings.Contains(filters, "ISUNPLAYED")
+	unplayedOnly := strings.Contains(filters, "ISUNPLAYED")
+	resumableOnly := strings.Contains(filters, "ISRESUMABLE")
+	likesOnly := strings.Contains(filters, "LIKES")
+	isFolder := strings.Contains(filters, "ISFOLDER") && !strings.Contains(filters, "ISNOTFOLDER")
+	notFolder := strings.Contains(filters, "ISNOTFOLDER")
+
+	genres := splitPipe(queryGet(q, "Genres"))
+	years := splitCSV(queryGet(q, "Years"))
+	ratings := splitPipe(queryGet(q, "OfficialRatings"))
+	countries := splitPipe(firstNonEmpty(queryGet(q, "Countries"), queryGet(q, "Country")))
+	minRating := float64(0)
+	if v := queryGet(q, "MinCommunityRating"); v != "" {
+		if _, err := fmt.Sscanf(v, "%f", &minRating); err != nil {
+			minRating = 0
+		}
+	}
+	nameStarts := strings.ToLower(strings.TrimSpace(queryGet(q, "NameStartsWith")))
+	is4k := strings.EqualFold(queryGet(q, "Is4K"), "true")
+	ishd := strings.EqualFold(queryGet(q, "IsHD"), "true")
+	var genreMap map[int]string
+	if len(genres) > 0 {
+		genreMap = h.genreNames(ctx, client)
+	}
+	out := items[:0]
+	for _, m := range items {
+		played := m.Watched != 0 || m.IsWatched != 0
+		if favOnly && m.IsFavorite == 0 {
+			continue
+		}
+		if playedOnly && !played {
+			continue
+		}
+		if unplayedOnly && played {
+			continue
+		}
+		if resumableOnly && (played || m.Ts <= 0) {
+			continue
+		}
+		if likesOnly {
+			if like, ok := h.state.Like(user, m.Guid); !ok || !like {
+				continue
+			}
+		}
+		isContainer := m.Type == "TV" || m.Type == "Season" || m.Type == "MediaDB" || m.Type == "Directory"
+		if isFolder && !isContainer {
+			continue
+		}
+		if notFolder && isContainer {
+			continue
+		}
+		if len(genres) > 0 && !matchGenre(m, genres, genreMap) {
+			continue
+		}
+		if len(years) > 0 && !matchYear(m, years) {
+			continue
+		}
+		if len(ratings) > 0 && !matchRating(m, ratings) {
+			continue
+		}
+		if len(countries) > 0 && !matchCountry(m, countries) {
+			continue
+		}
+		if minRating > 0 && voteOf(m.VoteAverage) < minRating {
+			continue
+		}
+		if nameStarts != "" && !strings.HasPrefix(strings.ToLower(sortNameOf(m)), nameStarts) {
+			continue
+		}
+		if is4k || ishd {
+			res := mediaResolutions(m)
+			if len(res) > 0 { // 无 media_stream 时视为未知，不做排除
+				if is4k && !hasAnyResolution(res, "4k", "2160", "2160p") {
+					continue
+				}
+				if ishd && !hasAnyResolution(res, "720", "1080", "4k", "2160") {
+					continue
+				}
+			}
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+func splitPipe(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, "|") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func splitCSV(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func matchGenre(m fn.MediaItem, want []string, names map[int]string) bool {
+	if len(m.Genres) == 0 {
+		return false
+	}
+	for _, id := range m.Genres {
+		name := names[id]
+		for _, w := range want {
+			if strings.EqualFold(strings.TrimSpace(name), strings.TrimSpace(w)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func matchYear(m fn.MediaItem, years []string) bool {
+	y := yearOf(m.AirDate, m.ReleaseDate, m.FirstAirDate)
+	for _, s := range years {
+		var n int
+		if _, err := fmt.Sscanf(s, "%d", &n); err == nil && n == y {
+			return true
+		}
+	}
+	return false
+}
+
+func matchCountry(m fn.MediaItem, want []string) bool {
+	for _, c := range m.CountryList() {
+		for _, w := range want {
+			if strings.EqualFold(strings.TrimSpace(c), strings.TrimSpace(w)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func matchRating(m fn.MediaItem, want []string) bool {
+	got := strings.ToUpper(strings.TrimSpace(string(m.ContentRatings)))
+	if got == "" {
+		return false
+	}
+	for _, w := range want {
+		if strings.EqualFold(got, strings.TrimSpace(w)) {
+			return true
+		}
+	}
+	return false
+}
+
+func mediaResolutions(m fn.MediaItem) []string {
+	if m.MediaStream == nil {
+		return nil
+	}
+	return m.MediaStream.Resolutions
+}
+
+func hasAnyResolution(res []string, want ...string) bool {
+	for _, r := range res {
+		r = strings.ToLower(r)
+		for _, w := range want {
+			if strings.Contains(r, w) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// randomSeedFor 为 Random 排序生成种子：
+//   - 客户端显式带 Seed 时优先；
+//   - StartIndex>0 的分页复用首页 seed，避免翻页重复/漏项；
+//   - StartIndex==0（首页/刷新）生成新 seed，让"推荐影片"每次刷新有变化。
+func (h *Handler) randomSeedFor(r *http.Request, q map[string][]string, user string, start int) string {
+	if s := queryGet(q, "Seed"); s != "" {
+		return s
+	}
+	dev := r.Header.Get("X-Emby-Device-Id")
+	if dev == "" {
+		dev = r.Header.Get("X-Emby-Client")
+	}
+	key := user + "|" + dev + "|" + queryGet(q, "ParentId") + "|" + queryGet(q, "IncludeItemTypes")
+	if start > 0 {
+		if v, ok := h.randSeeds.Load(key); ok {
+			if e, ok := v.(randSeedEntry); ok && time.Since(e.at) < 5*time.Minute {
+				return strconv.FormatInt(e.seed, 10)
+			}
+		}
+	}
+	seed := time.Now().UnixNano()
+	h.randSeeds.Store(key, randSeedEntry{seed: seed, at: time.Now()})
+	return strconv.FormatInt(seed, 10)
+}
+
+type randSeedEntry struct {
+	seed int64
+	at   time.Time
 }
 
 // parseInt 解析正整数，非法/负值返回 0。
@@ -1409,8 +2030,6 @@ func titleCompare(a, b string) int {
 }
 
 // itemSortDate 取条目用于排序的日期（首播 → 发行 → 首映，取第一个能解析的）。
-// 飞牛没有"入库时间"字段，桥接给客户端的 DateCreated 也是用首播日期兜底的
-// （见 toEmbyItem），所以按时间排序与客户端界面显示的日期是一致的。
 func itemSortDate(m fn.MediaItem) time.Time {
 	for _, s := range []string{m.AirDate, m.ReleaseDate, m.FirstAirDate} {
 		if s == "" {
@@ -1429,9 +2048,21 @@ func itemSortDate(m fn.MediaItem) time.Time {
 	return time.Time{}
 }
 
-// itemSortPlayedAt 取条目用于"按播放时间"排序的时间戳（秒）。
-func itemSortPlayedAt(m fn.MediaItem) int64 {
-	if at := lastPlayedAt(m.Guid); at > 0 {
+// itemCreatedAt 取入库时间（秒）：优先 create_time，缺失时回退首播日期。
+// 不能用 time.Now()——否则每次请求 DateCreated 都在变，排序/缓存全乱。
+func itemCreatedAt(m fn.MediaItem) int64 {
+	if c := m.CreatedAt(); c > 0 {
+		return c
+	}
+	if t := itemSortDate(m); !t.IsZero() {
+		return t.Unix()
+	}
+	return 0
+}
+
+// itemSortPlayedAt 取条目用于"按播放时间"排序的时间戳（秒，按用户隔离）。
+func itemSortPlayedAt(m fn.MediaItem, user string) int64 {
+	if at := lastPlayedAt(user, m.Guid); at > 0 {
 		return at
 	}
 	return m.WatchedTs
@@ -1445,56 +2076,159 @@ func itemSeconds(m fn.MediaItem) int {
 	return m.Runtime * 60
 }
 
-// sortMediaItems 按 Emby 的 SortBy / SortOrder 就地排序。
+// sortNameOf 按 Emby 习惯生成排序名：集用"剧名 SxxExx"，其余用标题。
+func sortNameOf(m fn.MediaItem) string {
+	if m.Type == "Episode" && m.TvTitle != "" {
+		return fmt.Sprintf("%s S%02dE%02d", m.TvTitle, m.SeasonNumber, m.EpisodeNumber)
+	}
+	if m.Title != "" {
+		return m.Title
+	}
+	return m.TvTitle
+}
+
+// sortKeys 把 SortBy 解析成有序的规范 key（未知 key 保留，比较时返回 0）。
+func sortKeys(sortBy string) []string {
+	parts := strings.Split(sortBy, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.ToLower(strings.TrimSpace(part))
+		switch part {
+		case "":
+			continue
+		case "sortname", "name":
+			out = append(out, "sortname")
+		case "seriessortname":
+			out = append(out, "seriessortname")
+		case "datecreated":
+			out = append(out, "datecreated")
+		case "premieredate", "airdate", "startdate", "firstairdate":
+			out = append(out, "premieredate")
+		case "productionyear":
+			out = append(out, "productionyear")
+		case "communityrating", "criticrating":
+			out = append(out, "communityrating")
+		case "runtime":
+			out = append(out, "runtime")
+		case "playcount":
+			out = append(out, "playcount")
+		case "dateplayed", "lastplayeddate":
+			out = append(out, "dateplayed")
+		case "random":
+			out = append(out, "random")
+		}
+	}
+	return out
+}
+
+// seedValue 把任意字符串散列成 int64（Random 排序种子用）。
+func seedValue(s string) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(s))
+	return int64(h.Sum64())
+}
+
+// compareByKey 返回 -1/0/1；未知 key 恒 0（不改变相对顺序）。
+func compareByKey(a, b fn.MediaItem, key, user string) int {
+	cmpInt := func(x, y int64) int {
+		switch {
+		case x < y:
+			return -1
+		case x > y:
+			return 1
+		default:
+			return 0
+		}
+	}
+	switch key {
+	case "sortname":
+		return titleCompare(sortNameOf(a), sortNameOf(b))
+	case "seriessortname":
+		return titleCompare(a.TvTitle, b.TvTitle)
+	case "datecreated":
+		return cmpInt(itemCreatedAt(a), itemCreatedAt(b))
+	case "premieredate":
+		ta, tb := itemSortDate(a), itemSortDate(b)
+		switch {
+		case ta.Before(tb):
+			return -1
+		case ta.After(tb):
+			return 1
+		default:
+			return 0
+		}
+	case "productionyear":
+		return cmpInt(int64(yearOf(a.AirDate, a.ReleaseDate, a.FirstAirDate)),
+			int64(yearOf(b.AirDate, b.ReleaseDate, b.FirstAirDate)))
+	case "communityrating":
+		va, vb := voteOf(a.VoteAverage), voteOf(b.VoteAverage)
+		switch {
+		case va < vb:
+			return -1
+		case va > vb:
+			return 1
+		default:
+			return 0
+		}
+	case "runtime":
+		return cmpInt(int64(itemSeconds(a)), int64(itemSeconds(b)))
+	case "playcount":
+		pa, pb := 0, 0
+		if a.Watched != 0 || a.IsWatched != 0 {
+			pa = 1
+		}
+		if b.Watched != 0 || b.IsWatched != 0 {
+			pb = 1
+		}
+		return cmpInt(int64(pa), int64(pb))
+	case "dateplayed":
+		return cmpInt(itemSortPlayedAt(a, user), itemSortPlayedAt(b, user))
+	}
+	return 0
+}
+
+// sortMediaItems 按 Emby 的 SortBy / SortOrder 就地排序（支持多键、按用户隔离的
+// DatePlayed、稳定 Random）。
 //
-// 客户端「按标题 / 按时间 / 按评分 / 按时长」等排序全部走这两个参数，而桥接以前
-// 完全忽略它们，表现就是排序点了没反应。这里覆盖客户端常用的键；
-// **不认识的键保持飞牛原顺序**，避免把现有行为改坏。
-// SortOrder 缺省或非 Descending 时为升序（与 Emby 语义一致）。
-func sortMediaItems(items []fn.MediaItem, sortBy, sortOrder string) {
+// seed 非空时 Random 用它做种子（同一浏览会话/分页顺序稳定）；为空则每次随机。
+func sortMediaItems(items []fn.MediaItem, sortBy, sortOrder, user, seed string) {
 	if len(items) < 2 || strings.TrimSpace(sortBy) == "" {
 		return
 	}
-	if isRandomSort(sortBy) {
-		mrand.Shuffle(len(items), func(i, j int) { items[i], items[j] = items[j], items[i] })
+	keys := sortKeys(sortBy)
+	if len(keys) == 0 {
+		return
+	}
+	random := false
+	for _, k := range keys {
+		if k == "random" {
+			random = true
+		}
+	}
+	if random {
+		s := seedValue(seed)
+		if seed == "" {
+			s = time.Now().UnixNano()
+		}
+		mrand.New(mrand.NewSource(s)).Shuffle(len(items), func(i, j int) {
+			items[i], items[j] = items[j], items[i]
+		})
 		return
 	}
 
 	desc := strings.EqualFold(strings.TrimSpace(sortOrder), "Descending")
-
-	var less func(i, j int) bool
-	switch {
-	case hasSortKey(sortBy, "SortName", "Name"):
-		less = func(i, j int) bool { return titleCompare(items[i].Title, items[j].Title) < 0 }
-	case hasSortKey(sortBy, "DatePlayed"):
-		less = func(i, j int) bool { return itemSortPlayedAt(items[i]) < itemSortPlayedAt(items[j]) }
-	case hasSortKey(sortBy, "PremiereDate", "DateCreated", "AirDate", "StartDate"):
-		less = func(i, j int) bool {
-			ti, tj := itemSortDate(items[i]), itemSortDate(items[j])
-			if ti.Equal(tj) {
-				// 日期缺失/相同的条目退化为按标题，避免顺序不稳定
-				return titleCompare(items[i].Title, items[j].Title) < 0
-			}
-			return ti.Before(tj)
-		}
-	case hasSortKey(sortBy, "ProductionYear"):
-		less = func(i, j int) bool {
-			return yearOf(items[i].AirDate, items[i].ReleaseDate, items[i].FirstAirDate) <
-				yearOf(items[j].AirDate, items[j].ReleaseDate, items[j].FirstAirDate)
-		}
-	case hasSortKey(sortBy, "CommunityRating", "CriticRating"):
-		less = func(i, j int) bool { return voteOf(items[i].VoteAverage) < voteOf(items[j].VoteAverage) }
-	case hasSortKey(sortBy, "Runtime"):
-		less = func(i, j int) bool { return itemSeconds(items[i]) < itemSeconds(items[j]) }
-	default:
-		return // 不认识的排序键：保持飞牛原顺序
-	}
-
 	sort.SliceStable(items, func(i, j int) bool {
-		if desc {
-			return less(j, i)
+		for _, k := range keys {
+			c := compareByKey(items[i], items[j], k, user)
+			if c == 0 {
+				continue
+			}
+			if desc {
+				return c > 0
+			}
+			return c < 0
 		}
-		return less(i, j)
+		return false
 	})
 }
 
@@ -1512,7 +2246,7 @@ func queryInt(q map[string][]string, key string, def int) int {
 // handleViews 实现 GET /Users/{uid}/Views：Emby 客户端首页的媒体库视图列表。
 // 直接映射飞牛 mediadb/list（0.9.8 原生支持），CollectionType 按 category 映射。
 func (h *Handler) handleViews(w http.ResponseWriter, r *http.Request) {
-	dbs, err := h.fnOf(r.Context()).MediaDBList(r.Context())
+	dbs, err := h.mediaDBs(r.Context(), h.fnOf(r.Context()))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"Error": err.Error(), "Items": []any{}})
 		return
@@ -1573,7 +2307,7 @@ func collectionType(c string) string {
 func (h *Handler) handleItemByID(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	// 详情用 item/{guid}：对 TV/Season 等容器类型也能正确返回（play/info 只适用于可播条目）
-	item, err := h.fnOf(r.Context()).ItemDetail(r.Context(), id)
+	item, err := h.itemDetail(r.Context(), h.fnOf(r.Context()), id)
 	if err != nil {
 		// 人物 guid（详情页 People 注入的 Id 非条目）：条目 404 → 演员详情
 		// （Yamby/Hills 详情页点演员进人物页走 /Users/{uid}/Items/{personId}）
@@ -1589,7 +2323,7 @@ func (h *Handler) handleItemByID(w http.ResponseWriter, r *http.Request) {
 	// 集详情页 seriesId! 强解包直接 "Null check operator used on a null value"
 	seriesID := ""
 	if item.Type == "Episode" && item.ParentGuid != "" {
-		if season, err := h.fnOf(r.Context()).ItemDetail(r.Context(), item.ParentGuid); err == nil {
+		if season, err := h.itemDetail(r.Context(), h.fnOf(r.Context()), item.ParentGuid); err == nil {
 			seriesID = season.ParentGuid
 		}
 	}
@@ -1728,9 +2462,11 @@ var episodesCache sync.Map // guid -> episodesEntry
 
 // seriesEpisodes 拉剧/季下全部集（剧 guid 自动逐季展开），按季号/集号升序。
 func (h *Handler) seriesEpisodes(ctx context.Context, guid string) []fn.MediaItem {
-	if v, ok := episodesCache.Load(guid); ok {
+	// 集列表带用户进度（ts/watched），缓存必须按会话隔离，否则多用户串状态。
+	key := h.fnOf(ctx).Token + "|" + guid
+	if v, ok := episodesCache.Load(key); ok {
 		if e, ok := v.(episodesEntry); ok && time.Since(e.at) < 60*time.Second {
-			return e.eps
+			return cloneItems(e.eps)
 		}
 	}
 	// 优先 episode/list（真机抓包：剧 guid 一次返回全剧所有集，跨季平铺自带
@@ -1743,8 +2479,8 @@ func (h *Handler) seriesEpisodes(ctx context.Context, guid string) []fn.MediaIte
 			}
 			return eps[i].EpisodeNumber < eps[j].EpisodeNumber
 		})
-		episodesCache.Store(guid, episodesEntry{eps: eps, at: time.Now()})
-		return eps
+		episodesCache.Store(key, episodesEntry{eps: eps, at: time.Now()})
+		return cloneItems(eps)
 	}
 	eps, err := h.fnOf(ctx).ItemList(ctx, guid)
 	if err != nil {
@@ -1768,8 +2504,8 @@ func (h *Handler) seriesEpisodes(ctx context.Context, guid string) []fn.MediaIte
 		}
 		return eps[i].EpisodeNumber < eps[j].EpisodeNumber
 	})
-	episodesCache.Store(guid, episodesEntry{eps: eps, at: time.Now()})
-	return eps
+	episodesCache.Store(key, episodesEntry{eps: eps, at: time.Now()})
+	return cloneItems(eps)
 }
 
 // seriesTotals 汇总剧/季全部集时长（秒）与集数（复用 seriesEpisodes 缓存）。
@@ -1868,7 +2604,7 @@ func (h *Handler) enrichMediaSources(r *http.Request, item map[string]any, guid 
 	playURL := h.streamURL(r, guid)
 	src["Path"] = playURL
 	src["DirectStreamUrl"] = playURL
-	info, err := h.fnOf(ctx).PlayInfoByGuid(ctx, guid)
+	info, err := h.playInfo(ctx, h.fnOf(ctx), guid)
 	if err != nil {
 		log.Printf("[media-info] play/info %s: %v", guid, err)
 		return
@@ -1898,7 +2634,7 @@ func (h *Handler) enrichMediaSources(r *http.Request, item map[string]any, guid 
 			}
 		}
 	}
-	list, listErr := h.fnOf(ctx).StreamListByGuid(ctx, guid)
+	list, listErr := h.streamList(ctx, h.fnOf(ctx), guid)
 	if listErr != nil || len(list.Files) == 0 {
 		log.Printf("[media-info] stream/list %s: %v", guid, listErr)
 		h.enrichSingleMediaSource(r, item, src, info)
@@ -2526,7 +3262,7 @@ func playInfoSeconds(info *fn.PlayInfo) int64 {
 // handlePlayback 实现 POST /Videos/{id}/Playback（老端点，新客户端走 PlaybackInfo）。
 func (h *Handler) handlePlayback(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	info, err := h.fnOf(r.Context()).PlayInfoByGuid(r.Context(), id)
+	info, err := h.playInfo(r.Context(), h.fnOf(r.Context()), id)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]any{"Error": err.Error()})
 		return
@@ -2561,7 +3297,7 @@ func (h *Handler) handlePlayback(w http.ResponseWriter, r *http.Request) {
 // 现复用详情页 enrichMediaSources 的真实流构建（单流单 codec + 宽高/位深/profile）。
 func (h *Handler) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	info, err := h.fnOf(r.Context()).PlayInfoByGuid(r.Context(), id)
+	info, err := h.playInfo(r.Context(), h.fnOf(r.Context()), id)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]any{"Error": err.Error()})
 		return
@@ -2603,7 +3339,7 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request) {
 	if versionID == "" {
 		versionID = r.URL.Query().Get("MediaSourceId")
 	}
-	info, err := h.fnOf(r.Context()).PlayInfoByGuid(r.Context(), id)
+	info, err := h.playInfo(r.Context(), h.fnOf(r.Context()), id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
@@ -2778,14 +3514,13 @@ func (h *Handler) recordToFN(r *http.Request, itemID string, ticks int64, stoppe
 		return
 	}
 	sec := ticks / 10_000_000
-	if info, err := h.fnOf(r.Context()).PlayInfoByGuid(r.Context(), itemID); err == nil {
+	if info, err := h.playInfo(r.Context(), h.fnOf(r.Context()), itemID); err == nil {
 		dur := playInfoSeconds(info)
 		if err := h.fnOf(r.Context()).RecordProgress(r.Context(), itemID, info.MediaGuid, sec, dur); err == nil {
-			touchProgress(itemID)
+			touchProgress(h.sessionUserName(r), itemID)
+			h.invalidateItem(h.fnOf(r.Context()), itemID)
 			// 进度刚上报就失效继续观看缓存：下次拉首页立即看到最新条目
-			resumeMu.Lock()
-			resumeAt = time.Time{}
-			resumeMu.Unlock()
+			h.invalidateResume(h.sessionUserName(r))
 		}
 		// 看完判定：**任何一次**位置上报达到阈值就标记已看，不限于 Stopped。
 		//
@@ -2795,6 +3530,7 @@ func (h *Handler) recordToFN(r *http.Request, itemID string, ticks int64, stoppe
 		// Emby 自身也是在播放进度达到约 90% 时判定为已播放，这里取 92% 与飞牛侧对齐。
 		if dur > 0 && sec*100 >= dur*watchedThresholdPercent {
 			if err := h.fnOf(r.Context()).WatchItem(r.Context(), itemID); err == nil {
+				h.invalidateItem(h.fnOf(r.Context()), itemID)
 				log.Printf("[watched] %s 已看完（%.0f%%，%ds/%ds，stopped=%v）",
 					itemID, float64(sec)/float64(dur)*100, sec, dur, stopped)
 			}
@@ -2826,24 +3562,38 @@ func loadProgressLocked() {
 	_ = json.Unmarshal(b, &progressTimes)
 }
 
-// touchProgress 记录某条目的最后播放时刻并落盘。
-func touchProgress(guid string) {
+// progressKey 按用户隔离播放时刻；用户为空时退回旧格式（兼容历史数据）。
+func progressKey(user, guid string) string {
+	if user == "" {
+		return guid
+	}
+	return user + "|" + guid
+}
+
+// touchProgress 记录某用户某条目的最后播放时刻并落盘。
+func touchProgress(user, guid string) {
 	progressMu.Lock()
 	defer progressMu.Unlock()
 	loadProgressLocked()
-	progressTimes[guid] = time.Now().Unix()
+	progressTimes[progressKey(user, guid)] = time.Now().Unix()
 	b, err := json.Marshal(progressTimes)
 	if err == nil {
 		_ = os.WriteFile(progressPath(), b, 0o644)
 	}
 }
 
-// lastPlayedAt 查条目的桥接侧最后播放时刻（无记录返回 0）。
-func lastPlayedAt(guid string) int64 {
+// lastPlayedAt 查某用户条目的桥接侧最后播放时刻（无记录返回 0）。
+func lastPlayedAt(user, guid string) int64 {
 	progressMu.Lock()
 	defer progressMu.Unlock()
 	loadProgressLocked()
-	return progressTimes[guid]
+	if at := progressTimes[progressKey(user, guid)]; at > 0 {
+		return at
+	}
+	if user != "" {
+		return progressTimes[guid] // 旧版本数据
+	}
+	return 0
 }
 
 // handleProgress 老端点进度回传。
@@ -2872,12 +3622,16 @@ func (h *Handler) handleProgress(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleItemImages(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	out := []map[string]any{}
-	if it, err := h.fnOf(r.Context()).ItemDetail(r.Context(), id); err == nil && it != nil {
+	it, err := h.itemDetail(r.Context(), h.fnOf(r.Context()), id)
+	if err == nil && it != nil {
 		tags := imageTags(*it)
 		for _, t := range []string{"Primary", "Logo", "Thumb", "Backdrop", "Banner", "Art"} {
 			if _, ok := tags[t]; ok {
 				out = append(out, map[string]any{"ImageType": t, "ImageIndex": 0})
 			}
+		}
+		for i := 1; i < len(it.BackdropPaths()); i++ {
+			out = append(out, map[string]any{"ImageType": "Backdrop", "ImageIndex": i})
 		}
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -2889,14 +3643,50 @@ func (h *Handler) handleLocalizationOptions(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, []string{"Auto"})
 }
 
-// handleItemImage 实现 GET /Items/{id}/Images/{imgType}[/{imgIndex}]。
-//
-// 飞牛只有海报资源：Primary 用竖版海报，其余类型优先取宽>高的横版海报（更接近
-// Logo/Backdrop 用途），都没有时回退同一张海报。0.9.8 真机契约：海报走
-// GET {base}/v/api/v1/sys/img{poster_path}?w=400，只需 Cookie（无需 authx）。
-// 任何失败都回 1x1 透明 PNG（200），避免客户端破图。
+// imagePathParams 解析官方图片完整路径：
+// /Images/{type}/{index}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}
+// 也兼容只有 index 的短路径与 query 参数。
+func imagePathParams(r *http.Request) (index int, tag, format string, maxW, maxH int) {
+	rest := r.PathValue("rest")
+	if rest != "" {
+		parts := strings.Split(rest, "/")
+		if len(parts) > 0 {
+			index = parseInt(parts[0])
+		}
+		if len(parts) > 1 {
+			tag = parts[1]
+		}
+		if len(parts) > 2 {
+			format = parts[2]
+		}
+		if len(parts) > 3 {
+			maxW = parseInt(parts[3])
+		}
+		if len(parts) > 4 {
+			maxH = parseInt(parts[4])
+		}
+	}
+	q := r.URL.Query()
+	if v := queryGet(q, "tag"); v != "" {
+		tag = v
+	}
+	if v := queryGet(q, "maxWidth"); v != "" {
+		maxW = parseInt(v)
+	}
+	if v := queryGet(q, "maxHeight"); v != "" {
+		maxH = parseInt(v)
+	}
+	_ = format
+	return
+}
+
+// handleItemImage 实现 GET /Items/{id}/Images/{imgType}[/{index}[/...]]。
+// v1.1：支持官方完整路径、多背景图索引、ETag/Cache-Control。
 func (h *Handler) handleItemImage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	imgType := strings.ToLower(r.PathValue("imgType"))
+	idx, tag, _, maxW, maxH := imagePathParams(r)
+
 	// admin 后台自定义库图优先：命中直接 302（自定义 URL），不查飞牛
 	if h.libImage != nil {
 		if u := h.libImage(id); u != "" {
@@ -2906,57 +3696,61 @@ func (h *Handler) handleItemImage(w http.ResponseWriter, r *http.Request) {
 	}
 	servePNG := func() {
 		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(png1x1())
 	}
-	// 人物头像（无状态）：People.PrimaryImageTag 是 base64url(飞牛 profile_path)，
-	// 解码命中（以 / 开头）直接代理 sys/img——人物 guid 非条目，查 ItemDetail 必 404。
-	// 普通海报 tag 为 "Primary"/"Logo" 等固定词（非合法长 base64，不会误命中）。
-	if tag := queryGet(r.URL.Query(), "tag"); len(tag) >= 8 {
+	// 人物头像（无状态）：People.PrimaryImageTag 是 base64url(飞牛 profile_path)
+	if len(tag) >= 8 {
 		if b, err := base64.URLEncoding.DecodeString(tag); err == nil && len(b) > 0 && b[0] == '/' {
-			h.serveSysImg(w, r, string(b))
+			h.serveSysImg(w, r, string(b), maxW, maxH)
 			return
 		}
 	}
-	item, err := h.fnOf(r.Context()).ItemDetail(r.Context(), id)
-	if err != nil {
+	item, err := h.itemDetail(r.Context(), h.fnOf(r.Context()), id)
+	if err != nil || item == nil {
 		log.Printf("[poster] item %q detail: %v", id, err)
 		servePNG()
 		return
 	}
-	// 飞牛只有竖版海报资源（item posters 为单值字符串）：
-	// Logo/Thumb/Backdrop 等类型回退同一张海报（横版位裁剪显示，好过透明图）
 	p := item.PosterPath()
-	// 按请求类型取对应资源（0.9.8 真机契约：剧有 logos/backdrops，集 poster 即横版剧照）
-	switch strings.ToLower(r.PathValue("imgType")) {
+	switch imgType {
 	case "logo":
-		p = item.LogoPath()
-		// 季/集无自有 Logo：沿 parent 链向上找（集→季→剧），取第一个有 logos 的
-		// （真机契约：季 parent_guid=剧，集 parent_guid=季；ancestor_guid 指库不可用）
+		if paths := item.LogoPaths(); len(paths) > 0 {
+			if idx >= 0 && idx < len(paths) {
+				p = paths[idx]
+			} else {
+				p = paths[0]
+			}
+		}
+		// 季/集无自有 Logo：沿 parent 链向上找（集→季→剧）
 		if p == "" && (item.Type == "Season" || item.Type == "Episode") {
 			g := item.ParentGuid
 			for i := 0; i < 2 && g != "" && g != item.Guid; i++ {
-				det, err := h.fnOf(r.Context()).ItemDetail(r.Context(), g)
-				if err != nil {
+				det, err := h.itemDetail(r.Context(), h.fnOf(r.Context()), g)
+				if err != nil || det == nil {
 					break
 				}
-				if det.LogoPath() != "" {
-					p = det.LogoPath()
+				if paths := det.LogoPaths(); len(paths) > 0 {
+					p = paths[0]
 					break
 				}
 				g = det.ParentGuid
 			}
 		}
 	case "backdrop", "thumb", "art", "banner":
-		if v := item.BackdropPath(); v != "" {
-			p = v
+		if paths := item.BackdropPaths(); len(paths) > 0 {
+			if idx >= 0 && idx < len(paths) {
+				p = paths[idx]
+			} else {
+				p = paths[0]
+			}
 		}
 	}
 	if p == "" && (item.Type == "MediaDB" || item.Type == "Directory" || item.Type == "TV") {
 		// 库/剧等容器自身无海报：回退库内第一个有海报的作品
-		// （首页"我的媒体"库卡片空白图修复）
-		if list, err := h.fnOf(r.Context()).ItemList(r.Context(), id); err == nil {
-			for _, it := range list { // 优先剧/电影
+		if list, err := h.allItems(r.Context(), h.fnOf(r.Context()), id); err == nil {
+			for _, it := range list {
 				if it.Type != "TV" && it.Type != "Movie" {
 					continue
 				}
@@ -2980,18 +3774,18 @@ func (h *Handler) handleItemImage(w http.ResponseWriter, r *http.Request) {
 		servePNG()
 		return
 	}
-	h.serveSysImg(w, r, p)
+	h.serveSysImg(w, r, p, maxW, maxH)
 }
 
 // serveSysImg 代理飞牛 sys/img 图片资源（海报/头像/Logo 统一出口）。
-// 绝对 URL（云盘封面等）302 让客户端直连。
-func (h *Handler) serveSysImg(w http.ResponseWriter, r *http.Request, p string) {
+// 绝对 URL（云盘封面等）302 让客户端直连；其余按 maxWidth/maxHeight 缩放并加缓存头。
+func (h *Handler) serveSysImg(w http.ResponseWriter, r *http.Request, p string, maxW, maxH int) {
 	servePNG := func() {
 		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(png1x1())
 	}
-	// 绝对 URL（云盘封面等）：302 让客户端直连
 	if strings.HasPrefix(p, "http://") || strings.HasPrefix(p, "https://") {
 		http.Redirect(w, r, p, http.StatusFound)
 		return
@@ -2999,21 +3793,27 @@ func (h *Handler) serveSysImg(w http.ResponseWriter, r *http.Request, p string) 
 	if !strings.HasPrefix(p, "/") {
 		p = "/" + p
 	}
-	// 分辨率：透传客户端请求的 maxWidth/maxHeight（此前写死 w=400，
-	// 高分屏拉伸显示发糊——飞牛影视 App 直连原图不糊）。真机实测 sys/img
-	// 全档位生效（w=200..3000，不传给原图）。宁大勿小保证清晰，上限 3000。
 	wParam := 800
-	if v := queryGet(r.URL.Query(), "maxWidth"); v != "" {
-		if n := parseInt(v); n > 0 {
-			wParam = n
-		}
-	} else if v := queryGet(r.URL.Query(), "maxHeight"); v != "" {
-		if n := parseInt(v); n > wParam {
-			wParam = n
-		}
+	if maxW > 0 {
+		wParam = maxW
+	} else if maxH > 0 {
+		wParam = maxH
 	}
 	if wParam > 3000 {
 		wParam = 3000
+	}
+	if wParam < 32 {
+		wParam = 32
+	}
+	// ETag/Cache-Control：客户端按 tag/URL 缓存图片；同图重复请求直接 304。
+	hsh := fnv.New64a()
+	_, _ = hsh.Write([]byte(p + "|" + strconv.Itoa(wParam)))
+	etag := fmt.Sprintf(`"%x"`, hsh.Sum64())
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	if inm := r.Header.Get("If-None-Match"); inm != "" && inm == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
 	}
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet,
 		h.fnOf(r.Context()).BaseURL+"/v/api/v1/sys/img"+p+"?w="+strconv.Itoa(wParam), nil)
@@ -3056,6 +3856,101 @@ func playCountOf(played bool) int {
 		return 1
 	}
 	return 0
+}
+
+// firstNonEmpty 返回第一个非空字符串。
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// countriesOrEmpty 返回非 nil 的国家/地区数组（严格客户端不接受 null）。
+func countriesOrEmpty(m fn.MediaItem) []string {
+	if c := m.CountryList(); len(c) > 0 {
+		return c
+	}
+	return []string{}
+}
+
+// genreDTOs 把飞牛 genre id 映射成 Emby 的 Genres（名称数组）与 GenreItems。
+func (h *Handler) genreDTOs(r *http.Request, ids []int) ([]string, []map[string]any) {
+	names := []string{}
+	items := []map[string]any{}
+	if r == nil || h == nil || len(ids) == 0 {
+		return names, items
+	}
+	dict := h.genreNames(r.Context(), h.fnOf(r.Context()))
+	seen := map[string]bool{}
+	for _, id := range ids {
+		name := dict[id]
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+		items = append(items, map[string]any{"Name": name, "Id": name, "Type": "Genre"})
+	}
+	return names, items
+}
+
+// backdropImageTags 生成 BackdropImageTags：客户端只有看到非空 tag 才会请求背景图。
+// 有 backdrops 时按张数给 0..N-1；没有时若只有海报，也给 0（handler 会回退海报）。
+func backdropImageTags(m fn.MediaItem) []string {
+	paths := m.BackdropPaths()
+	if len(paths) == 0 {
+		if m.PosterPath() != "" || m.LogoPath() != "" {
+			return []string{"0"}
+		}
+		return []string{}
+	}
+	tags := make([]string, 0, len(paths))
+	for i := range paths {
+		tags = append(tags, strconv.Itoa(i))
+	}
+	return tags
+}
+
+// providerRegex 匹配 trim_id 里的 tt/tm + 数字（飞牛用前缀区分 IMDb/TMDB）。
+var providerRegex = regexp.MustCompile(`(?i)(tt|tm)(\d{4,})`)
+
+// providerInfo 生成 Emby ProviderIds 与外部链接。
+func providerInfo(m fn.MediaItem) (map[string]any, []any) {
+	ids := map[string]any{}
+	urls := []any{}
+	add := func(name, id, url string) {
+		if id == "" || ids[name] != nil {
+			return
+		}
+		ids[name] = id
+		if url != "" {
+			urls = append(urls, map[string]any{"Name": name, "Url": url})
+		}
+	}
+	if m.ImdbID != "" {
+		add("Imdb", m.ImdbID, "https://www.imdb.com/title/"+m.ImdbID)
+	}
+	for _, match := range providerRegex.FindAllStringSubmatch(m.TrimID, -1) {
+		prefix := strings.ToLower(match[1])
+		id := match[2]
+		if prefix == "tt" {
+			add("Imdb", id, "https://www.imdb.com/title/tt"+id)
+		} else {
+			kind := "movie"
+			if m.Type == "TV" || m.Type == "Season" || m.Type == "Episode" {
+				kind = "tv"
+			}
+			add("Tmdb", id, "https://www.themoviedb.org/"+kind+"/"+id)
+		}
+	}
+	if int(m.DoubanID) > 0 {
+		id := strconv.Itoa(int(m.DoubanID))
+		add("Douban", id, "https://movie.douban.com/subject/"+id+"/")
+	}
+	return ids, urls
 }
 
 // imageTags 生成 BaseItemDto.ImageTags：客户端只在 tag 非空时才发对应图片请求
@@ -3213,6 +4108,10 @@ func toEmbyItemsWithSeries(r *http.Request, items []fn.MediaItem, seriesID strin
 }
 
 func toEmbyItemWithSeries(r *http.Request, m fn.MediaItem, seriesID string, h *Handler) map[string]any {
+	user := ""
+	if r != nil {
+		user = h.sessionUserName(r)
+	}
 	// 飞牛 type 直接映射 Emby Type；TV/Season/Directory 是容器（可下钻）
 	itemType := "Movie"
 	isFolder := false
@@ -3229,6 +4128,8 @@ func toEmbyItemWithSeries(r *http.Request, m fn.MediaItem, seriesID string, h *H
 		itemType, isFolder = "Folder", true
 	case "Video":
 		itemType = "Video"
+	case "Person":
+		itemType = "Person"
 	}
 	name := m.Title
 	if name == "" && m.TvTitle != "" {
@@ -3248,13 +4149,15 @@ func toEmbyItemWithSeries(r *http.Request, m fn.MediaItem, seriesID string, h *H
 	if premiere == "" {
 		premiere = normalizeEmbyDate(m.FirstAirDate)
 	}
-	// DateCreated（入库时间）：web 客户端详情页 renderMediaSources 会
-	// new Date(Date.parse(item.DateCreated)) 后 Intl 格式化，缺失时得到
-	// Invalid Date → "RangeError: Invalid time value" 整页渲染中断。
-	// 飞牛无入库时间字段，用首播日期兜底，再兜当前时间。
-	dateCreated := premiere
-	if dateCreated == "" {
-		dateCreated = time.Now().UTC().Format(time.RFC3339)
+	// DateCreated（入库时间）：优先飞牛的 create_time（v1.1），
+	// 缺失才回退首播日期；两者都没有时给 epoch（稳定值），绝不用 time.Now()。
+	dateCreated := ""
+	if ts := itemCreatedAt(m); ts > 0 {
+		dateCreated = time.Unix(ts, 0).UTC().Format("2006-01-02T15:04:05.0000000Z")
+	} else if premiere != "" {
+		dateCreated = premiere
+	} else {
+		dateCreated = "1970-01-01T00:00:00.0000000Z"
 	}
 	item := map[string]any{
 		"Id":                      m.Guid,
@@ -3262,7 +4165,7 @@ func toEmbyItemWithSeries(r *http.Request, m fn.MediaItem, seriesID string, h *H
 		"Name":                    name,
 		"Type":                    itemType,
 		"IsFolder":                isFolder,
-		"SortName":                m.Title,
+		"SortName":                sortNameOf(m),
 		"ParentId":                m.ParentGuid,
 		"PrimaryImageAspectRatio": 0.6667,
 		"Path":                    "fn://" + m.Guid,
@@ -3275,14 +4178,15 @@ func toEmbyItemWithSeries(r *http.Request, m fn.MediaItem, seriesID string, h *H
 		"DateCreated":             nullableDate(dateCreated),
 		"ProductionYear":          yearOf(m.AirDate, m.ReleaseDate, m.FirstAirDate),
 		"ImageTags":               imageTags(m),
+		"BackdropImageTags":       backdropImageTags(m),
 	}
 	// 通用空集合字段：Flutter 客户端对列表字段常用 ! 强解包，缺失即
 	// "Null check operator used on a null value"（官方对无数据的列表也返回空数组）
-	item["Genres"] = []any{}
-	item["GenreItems"] = []any{}
+	genres, genreItems := h.genreDTOs(r, m.Genres)
+	item["Genres"] = genres
+	item["GenreItems"] = genreItems
 	item["Studios"] = []any{}
 	item["Taglines"] = []any{}
-	item["BackdropImageTags"] = []any{}
 	item["ScreenshotImageTags"] = []any{}
 	item["Chapters"] = []any{}
 	item["LocationType"] = "FileSystem"
@@ -3293,13 +4197,13 @@ func toEmbyItemWithSeries(r *http.Request, m fn.MediaItem, seriesID string, h *H
 	// （表现：请求全 200 但页面不渲染、无后续请求——「点进剧集进不去」）。
 	// 全部给安全空值（官方对无数据场景也返回 ""/0/[]）。
 	item["CanDownload"] = false
-	item["OriginalTitle"] = name
-	item["OfficialRating"] = ""
+	item["OriginalTitle"] = firstNonEmpty(m.OriginalTitle, name)
+	item["OfficialRating"] = strings.TrimSpace(string(m.ContentRatings))
 	item["CriticRating"] = 0
-	item["Status"] = ""   // Series 分支有值时覆盖（Continuing/Ended）
-	item["EndDate"] = nil // 空串会让 Dart DateTime.parse("") 抛 FormatException
+	item["Status"] = ""                                              // Series 分支有值时覆盖（Continuing/Ended）
+	item["EndDate"] = nullableDate(normalizeEmbyDate(m.LastAirDate)) // 空串会让 Dart DateTime.parse("") 抛 FormatException
 	item["Tags"] = []any{}
-	item["ProductionLocations"] = []any{}
+	item["ProductionLocations"] = countriesOrEmpty(m)
 	item["AirDays"] = []any{}
 	item["AirTime"] = ""
 	item["Width"] = 0
@@ -3309,13 +4213,11 @@ func toEmbyItemWithSeries(r *http.Request, m fn.MediaItem, seriesID string, h *H
 	item["Album"] = ""
 	item["AlbumArtists"] = []any{}
 	item["ArtistItems"] = []any{}
-	// ProviderIds/ExternalUrls：飞牛刮削的 IMDb ID（客户端"外部链接"入口，
-	// Yamby 列表/详情请求都带 Fields=ProviderIds,ExternalUrls）
-	if m.ImdbID != "" {
-		item["ProviderIds"] = map[string]any{"Imdb": m.ImdbID}
-		item["ExternalUrls"] = []any{map[string]any{
-			"Name": "IMDb", "Url": "https://www.imdb.com/title/" + m.ImdbID,
-		}}
+	// ProviderIds/ExternalUrls：IMDb + TMDB（trim_id）+ 豆瓣（douban_id）
+	providerIDs, externalURLs := providerInfo(m)
+	if len(providerIDs) > 0 {
+		item["ProviderIds"] = providerIDs
+		item["ExternalUrls"] = externalURLs
 	}
 	// MediaSources：仅可播条目携带（官方容器类型 Series/Season/Folder 不返回），
 	// 且 MediaSourceInfo.MediaStreams 为必填（Yamby Kotlin 严格序列化，缺字段直接抛异常）。
@@ -3358,6 +4260,9 @@ func toEmbyItemWithSeries(r *http.Request, m fn.MediaItem, seriesID string, h *H
 		item["SeasonName"] = m.ParentTitle // 真机为"第 2 季"
 		item["SeriesName"] = m.TvTitle
 		item["SeasonId"] = m.ParentGuid // 集的 parent 即季
+		if seriesID == "" {
+			seriesID = m.SeriesGuid
+		}
 		if seriesID != "" {
 			item["SeriesId"] = seriesID // 剧 guid 仅下钻场景可知（ancestor_guid 是库）
 			// Yamby/Flutter 集详情页的剧 logo/海报直接读这些字段（null 即
@@ -3381,6 +4286,10 @@ func toEmbyItemWithSeries(r *http.Request, m fn.MediaItem, seriesID string, h *H
 			item["ChildCount"] = cc
 		} else if cc := m.LocalNumberOfEpisodes; cc > 0 {
 			item["ChildCount"] = cc
+		}
+	case "Person":
+		if n := m.NumberOfItem; n > 0 {
+			item["RecursiveItemCount"] = n
 		}
 	case "Series":
 		if n := m.NumberOfSeasons; n > 0 {
@@ -3422,6 +4331,9 @@ func toEmbyItemWithSeries(r *http.Request, m fn.MediaItem, seriesID string, h *H
 	if played {
 		ud["PlayCount"] = 1
 	}
+	if like, ok := h.state.Like(user, m.Guid); ok {
+		ud["Likes"] = like
+	}
 	// 总时长 + 进度百分比：客户端"继续观看"卡片进度条靠 PlayedPercentage
 	// （只有位置没有总时长时只能显示"已播放至 x 秒"，拖动条比例算不出）。
 	// 飞牛集条目 duration=秒、剧/季 runtime=分钟；此项同时补条目 RunTimeTicks。
@@ -3439,7 +4351,7 @@ func toEmbyItemWithSeries(r *http.Request, m fn.MediaItem, seriesID string, h *H
 	// 只有像合理 Unix 时间戳（>2001 年）才直接用；否则用桥接侧自己记录的播放时刻
 	ts := m.WatchedTs
 	if ts <= 1_000_000_000 {
-		ts = lastPlayedAt(m.Guid)
+		ts = lastPlayedAt(user, m.Guid)
 	}
 	if ts > 1_000_000_000 {
 		ud["LastPlayedDate"] = time.Unix(ts, 0).UTC().Format("2006-01-02T15:04:05.0000000Z")
@@ -3476,42 +4388,87 @@ func displayName(info *fn.PlayInfo) string {
 // 全没看过取第一集，全看完返回空。之前恒返回空 → Hills 继续播放区块
 // 拿不到条目（总时长/进度显示缺失，"继续播放那里没有总时长"）。
 func (h *Handler) handleNextUp(w http.ResponseWriter, r *http.Request) {
-	empty := func() {
+	q := r.URL.Query()
+	limit := queryInt(q, "Limit", 10)
+	if limit <= 0 {
+		limit = 10
+	}
+	start := queryInt(q, "StartIndex", 0)
+	if start < 0 {
+		start = 0
+	}
+	seriesID := queryGet(q, "SeriesId")
+	if seriesID == "" {
+		seriesID = queryGet(q, "ParentId")
+	}
+	if seriesID != "" {
+		if next := h.nextEpisode(r.Context(), seriesID); next != nil {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"Items":            []map[string]any{toEmbyItemWithSeries(r, *next, seriesID, h)},
+				"TotalRecordCount": 1,
+				"StartIndex":       0,
+			})
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"Items": []any{}, "TotalRecordCount": 0, "StartIndex": 0})
-	}
-	seriesID := queryGet(r.URL.Query(), "SeriesId")
-	if seriesID == "" {
-		seriesID = queryGet(r.URL.Query(), "ParentId")
-	}
-	if seriesID == "" {
-		empty() // 首页级 NextUp（无剧 guid）暂不支持
 		return
 	}
-	eps := h.seriesEpisodes(r.Context(), seriesID)
-	var next *fn.MediaItem
-	for i := range eps {
-		if eps[i].Ts > 0 && eps[i].Watched == 0 && eps[i].IsWatched == 0 {
-			next = &eps[i]
+
+	// 首页级 NextUp：以"继续观看"里出现过的剧为基线，每剧取下一集。
+	ctx := r.Context()
+	client := h.fnOf(ctx)
+	user := h.sessionUserName(r)
+	resume := h.resumeSnapshot(ctx, client, user)
+	out := make([]map[string]any, 0, limit)
+	seen := map[string]bool{}
+	for _, m := range resume {
+		if m.Type != "" && m.Type != "Episode" {
+			continue
+		}
+		series := m.SeriesGuid
+		if series == "" {
+			series = h.seriesIDForEpisode(ctx, client, m)
+		}
+		if series == "" || seen[series] {
+			continue
+		}
+		seen[series] = true
+		next := h.nextEpisode(ctx, series)
+		if next == nil {
+			continue
+		}
+		out = append(out, toEmbyItemWithSeries(r, *next, series, h))
+		if len(out) >= 100 {
 			break
 		}
 	}
-	if next == nil {
-		for i := range eps {
-			if eps[i].Watched == 0 && eps[i].IsWatched == 0 {
-				next = &eps[i]
-				break
-			}
-		}
+	total := len(out)
+	if start > total {
+		start = total
 	}
-	if next == nil {
-		empty()
-		return
+	items := out[start:]
+	if len(items) > limit {
+		items = items[:limit]
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"Items":            []map[string]any{toEmbyItemWithSeries(r, *next, seriesID, h)},
-		"TotalRecordCount": 1,
-		"StartIndex":       0,
+		"Items": items, "TotalRecordCount": total, "StartIndex": start,
 	})
+}
+
+// nextEpisode 返回剧的"下一集"：优先有进度且未看完的集，否则第一集未看的。
+func (h *Handler) nextEpisode(ctx context.Context, seriesID string) *fn.MediaItem {
+	eps := h.seriesEpisodes(ctx, seriesID)
+	for i := range eps {
+		if eps[i].Ts > 0 && eps[i].Watched == 0 && eps[i].IsWatched == 0 {
+			return &eps[i]
+		}
+	}
+	for i := range eps {
+		if eps[i].Watched == 0 && eps[i].IsWatched == 0 {
+			return &eps[i]
+		}
+	}
+	return nil
 }
 
 // handleShowsSeasons 实现 GET /Shows/{id}/Seasons：官方 App 剧集季导航。
@@ -3522,7 +4479,12 @@ func (h *Handler) handleShowsSeasons(w http.ResponseWriter, r *http.Request) {
 	if err != nil || len(seasons) == 0 {
 		seasons, _ = h.fnOf(r.Context()).ItemList(r.Context(), id)
 	}
-	sort.Slice(seasons, func(i, j int) bool { return seasons[i].SeasonNumber < seasons[j].SeasonNumber })
+	if queryGet(r.URL.Query(), "SortBy") != "" {
+		sortMediaItems(seasons, queryGet(r.URL.Query(), "SortBy"), queryGet(r.URL.Query(), "SortOrder"),
+			h.sessionUserName(r), h.randomSeedFor(r, r.URL.Query(), h.sessionUserName(r), 0))
+	} else {
+		sort.Slice(seasons, func(i, j int) bool { return seasons[i].SeasonNumber < seasons[j].SeasonNumber })
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"Items":            toEmbyItemsWithSeries(r, seasons, id, h),
 		"TotalRecordCount": len(seasons),
@@ -3558,11 +4520,29 @@ func (h *Handler) handleShowsEpisodes(w http.ResponseWriter, r *http.Request) {
 		}
 		eps = all
 	}
-	sort.Slice(eps, func(i, j int) bool { return eps[i].EpisodeNumber < eps[j].EpisodeNumber })
+	if queryGet(r.URL.Query(), "SortBy") != "" {
+		sortMediaItems(eps, queryGet(r.URL.Query(), "SortBy"), queryGet(r.URL.Query(), "SortOrder"),
+			h.sessionUserName(r), h.randomSeedFor(r, r.URL.Query(), h.sessionUserName(r), 0))
+	} else {
+		sort.Slice(eps, func(i, j int) bool { return eps[i].EpisodeNumber < eps[j].EpisodeNumber })
+	}
+	start := queryInt(r.URL.Query(), "StartIndex", 0)
+	limit := queryInt(r.URL.Query(), "Limit", 0)
+	total := len(eps)
+	if start < 0 {
+		start = 0
+	}
+	if start > total {
+		start = total
+	}
+	page := eps[start:]
+	if limit > 0 && len(page) > limit {
+		page = page[:limit]
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"Items":            toEmbyItemsWithSeries(r, eps, seriesID, h),
-		"TotalRecordCount": len(eps),
-		"StartIndex":       0,
+		"Items":            toEmbyItemsWithSeries(r, page, seriesID, h),
+		"TotalRecordCount": total,
+		"StartIndex":       start,
 	})
 }
 
@@ -3586,7 +4566,64 @@ func (h *Handler) handleVideosSub(w http.ResponseWriter, r *http.Request) {
 // 飞牛无字幕内容下发接口（stream/subtitle 等路径实测返回空），内嵌字幕由
 // 客户端直连容器读取；此处显式 404，避免兜底 JSON 被客户端当字幕解析报错。
 func (h *Handler) handleSubtitleStream(w http.ResponseWriter, r *http.Request) {
-	http.Error(w, "subtitle not available via bridge (embedded in container)", http.StatusNotFound)
+	id := r.PathValue("id")
+	idx, err := strconv.Atoi(r.PathValue("index"))
+	if err != nil {
+		http.Error(w, "bad subtitle index", http.StatusBadRequest)
+		return
+	}
+	ctx := r.Context()
+	client := h.fnOf(ctx)
+	sl, err := h.streamList(ctx, client, id)
+	if err != nil {
+		http.Error(w, "subtitle list unavailable", http.StatusNotFound)
+		return
+	}
+	var sub *fn.SubtitleStream
+	for i := range sl.SubtitleStreams {
+		if sl.SubtitleStreams[i].Index == idx {
+			sub = &sl.SubtitleStreams[i]
+			break
+		}
+	}
+	if sub == nil {
+		http.Error(w, "subtitle not found", http.StatusNotFound)
+		return
+	}
+	if sub.IsExternal == 0 || sub.Guid == "" {
+		// 内嵌字幕由客户端直读容器；桥接只下发外挂字幕文件。
+		http.Error(w, "subtitle is embedded in container", http.StatusNotFound)
+		return
+	}
+	data, ct, err := client.SubtitleFile(ctx, sub.Guid)
+	if err != nil {
+		log.Printf("[subtitle] %s index=%d guid=%s: %v", id, idx, sub.Guid, err)
+		http.Error(w, "subtitle fetch failed", http.StatusBadGateway)
+		return
+	}
+	if ct == "" || strings.Contains(ct, "octet-stream") {
+		ct = subtitleContentType(sub.CodecName, sub.Format)
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+// subtitleContentType 按字幕编码/格式给 Content-Type（客户端按此选择解析器）。
+func subtitleContentType(codec, format string) string {
+	v := strings.ToLower(firstNonEmpty(format, codec))
+	switch {
+	case strings.Contains(v, "vtt"):
+		return "text/vtt; charset=utf-8"
+	case strings.Contains(v, "ass"), strings.Contains(v, "ssa"):
+		return "text/x-ssa; charset=utf-8"
+	case strings.Contains(v, "subrip"), strings.Contains(v, "srt"):
+		return "application/x-subrip; charset=utf-8"
+	default:
+		return "text/plain; charset=utf-8"
+	}
 }
 
 // handleQueryFilters 实现 GET /Items/Filters 与 /Users/{uid}/Items/Filters。
@@ -3595,13 +4632,174 @@ func (h *Handler) handleSubtitleStream(w http.ResponseWriter, r *http.Request) {
 // 这层筛选项数据，回空数组即可 —— **关键是端点必须存在**：此前该路径被
 // /Items/{id} 通配吃掉，桥接拿 "Filters" 当作影片 ID 去查飞牛并返回 404，
 // 而客户端打开媒体库时会调用它，404 会导致媒体库页打不开。
-func (h *Handler) handleQueryFilters(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"Genres":          []any{},
-		"Tags":            []any{},
-		"OfficialRatings": []any{},
-		"Years":           []any{},
+// filterDict 是 /Items/Filters 与 /Genres 需要的字典。
+type filterDict struct {
+	Genres  []string
+	Years   []string
+	Ratings []string
+}
+
+// filterDictFor 汇总某库（或全局）可用的类型/年份/分级，缓存 5 分钟。
+func (h *Handler) filterDictFor(ctx context.Context, client *fn.Client, parentID string) filterDict {
+	key := "filterdict:" + client.Token + ":" + parentID
+	v, err := h.cache.Do(key, 5*time.Minute, func() (any, error) {
+		fd := filterDict{}
+		names := h.genreNames(ctx, client)
+		if parentID != "" {
+			if opts, e := client.TagList(ctx, parentID, ""); e == nil && opts != nil {
+				for _, id := range opts.Genres {
+					if n := names[id]; n != "" {
+						fd.Genres = append(fd.Genres, n)
+					}
+				}
+			}
+			if list, e := h.typedItems(ctx, client, parentID, []string{"Movie", "TV", "Video", "Directory"}, 0); e == nil {
+				years := map[int]bool{}
+				ratings := map[string]bool{}
+				for _, m := range list {
+					if y := yearOf(m.AirDate, m.ReleaseDate, m.FirstAirDate); y > 0 {
+						years[y] = true
+					}
+					if r := strings.ToUpper(strings.TrimSpace(string(m.ContentRatings))); r != "" {
+						ratings[r] = true
+					}
+				}
+				for y := range years {
+					fd.Years = append(fd.Years, strconv.Itoa(y))
+				}
+				for r := range ratings {
+					fd.Ratings = append(fd.Ratings, r)
+				}
+			}
+		}
+		if len(fd.Genres) == 0 {
+			for _, n := range names {
+				fd.Genres = append(fd.Genres, n)
+			}
+		}
+		sort.Strings(fd.Genres)
+		sort.Sort(sort.Reverse(sort.StringSlice(fd.Years)))
+		sort.Strings(fd.Ratings)
+		return fd, nil
 	})
+	if err != nil {
+		return filterDict{}
+	}
+	fd, _ := v.(filterDict)
+	return fd
+}
+
+func stringsOrEmpty(in []string) []string {
+	if in == nil {
+		return []string{}
+	}
+	return in
+}
+
+// handleQueryFilters 实现 GET /Items/Filters 与 /Users/{uid}/Items/Filters。
+// 现在返回真实的类型/年份/分级（飞牛 /tag/list + item/list 可推导）。
+func (h *Handler) handleQueryFilters(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	fd := h.filterDictFor(ctx, h.fnOf(ctx), queryGet(r.URL.Query(), "ParentId"))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"Genres":          stringsOrEmpty(fd.Genres),
+		"Tags":            []string{},
+		"OfficialRatings": stringsOrEmpty(fd.Ratings),
+		"Years":           stringsOrEmpty(fd.Years),
+	})
+}
+
+// handleGenres 实现 GET /Genres：Emby QueryResult<BaseItemDto>。
+// 名称来自 /tag/genres；同名 genre 在不同库 id 不同，但展示名可以直接合并。
+func (h *Handler) handleGenres(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	names := h.genreNames(ctx, h.fnOf(ctx))
+	items := make([]map[string]any, 0, len(names))
+	seen := map[string]bool{}
+	for _, name := range names {
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		items = append(items, map[string]any{
+			"Name": name, "Id": name, "Type": "Genre", "IsFolder": false,
+		})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i]["Name"].(string) < items[j]["Name"].(string)
+	})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"Items": items, "TotalRecordCount": len(items), "StartIndex": 0,
+	})
+}
+
+// handleYears 实现 GET /Years：Emby QueryResult<BaseItemDto>。
+func (h *Handler) handleYears(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	fd := h.filterDictFor(ctx, h.fnOf(ctx), queryGet(r.URL.Query(), "ParentId"))
+	items := make([]map[string]any, 0, len(fd.Years))
+	for _, y := range fd.Years {
+		items = append(items, map[string]any{"Name": y, "Id": y, "Type": "Year", "IsFolder": false})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"Items": items, "TotalRecordCount": len(items), "StartIndex": 0,
+	})
+}
+
+// handleOfficialRatings 实现 GET /OfficialRatings。
+func (h *Handler) handleOfficialRatings(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	fd := h.filterDictFor(ctx, h.fnOf(ctx), queryGet(r.URL.Query(), "ParentId"))
+	items := make([]map[string]any, 0, len(fd.Ratings))
+	for _, v := range fd.Ratings {
+		items = append(items, map[string]any{"Name": v, "Id": v, "Type": "OfficialRating", "IsFolder": false})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"Items": items, "TotalRecordCount": len(items), "StartIndex": 0,
+	})
+}
+
+// handleRating 实现 POST/DELETE /Users/{uid}/Items/{id}/Rating?Likes=。
+// 飞牛没有喜欢/不喜欢，落桥接本地（按用户）。
+func (h *Handler) handleRating(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	user := h.sessionUserName(r)
+	var (
+		played bool
+		like   *bool
+	)
+	if det, err := h.itemDetail(r.Context(), h.fnOf(r.Context()), id); err == nil && det != nil {
+		played = det.Watched != 0 || det.IsWatched != 0
+	}
+	if r.Method == http.MethodPost {
+		v := !strings.EqualFold(queryGet(r.URL.Query(), "Likes"), "false")
+		h.state.SetLike(user, id, v)
+		h.cache.Delete("detail:" + h.fnOf(r.Context()).Token + ":" + id)
+		like = &v
+	} else {
+		h.state.ClearLike(user, id)
+	}
+	dto := h.userItemDataDTOOf(r.Context(), id, played, user)
+	if like != nil {
+		dto["Likes"] = *like
+	} else {
+		dto["Likes"] = nil
+	}
+	writeJSON(w, http.StatusOK, dto)
+}
+
+// handleHideFromResume 实现 POST /Users/{uid}/Items/{id}/HideFromResume?Hide=。
+func (h *Handler) handleHideFromResume(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	hidden := !strings.EqualFold(queryGet(r.URL.Query(), "Hide"), "false")
+	user := h.sessionUserName(r)
+	h.state.SetHidden(user, id, hidden)
+	h.invalidateResume(user)
+	played := false
+	if det, err := h.itemDetail(r.Context(), h.fnOf(r.Context()), id); err == nil && det != nil {
+		played = det.Watched != 0 || det.IsWatched != 0
+	}
+	writeJSON(w, http.StatusOK, h.userItemDataDTOOf(r.Context(), id, played, h.sessionUserName(r)))
 }
 
 // handleVirtualFolders 实现 GET /Library/VirtualFolders。
@@ -3610,7 +4808,7 @@ func (h *Handler) handleQueryFilters(w http.ResponseWriter, r *http.Request) {
 // 即不声明该字段。
 func (h *Handler) handleVirtualFolders(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	dbs, err := h.fnOf(ctx).MediaDBList(ctx)
+	dbs, err := h.mediaDBs(ctx, h.fnOf(ctx))
 	if err != nil {
 		writeJSON(w, http.StatusOK, []any{})
 		return
@@ -3643,7 +4841,7 @@ func (h *Handler) handleItemCountsAll(w http.ResponseWriter, r *http.Request) {
 		"ProgramCount": 0, "TrailerCount": 0, "SongCount": 0, "AlbumCount": 0,
 		"BoxSetCount": 0, "BookCount": 0, "ItemCount": 0,
 	}
-	if dbs, err := h.fnOf(ctx).MediaDBList(ctx); err == nil {
+	if dbs, err := h.mediaDBs(ctx, h.fnOf(ctx)); err == nil {
 		total, movies, series := 0, 0, 0
 		for _, db := range dbs {
 			_, n, err := h.fnOf(ctx).ItemListPage(ctx, "ancestor_guid", db.Guid, 1, 1)
@@ -3667,7 +4865,7 @@ func (h *Handler) handleItemCountsAll(w http.ResponseWriter, r *http.Request) {
 
 // handleItemCounts 实现 GET /Items/{id}/Counts：客户端仪表盘统计。
 func (h *Handler) handleItemCounts(w http.ResponseWriter, r *http.Request) {
-	dbs, err := h.fnOf(r.Context()).MediaDBList(r.Context())
+	dbs, err := h.mediaDBs(r.Context(), h.fnOf(r.Context()))
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{})
 		return
@@ -3715,36 +4913,74 @@ func (h *Handler) handleThemeMedia(w http.ResponseWriter, r *http.Request) {
 // 必须只返回该库的条目（此前忽略 ParentId 导致所有区块显示同一份跨库混合数据）。
 // 不带 ParentId 时（全局"最新添加"）才做跨库聚合。
 func (h *Handler) handleLatest(w http.ResponseWriter, r *http.Request) {
-	limit := queryInt(r.URL.Query(), "Limit", 20)
+	q := r.URL.Query()
+	ctx := r.Context()
+	client := h.fnOf(ctx)
+	limit := queryInt(q, "Limit", 20)
 	if limit <= 0 {
 		limit = 20
 	}
-	if parent := r.URL.Query().Get("ParentId"); parent != "" {
-		list, err := h.fnOf(r.Context()).ItemListContainers(r.Context(), parent, limit)
+	dbs, err := h.mediaDBs(ctx, client)
+	if err != nil {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	catOf := func(guid string) string {
+		for _, db := range dbs {
+			if db.Guid == guid {
+				return collectionType(db.Category)
+			}
+		}
+		return ""
+	}
+	parent := queryGet(q, "ParentId")
+	types := strings.ToUpper(queryGet(q, "IncludeItemTypes"))
+
+	if parent != "" {
+		cat := catOf(parent)
+		if (types == "" && cat == "tvshows") || strings.Contains(types, "EPISODE") {
+			list, err := h.typedItems(ctx, client, parent, []string{"Episode"}, limit*3)
+			if err != nil {
+				list = nil
+			}
+			h.enrichEpisodeSeries(ctx, client, list, 80)
+			sortMediaItems(list, "DateCreated", "Descending", h.sessionUserName(r), "")
+			if len(list) > limit {
+				list = list[:limit]
+			}
+			writeJSON(w, http.StatusOK, toEmbyItemsOrEmpty(r, list, h))
+			return
+		}
+		list, err := h.typedItems(ctx, client, parent, []string{"Movie", "TV", "Directory", "Video"}, limit)
 		if err != nil {
 			list = nil
 		}
 		writeJSON(w, http.StatusOK, toEmbyItemsOrEmpty(r, list, h))
 		return
 	}
-	dbs, err := h.fnOf(r.Context()).MediaDBList(r.Context())
-	if err != nil {
-		writeJSON(w, http.StatusOK, []any{})
-		return
-	}
+
+	// 全局 Latest：TV 库取最新集，其它库取容器；合并后按入库时间倒序。
 	var all []fn.MediaItem
 	for _, db := range dbs {
-		// 服务端只取容器级（Movie/TV/Directory/Video）：Latest 展示"最新添加的剧/电影"，
-		// 点进去才是季/集；客户端侧过滤在大库下会漏（前 N 页可能全是集）
-		list, err := h.fnOf(r.Context()).ItemListContainers(r.Context(), db.Guid, limit)
-		if err != nil {
+		cat := collectionType(db.Category)
+		var list []fn.MediaItem
+		var e error
+		if cat == "tvshows" && types == "" {
+			list, e = h.typedItems(ctx, client, db.Guid, []string{"Episode"}, limit*3)
+			if e == nil {
+				h.enrichEpisodeSeries(ctx, client, list, 60)
+			}
+		} else {
+			list, e = h.typedItems(ctx, client, db.Guid, []string{"Movie", "TV", "Directory", "Video"}, limit)
+		}
+		if e != nil {
 			continue
 		}
 		all = append(all, list...)
-		if len(all) >= limit {
-			break
-		}
 	}
+	sort.SliceStable(all, func(i, j int) bool {
+		return itemCreatedAt(all[i]) > itemCreatedAt(all[j])
+	})
 	if len(all) > limit {
 		all = all[:limit]
 	}
@@ -3760,33 +4996,65 @@ func toEmbyItemsOrEmpty(r *http.Request, items []fn.MediaItem, h *Handler) []map
 	return out
 }
 
-// 继续观看快照缓存：Yamby 每次刷新首页都会请求 Resume，全库聚合有翻页成本，
-// 缓存 60s（进度刚播完就上首页的延迟上限 1 分钟，可接受）。
-var (
-	resumeMu    sync.Mutex
-	resumeItems []fn.MediaItem
-	resumeAt    time.Time
-)
+// 继续观看快照：按用户缓存 45s（Yamby 每次刷新首页都会请求 Resume）。
+type resumeEntry struct {
+	items []fn.MediaItem
+	at    time.Time
+}
+
+var resumeCache sync.Map // user -> resumeEntry
+
+// invalidateResume 清掉某用户的继续观看缓存（进度/已看/隐藏变化后调用）。
+func (h *Handler) invalidateResume(user string) {
+	if user != "" {
+		resumeCache.Delete(user)
+	}
+	resumeCache.Range(func(k, _ any) bool {
+		if k == "" || k == user {
+			resumeCache.Delete(k)
+		}
+		return true
+	})
+}
 
 // handleResume 实现 GET /Users/{uid}/Items/Resume：首页"继续观看"。
-// 飞牛无现成列表 API（watch_list / play/record/list 等真机均 501），
-// item/list 的 watched_ts/ts 排序也不生效（真机验证：DESC 排序结果仍是 create_time 序），
-// 所以桥接侧自行聚合：全库拉集级条目（Episode/Movie/Video），筛"有进度且未看完"，
-// 按最后播放时间（watched_ts，未看完时飞牛也写入最后播放时刻）倒序。
+//
+// v1.1：优先用 /play/list（飞牛自己的播放历史，顺序即最近播放），
+// 失败/为空才回退全库扫描；缓存按用户隔离，不再串数据。
 func (h *Handler) handleResume(w http.ResponseWriter, r *http.Request) {
-	limit := queryInt(r.URL.Query(), "Limit", 20)
+	q := r.URL.Query()
+	limit := queryInt(q, "Limit", 20)
 	if limit <= 0 {
 		limit = 20
 	}
-	all := resumeSnapshot(r.Context(), h.FN)
-	items := all
+	start := queryInt(q, "StartIndex", 0)
+	if start < 0 {
+		start = 0
+	}
+	user := h.sessionUserName(r)
+	all := h.resumeSnapshot(r.Context(), h.fnOf(r.Context()), user)
+	if parent := queryGet(q, "ParentId"); parent != "" {
+		kept := all[:0]
+		for _, m := range all {
+			if m.AncestorGuid == parent || m.ParentGuid == parent || m.Guid == parent {
+				kept = append(kept, m)
+			}
+		}
+		all = kept
+	}
+	total := len(all)
+	if start > total {
+		start = total
+	}
+	items := all[start:]
 	if len(items) > limit {
 		items = items[:limit]
 	}
+	h.enrichEpisodeSeries(r.Context(), h.fnOf(r.Context()), items, 60)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"Items":            toEmbyItemsOrEmpty(r, items, h),
-		"TotalRecordCount": len(all),
-		"StartIndex":       0,
+		"TotalRecordCount": total,
+		"StartIndex":       start,
 	})
 }
 
@@ -3804,48 +5072,85 @@ func nearEnd(m fn.MediaItem) bool {
 }
 
 // markWatchedAsync 异步补标已看（自愈"位置到片尾却仍未看"的残留条目）。
-func markWatchedAsync(c *fn.Client, guid string) {
+func (h *Handler) markWatchedAsync(c *fn.Client, user, guid string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := c.WatchItem(ctx, guid); err == nil {
+		h.invalidateItem(c, guid)
+		h.invalidateResume(user)
 		log.Printf("[watched] %s 自愈补标已看（位置已达片尾阈值）", guid)
 	}
 }
 
-// resumeSnapshot 取全库"继续观看"候选（ts>0 且未看完），按最后播放时间倒序，60s 缓存。
-func resumeSnapshot(ctx context.Context, c *fn.Client) []fn.MediaItem {
-	resumeMu.Lock()
-	defer resumeMu.Unlock()
-	if resumeItems != nil && time.Since(resumeAt) < 60*time.Second {
-		return resumeItems
+// resumeSnapshot 取用户"继续观看"候选（有进度且未看完），按最后播放时间倒序。
+func (h *Handler) resumeSnapshot(ctx context.Context, c *fn.Client, user string) []fn.MediaItem {
+	if v, ok := resumeCache.Load(user); ok {
+		if e, ok := v.(resumeEntry); ok && time.Since(e.at) < 45*time.Second {
+			return cloneItems(e.items)
+		}
 	}
 	var all []fn.MediaItem
-	if dbs, err := c.MediaDBList(ctx); err == nil {
-		for _, db := range dbs {
-			list, err := c.ItemListTyped(ctx, db.Guid, []string{"Episode", "Movie", "Video"}, 0)
-			if err != nil {
+
+	// 1) 首选 /play/list：服务端已按最近播放排序，且不需要全库翻页。
+	if hist, err := c.PlayList(ctx); err == nil && len(hist) > 0 {
+		seen := map[string]bool{}
+		for _, m := range hist {
+			if m.Guid == "" || seen[m.Guid] {
 				continue
 			}
-			for _, m := range list {
-				if m.Ts == 0 || m.Watched != 0 || m.IsWatched != 0 {
-					continue
+			seen[m.Guid] = true
+			if m.Ts <= 0 || m.Watched != 0 || m.IsWatched != 0 {
+				continue
+			}
+			if h.state.Hidden(user, m.Guid) {
+				continue
+			}
+			if nearEnd(m) {
+				go h.markWatchedAsync(c, user, m.Guid)
+				continue
+			}
+			// play/list 字段可能不全：标题/类型缺失时补一次详情（有缓存）。
+			if m.Title == "" || m.Type == "" {
+				if det, err := h.itemDetail(ctx, c, m.Guid); err == nil && det != nil {
+					ts, w, iw := m.Ts, m.Watched, m.IsWatched
+					m = *det
+					m.Ts, m.Watched, m.IsWatched = ts, w, iw
 				}
-				// 自愈：位置已到片尾（≥92%）却没标已看的条目。
-				// 早期版本只在 Sessions/Playing/Stopped 时判定"已看完"，而有的客户端
-				// （实测小幻影视）只发 Progress、从不发 Stopped，于是位置记到了 100%
-				// 却仍是未看状态 —— 这类条目既不该留在「继续观看」，也该补上已看标记。
-				if nearEnd(m) {
-					go markWatchedAsync(c, m.Guid)
-					continue
-				}
-				all = append(all, m)
+			}
+			all = append(all, m)
+			if len(all) >= 60 {
+				break
 			}
 		}
 	}
+
+	// 2) 历史不可用/为空：回退全库扫描（旧逻辑，带用户隔离）。
+	if len(all) == 0 {
+		if dbs, err := h.mediaDBs(ctx, c); err == nil {
+			for _, db := range dbs {
+				list, err := h.typedItems(ctx, c, db.Guid, []string{"Episode", "Movie", "Video"}, 0)
+				if err != nil {
+					continue
+				}
+				for _, m := range list {
+					if m.Ts == 0 || m.Watched != 0 || m.IsWatched != 0 {
+						continue
+					}
+					if h.state.Hidden(user, m.Guid) {
+						continue
+					}
+					if nearEnd(m) {
+						go h.markWatchedAsync(c, user, m.Guid)
+						continue
+					}
+					all = append(all, m)
+				}
+			}
+		}
+	}
+
 	sort.Slice(all, func(i, j int) bool {
-		// 桥接侧记录的播放时间优先（真实时间序）；都无记录时回退 watched_ts
-		// （注意：watched_ts 对未看完条目是位置秒而非时间戳，只作弱排序兜底）
-		ti, tj := lastPlayedAt(all[i].Guid), lastPlayedAt(all[j].Guid)
+		ti, tj := lastPlayedAt(user, all[i].Guid), lastPlayedAt(user, all[j].Guid)
 		if ti != tj {
 			return ti > tj
 		}
@@ -3854,8 +5159,8 @@ func resumeSnapshot(ctx context.Context, c *fn.Client) []fn.MediaItem {
 	if all == nil {
 		all = []fn.MediaItem{}
 	}
-	resumeItems, resumeAt = all, time.Now()
-	return all
+	resumeCache.Store(user, resumeEntry{items: all, at: time.Now()})
+	return cloneItems(all)
 }
 
 // handleMovieRecommendations 实现 GET /Movies/Recommendations。
@@ -3874,6 +5179,7 @@ func resumeSnapshot(ctx context.Context, c *fn.Client) []fn.MediaItem {
 // 没有任何播放记录时返回空数组 —— 真实 Emby 对无观看历史的用户同样返回空。
 func (h *Handler) handleMovieRecommendations(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	user := h.sessionUserName(r)
 	catLimit := queryInt(r.URL.Query(), "CategoryLimit", 5)
 	itemLimit := queryInt(r.URL.Query(), "ItemLimit", 10)
 	if catLimit <= 0 || catLimit > 20 {
@@ -3909,7 +5215,7 @@ func (h *Handler) handleMovieRecommendations(w http.ResponseWriter, r *http.Requ
 	var bases []baseline
 	for _, lib := range libs {
 		for _, m := range byLib[lib] {
-			at := lastPlayedAt(m.Guid)
+			at := lastPlayedAt(user, m.Guid)
 			if m.Watched == 0 && m.IsWatched == 0 && m.Ts == 0 && at == 0 {
 				continue
 			}

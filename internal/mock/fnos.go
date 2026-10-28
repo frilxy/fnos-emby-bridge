@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -132,6 +133,7 @@ type Option func(*mockOpts)
 
 type mockOpts struct {
 	otherLibrary bool
+	tvLibrary    bool
 }
 
 // WithOtherLibrary 额外提供一个 Other 类库（条目 type=Video）。
@@ -141,11 +143,62 @@ func WithOtherLibrary() Option {
 	return func(o *mockOpts) { o.otherLibrary = true }
 }
 
+// WithTVLibrary 增加一个 TV 类库（含季/集），用于验证 Latest 剧集语义与 NextUp。
+func WithTVLibrary() Option {
+	return func(o *mockOpts) { o.tvLibrary = true }
+}
+
+// addTVLibrary 往**当前 handler 的**夹具里补 TV 库/剧/季/集。
+func addTVLibrary(items map[string]map[string]any, ancestor, parent map[string][]string) {
+	items["lib_tv"] = map[string]any{"guid": "lib_tv", "title": "剧集库", "type": "MediaDB", "category": "TV"}
+	items["fv_tv2"] = map[string]any{"guid": "fv_tv2", "parent_guid": "lib_tv", "title": "剧集C", "type": "TV",
+		"poster": "/1c/09/mock_fvtv2.webp", "poster_width": 300, "poster_height": 450,
+		"can_play": 0, "is_watched": 0, "number_of_seasons": 1, "number_of_episodes": 2,
+		"overview": "一部剧", "genres": []int{1}, "content_ratings": "TV-14",
+		"production_countries": []string{"CN"}, "original_title": "Drama C", "trim_id": "tm12345",
+		"create_time": 1700000000, "air_date": "2020-05-01"}
+	items["fv_s2"] = map[string]any{"guid": "fv_s2", "parent_guid": "fv_tv2", "title": "第一季", "type": "Season",
+		"poster": "/1c/09/mock_fvs2.webp", "season_number": 1, "number_of_episodes": 2}
+	items["fv_ep1"] = map[string]any{"guid": "fv_ep1", "parent_guid": "fv_s2", "ancestor_guid": "lib_tv",
+		"title": "剧集C 第1集", "type": "Episode", "poster": "/1c/09/mock_ep1.webp",
+		"duration": 2400, "runtime": 40, "can_play": 1, "is_watched": 0, "ts": 600,
+		"season_number": 1, "episode_number": 1, "air_date": "2020-05-01", "overview": "第一集",
+		"tv_title": "剧集C", "create_time": 1700000100, "genres": []int{1},
+		"media_stream": map[string]any{"resolutions": []string{"1080p"}, "audio_type": "Stereo"}}
+	items["fv_ep2"] = map[string]any{"guid": "fv_ep2", "parent_guid": "fv_s2", "ancestor_guid": "lib_tv",
+		"title": "剧集C 第2集", "type": "Episode", "poster": "/1c/09/mock_ep2.webp",
+		"duration": 2400, "runtime": 40, "can_play": 1, "is_watched": 0, "ts": 0,
+		"season_number": 1, "episode_number": 2, "air_date": "2020-05-08", "overview": "第二集",
+		"tv_title": "剧集C", "create_time": 1700000200, "genres": []int{1},
+		"media_stream": map[string]any{"resolutions": []string{"4k"}, "audio_type": "DolbyAtmos"}}
+	ancestor["lib_tv"] = []string{"fv_tv2"}
+	parent["fv_tv2"] = []string{"fv_s2"}
+	parent["fv_s2"] = []string{"fv_ep1", "fv_ep2"}
+}
+
 func NewHandler(cloudDirect bool, cdnBase string, opts ...Option) *http.ServeMux {
 	var o mockOpts
 	for _, fn := range opts {
 		fn(&o)
 	}
+	// 每个 handler 用独立 map（浅拷贝：条目值仍是共享指针，SetItemField 能生效），
+	// 避免 WithTVLibrary 的夹具污染其它测试。
+	items := make(map[string]map[string]any, len(mockItems))
+	for k, v := range mockItems {
+		items[k] = v
+	}
+	ancestor := make(map[string][]string, len(mockAncestor))
+	for k, v := range mockAncestor {
+		ancestor[k] = append([]string(nil), v...)
+	}
+	parent := make(map[string][]string, len(mockParent))
+	for k, v := range mockParent {
+		parent[k] = append([]string(nil), v...)
+	}
+	if o.tvLibrary {
+		addTVLibrary(items, ancestor, parent)
+	}
+	registerItemMap(items)
 	mux := http.NewServeMux()
 
 	// 0.9.8 登录：v2 + SHA256 密码
@@ -180,6 +233,11 @@ func NewHandler(cloudDirect bool, cdnBase string, opts ...Option) *http.ServeMux
 				"guid": "lib_other", "title": "其他库", "category": "Other", "view_type": 0,
 				"posters": []string{"/1c/09/mock_lib.webp"}})
 		}
+		if o.tvLibrary {
+			libs = append(libs, map[string]any{
+				"guid": "lib_tv", "title": "剧集库", "category": "TV", "view_type": 0,
+				"posters": []string{"/1c/09/mock_lib.webp"}})
+		}
 		writeResult(w, 0, "", libs)
 	})
 
@@ -189,6 +247,11 @@ func NewHandler(cloudDirect bool, cdnBase string, opts ...Option) *http.ServeMux
 			ParentGuid   string `json:"parent_guid"`
 			Page         int    `json:"page"`
 			PageSize     int    `json:"page_size"`
+			Tags         struct {
+				Type    []string `json:"type"`
+				Genres  int      `json:"genres"`
+				Watched string   `json:"watched"`
+			} `json:"tags"`
 		}
 		b, _ := io.ReadAll(r.Body)
 		if err := json.Unmarshal(b, &req); err != nil {
@@ -198,21 +261,48 @@ func NewHandler(cloudDirect bool, cdnBase string, opts ...Option) *http.ServeMux
 		var guids []string
 		if req.AncestorGuid != "" {
 			// 真机互斥：ancestor 模式只对库 guid 生效
-			guids = mockAncestor[req.AncestorGuid]
+			guids = ancestor[req.AncestorGuid]
+			// 集是库的子孙，mockAncestor 只存直接容器；按 Episode 查询时从全局夹具补。
+			if len(req.Tags.Type) == 1 && req.Tags.Type[0] == "Episode" {
+				guids = nil
+				for g, it := range items {
+					if str(it["ancestor_guid"]) == req.AncestorGuid && str(it["type"]) == "Episode" {
+						guids = append(guids, g)
+					}
+				}
+			}
 		} else if req.ParentGuid != "" {
-			guids = mockParent[req.ParentGuid]
+			guids = parent[req.ParentGuid]
 		}
 		list := make([]map[string]any, 0, len(guids))
 		for _, g := range guids {
-			if it, ok := mockItems[g]; ok {
-				list = append(list, it)
+			it, ok := items[g]
+			if !ok {
+				continue
 			}
+			if len(req.Tags.Type) > 0 && !containsStr(req.Tags.Type, str(it["type"])) {
+				continue
+			}
+			if req.Tags.Genres > 0 && !containsInt(it["genres"], req.Tags.Genres) {
+				continue
+			}
+			if req.Tags.Watched != "" {
+				want := req.Tags.Watched == "1"
+				got := it["is_watched"] == 1 || it["watched"] == 1
+				if want != got {
+					continue
+				}
+			}
+			list = append(list, it)
 		}
+		sort.SliceStable(list, func(i, j int) bool {
+			return int64Of(list[i]["create_time"]) > int64Of(list[j]["create_time"])
+		})
 		writeResult(w, 0, "", map[string]any{"list": list, "total": len(list)})
 	})
 
 	mux.HandleFunc("GET /v/api/v1/item/{guid}", func(w http.ResponseWriter, r *http.Request) {
-		it, ok := mockItems[r.PathValue("guid")]
+		it, ok := items[r.PathValue("guid")]
 		if !ok {
 			writeResult(w, 404, "no such item", nil)
 			return
@@ -221,10 +311,10 @@ func NewHandler(cloudDirect bool, cdnBase string, opts ...Option) *http.ServeMux
 	})
 
 	mux.HandleFunc("GET /v/api/v1/season/list/{guid}", func(w http.ResponseWriter, r *http.Request) {
-		guids := mockParent[r.PathValue("guid")]
+		guids := parent[r.PathValue("guid")]
 		list := make([]map[string]any, 0, len(guids))
 		for _, g := range guids {
-			if it, ok := mockItems[g]; ok {
+			if it, ok := items[g]; ok {
 				list = append(list, it)
 			}
 		}
@@ -237,9 +327,9 @@ func NewHandler(cloudDirect bool, cdnBase string, opts ...Option) *http.ServeMux
 		}
 		b, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(b, &req)
-		it, ok := mockItems[req.ItemGuid]
+		it, ok := items[req.ItemGuid]
 		if !ok {
-			it = mockItems["fv_001"]
+			it = items["fv_001"]
 		}
 		writeResult(w, 0, "", map[string]any{
 			"guid": it["guid"], "parent_guid": it["parent_guid"], "grand_guid": "",
@@ -366,7 +456,83 @@ func NewHandler(cloudDirect bool, cdnBase string, opts ...Option) *http.ServeMux
 		recordMu.Lock()
 		records = append(records, RecordEntry{Token: token, Guid: req.ItemGuid, Ts: int64(req.Ts)})
 		recordMu.Unlock()
+		itemMu.Lock()
+		setItemFieldLocked(req.ItemGuid, "ts", int64(req.Ts))
+		itemMu.Unlock()
 		writeResult(w, 0, "", map[string]any{})
+	})
+
+	// 搜索：GET /search/list?q=
+	mux.HandleFunc("GET /v/api/v1/search/list", func(w http.ResponseWriter, r *http.Request) {
+		q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
+		list := make([]map[string]any, 0)
+		for _, it := range items {
+			if q == "" || strings.Contains(strings.ToLower(str(it["title"])), q) ||
+				strings.Contains(strings.ToLower(str(it["tv_title"])), q) {
+				if str(it["type"]) == "MediaDB" {
+					continue
+				}
+				list = append(list, it)
+			}
+		}
+		writeResult(w, 0, "", list)
+	})
+
+	// 播放历史：GET /play/list（有 ts 的条目，最近播放在前）
+	mux.HandleFunc("GET /v/api/v1/play/list", func(w http.ResponseWriter, r *http.Request) {
+		list := make([]map[string]any, 0)
+		for _, it := range items {
+			if int64Of(it["ts"]) > 0 {
+				list = append(list, it)
+			}
+		}
+		sort.SliceStable(list, func(i, j int) bool {
+			return int64Of(list[i]["ts"]) > int64Of(list[j]["ts"])
+		})
+		writeResult(w, 0, "", list)
+	})
+
+	// 筛选字典
+	mux.HandleFunc("GET /v/api/v1/tag/genres", func(w http.ResponseWriter, r *http.Request) {
+		writeResult(w, 0, "", []map[string]any{
+			{"id": 1, "value": "剧情"}, {"id": 2, "value": "科幻"},
+		})
+	})
+	mux.HandleFunc("GET /v/api/v1/tag/list", func(w http.ResponseWriter, r *http.Request) {
+		writeResult(w, 0, "", map[string]any{
+			"genres": []int{1, 2}, "resolutions": []string{"4k", "1080p"},
+			"color_range": []string{"SDR", "HDR"}, "audio_type": []string{"Stereo", "DolbyAtmos"},
+			"locate": []string{"CN"}, "decades": []string{"2020s", "Recent"},
+		})
+	})
+
+	// 流列表：供详情/字幕使用（字幕 index=3 为外挂 srt）
+	mux.HandleFunc("GET /v/api/v1/stream/list/{guid}", func(w http.ResponseWriter, r *http.Request) {
+		guid := r.PathValue("guid")
+		writeResult(w, 0, "", map[string]any{
+			"files": []map[string]any{{
+				"guid": "md_" + guid, "file_name": "a.mkv", "size": 4096, "can_play": 1,
+				"create_time": 1700000000000,
+			}},
+			"video_streams": []map[string]any{{
+				"media_guid": "md_" + guid, "codec_name": "hevc", "width": 1920, "height": 1080,
+				"bps": 8000000, "profile": "Main 10", "bit_depth": 10, "duration": 2400,
+			}},
+			"audio_streams": []map[string]any{{
+				"media_guid": "md_" + guid, "index": 1, "codec_name": "aac", "language": "chi",
+				"channels": 2, "is_default": 1, "title": "国语",
+			}},
+			"subtitle_streams": []map[string]any{
+				{"media_guid": "md_" + guid, "guid": "sub_001", "index": 3, "codec_name": "subrip",
+					"format": "srt", "language": "chi", "title": "中文", "is_external": 1, "is_default": 1},
+				{"media_guid": "md_" + guid, "guid": "sub_002", "index": 4, "codec_name": "ass",
+					"format": "ass", "language": "chi", "title": "内嵌", "is_external": 0},
+			},
+		})
+	})
+	mux.HandleFunc("GET /v/api/v1/subtitle/dl/{guid}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-subrip; charset=utf-8")
+		_, _ = w.Write([]byte("1\n00:00:01,000 --> 00:00:03,000\nmock subtitle\n"))
 	})
 
 	// 0.9.8 海报端点：/v/api/v1/sys/img/{path}?w=400（mock 不校验 relay cookie）
@@ -379,10 +545,32 @@ func NewHandler(cloudDirect bool, cdnBase string, opts ...Option) *http.ServeMux
 	return mux
 }
 
-// itemMu 保护 mockItems 的写操作（真实飞牛侧状态是会被改的）。
-var itemMu sync.Mutex
+// itemMu 保护 mock 条目写操作；itemMaps 记录每个 handler 的本地条目表，
+// 让 SetItemField / item/watched / play/record 能同时作用到所有活跃 handler。
+var (
+	itemMu   sync.Mutex
+	itemMaps []map[string]map[string]any
+)
 
-// mockSetWatched 修改 mock 条目的 is_watched（并发安全）。
+func registerItemMap(m map[string]map[string]any) {
+	itemMu.Lock()
+	defer itemMu.Unlock()
+	itemMaps = append(itemMaps, m)
+}
+
+// setItemFieldLocked 修改全局夹具与所有活跃 handler 的本地副本。
+func setItemFieldLocked(guid, key string, val any) {
+	if it, ok := mockItems[guid]; ok {
+		it[key] = val
+	}
+	for _, m := range itemMaps {
+		if it, ok := m[guid]; ok {
+			it[key] = val
+		}
+	}
+}
+
+// mockSetWatched 修改 mock 条目的 is_watched/watched（并发安全）。
 func mockSetWatched(r *http.Request, v int) {
 	var req struct {
 		ItemGuid string `json:"item_guid"`
@@ -395,9 +583,8 @@ func mockSetWatched(r *http.Request, v int) {
 	}
 	itemMu.Lock()
 	defer itemMu.Unlock()
-	if it, ok := mockItems[req.ItemGuid]; ok {
-		it["is_watched"] = v
-	}
+	setItemFieldLocked(req.ItemGuid, "is_watched", v)
+	setItemFieldLocked(req.ItemGuid, "watched", v)
 }
 
 // SetItemField 供测试直接改 mock 条目字段（例如把 ts 设成片尾，复现
@@ -405,9 +592,41 @@ func mockSetWatched(r *http.Request, v int) {
 func SetItemField(guid, key string, val any) {
 	itemMu.Lock()
 	defer itemMu.Unlock()
-	if it, ok := mockItems[guid]; ok {
-		it[key] = val
+	setItemFieldLocked(guid, key, val)
+}
+
+func containsStr(list []string, v string) bool {
+	for _, s := range list {
+		if s == v {
+			return true
+		}
 	}
+	return false
+}
+
+func containsInt(v any, want int) bool {
+	raw, ok := v.([]int)
+	if !ok {
+		return false
+	}
+	for _, n := range raw {
+		if n == want {
+			return true
+		}
+	}
+	return false
+}
+
+func int64Of(v any) int64 {
+	switch n := v.(type) {
+	case int:
+		return int64(n)
+	case int64:
+		return n
+	case float64:
+		return int64(n)
+	}
+	return 0
 }
 
 // writeResult 输出飞牛统一响应包 {"code":0,"msg":"","data":...}。
