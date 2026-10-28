@@ -19,9 +19,10 @@
 ## 版本号约定
 
 - **正式版**：`1.x.y`（tag `v1.x.y`）。
-- **预发布版**：`1.x.y-b###`（manifest），tag / Docker 镜像用 `b###`（`b001`、`b002`…），
-  每次修改递增构建号。fnOS/fnpack 要求 manifest 为 `x.y.z[-r]` 形态，因此不能直接把
-  manifest 写成裸 `b001`。
+- **预发布版**：`1.x.y-b###`（manifest），tag / Docker 镜像用 `b###`（`b001`、`b002`…）。
+  fnOS 应用中心比较版本时会忽略 `-b###` 后缀，所以**每次修改要同时递增补丁号和构建号**
+  （如 `1.1.3-b003` → `1.1.4-b004`），否则会报「已安装相同版本」。
+  fnOS/fnpack 要求 manifest 为 `x.y.z[-r]` 形态，因此不能直接写成裸 `b001`。
 
 ## v1.1 新增
 
@@ -71,7 +72,7 @@
 ```yaml
 services:
   fnos-emby-bridge:
-    image: ghcr.io/frilxy/fnos-emby-bridge:b002
+    image: ghcr.io/frilxy/fnos-emby-bridge:b003
     container_name: fnos-emby-bridge
     restart: unless-stopped
     ports: ["8096:8096"]
