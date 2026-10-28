@@ -452,6 +452,20 @@ func TestStreamURLIncludesAuthorizationHeaderToken(t *testing.T) {
 	}
 }
 
+func TestTVPrimaryAspectRatio(t *testing.T) {
+	bridge, token := newV11Bridge(t, mock.WithTVLibrary())
+	mock.SetItemField("fv_tv2", "poster_width", 1920)
+	mock.SetItemField("fv_tv2", "poster_height", 1080)
+	body := getWithToken(t, bridge.URL+"/Items/fv_tv2", token)
+	var it map[string]any
+	if err := json.Unmarshal(body, &it); err != nil {
+		t.Fatalf("detail decode: %s", body)
+	}
+	if a, _ := it["PrimaryImageAspectRatio"].(float64); a < 1.7 || a > 1.8 {
+		t.Fatalf("1920x1080 主图应给 16:9 比例，实际 %v（避免被客户端裁成竖版）", it["PrimaryImageAspectRatio"])
+	}
+}
+
 func TestAuthRequiredAndUserIdentity(t *testing.T) {
 	bridge, token := newV11Bridge(t)
 

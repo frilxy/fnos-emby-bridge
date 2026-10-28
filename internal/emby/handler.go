@@ -3901,6 +3901,22 @@ func (h *Handler) handleItemImage(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// TV 剧集：飞牛剧条目的 poster 可能是 16:9 横图或为空。竖版位优先用
+	// 该剧第一季的竖版海报（同一作品），避免把横图裁成海报。
+	if imgType == "primary" && item.Type == "TV" && (p == "" || isWidePoster(*item)) {
+		if kids, err := h.allItems(r.Context(), client, id); err == nil {
+			for _, ch := range kids {
+				if ch.Type != "Season" {
+					continue
+				}
+				if pp := ch.PosterPath(); pp != "" && !isWidePoster(ch) {
+					p = pp
+					log.Printf("[poster] TV %q 使用季 %q 的竖版海报", id, ch.Guid)
+					break
+				}
+			}
+		}
+	}
 	// 条目自身没有对应图时，先沿 parent 链找季/剧的图（同一作品），
 	// 竖版位不要优先拿横版图（否则电视节目海报会变成宽图/错图）。
 	if p == "" && item.ParentGuid != "" {
@@ -4058,6 +4074,23 @@ func playCountOf(played bool) int {
 		return 1
 	}
 	return 0
+}
+
+// primaryAspect 返回主图宽高比：飞牛 TV/集的 poster 可能是 16:9 横图，
+// 之前固定 0.6667 会让客户端按竖版裁剪，显示成错误构图。
+func primaryAspect(m fn.MediaItem) float64 {
+	if m.PosterWidth > 0 && m.PosterHeight > 0 {
+		a := float64(m.PosterWidth) / float64(m.PosterHeight)
+		if a > 0.4 && a < 4 {
+			return a
+		}
+	}
+	return 0.6667
+}
+
+// isWidePoster 判断主图是否为横图（宽>高）。
+func isWidePoster(m fn.MediaItem) bool {
+	return m.PosterWidth > 0 && m.PosterHeight > 0 && m.PosterWidth > m.PosterHeight
 }
 
 // firstNonEmpty 返回第一个非空字符串。
@@ -4391,7 +4424,7 @@ func toEmbyItemWithSeries(r *http.Request, m fn.MediaItem, seriesID string, h *H
 		"IsFolder":                isFolder,
 		"SortName":                sortNameOf(m),
 		"ParentId":                m.ParentGuid,
-		"PrimaryImageAspectRatio": 0.6667,
+		"PrimaryImageAspectRatio": primaryAspect(m),
 		"Path":                    "fn://" + m.Guid,
 		"RunTimeTicks":            dur * 10_000_000,
 		"CanDelete":               false,
