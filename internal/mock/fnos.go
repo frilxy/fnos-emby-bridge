@@ -135,6 +135,7 @@ type mockOpts struct {
 	otherLibrary bool
 	tvLibrary    bool
 	brokenDetail string
+	brokenSearch bool
 }
 
 // WithOtherLibrary 额外提供一个 Other 类库（条目 type=Video）。
@@ -152,6 +153,11 @@ func WithBrokenDetail(guid string) Option {
 // WithTVLibrary 增加一个 TV 类库（含季/集），用于验证 Latest 剧集语义与 NextUp。
 func WithTVLibrary() Option {
 	return func(o *mockOpts) { o.tvLibrary = true }
+}
+
+// WithBrokenSearch 让 /search/list 返回 500，验证桥接的库内标题搜索兜底。
+func WithBrokenSearch() Option {
+	return func(o *mockOpts) { o.brokenSearch = true }
 }
 
 // addTVLibrary 往**当前 handler 的**夹具里补 TV 库/剧/季/集。
@@ -470,6 +476,10 @@ func NewHandler(cloudDirect bool, cdnBase string, opts ...Option) *http.ServeMux
 
 	// 搜索：GET /search/list?q=
 	mux.HandleFunc("GET /v/api/v1/search/list", func(w http.ResponseWriter, r *http.Request) {
+		if o.brokenSearch {
+			http.Error(w, "search unavailable", http.StatusInternalServerError)
+			return
+		}
 		q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
 		list := make([]map[string]any, 0)
 		for _, it := range items {

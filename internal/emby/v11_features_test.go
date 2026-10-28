@@ -499,6 +499,38 @@ func TestSeasonDetailAndImageFallback(t *testing.T) {
 	}
 }
 
+func TestSearchFallbackAndHints(t *testing.T) {
+	// 飞牛 search/list 500 时，/Items?SearchTerm 不能 500，要回退库内标题搜索。
+	bridge, token := newV11Bridge(t, mock.WithBrokenSearch())
+
+	body := getWithToken(t, bridge.URL+"/Items?SearchTerm=%E7%94%B5%E5%BD%B1", token)
+	var res struct {
+		Items            []map[string]any `json:"Items"`
+		TotalRecordCount int              `json:"TotalRecordCount"`
+	}
+	if err := json.Unmarshal(body, &res); err != nil {
+		t.Fatalf("Items 搜索 decode: %v (%s)", err, body)
+	}
+	if len(res.Items) == 0 || fmt.Sprint(res.Items[0]["Id"]) != "fv_001" {
+		t.Fatalf("搜索兜底应找到电影A：%s", body)
+	}
+
+	hintsBody := getWithToken(t, bridge.URL+"/Search/Hints?SearchTerm=%E7%94%B5%E5%BD%B1", token)
+	var hints struct {
+		SearchHints      []map[string]any `json:"SearchHints"`
+		TotalRecordCount int              `json:"TotalRecordCount"`
+	}
+	if err := json.Unmarshal(hintsBody, &hints); err != nil {
+		t.Fatalf("Search/Hints 应返回 SearchHintResult：%v (%s)", err, hintsBody)
+	}
+	if len(hints.SearchHints) == 0 || fmt.Sprint(hints.SearchHints[0]["ItemId"]) != "fv_001" {
+		t.Fatalf("Search/Hints 应返回 fv_001：%s", hintsBody)
+	}
+	if fmt.Sprint(hints.SearchHints[0]["Type"]) != "Movie" || fmt.Sprint(hints.SearchHints[0]["Name"]) != "电影A" {
+		t.Fatalf("SearchHint 字段不对：%v", hints.SearchHints[0])
+	}
+}
+
 func TestAuthRequiredAndUserIdentity(t *testing.T) {
 	bridge, token := newV11Bridge(t)
 
