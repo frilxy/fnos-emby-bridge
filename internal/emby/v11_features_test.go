@@ -333,20 +333,20 @@ func TestImageLongPathAndBackdropTags(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("长路径图片应 200，实际 %d", resp.StatusCode)
 	}
-	etag := resp.Header.Get("ETag")
-	if etag == "" {
-		t.Fatalf("图片应带 ETag")
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "image/") {
+		t.Fatalf("图片 Content-Type 应为 image/*，实际 %q", ct)
 	}
+	// 图片不再用 304（部分客户端会把 304 当空响应）；条件请求仍应返回 200 + body
 	req2, _ := http.NewRequest(http.MethodGet, bridge.URL+"/Items/fv_tv2/Images/Backdrop/1/tag/jpg/400/600", nil)
 	req2.Header.Set("X-Emby-Token", token)
-	req2.Header.Set("If-None-Match", etag)
+	req2.Header.Set("If-None-Match", `"stale"`)
 	resp2, err := http.DefaultClient.Do(req2)
 	if err != nil {
-		t.Fatalf("image 304: %v", err)
+		t.Fatalf("image retry: %v", err)
 	}
 	defer resp2.Body.Close()
-	if resp2.StatusCode != http.StatusNotModified {
-		t.Fatalf("If-None-Match 应 304，实际 %d", resp2.StatusCode)
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("条件请求应返回 200（不使用 304），实际 %d", resp2.StatusCode)
 	}
 }
 
