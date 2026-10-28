@@ -433,6 +433,25 @@ func TestImageWithoutTokenUsesSession(t *testing.T) {
 	}
 }
 
+func TestStreamURLIncludesAuthorizationHeaderToken(t *testing.T) {
+	bridge, token := newV11Bridge(t)
+	req, _ := http.NewRequest(http.MethodPost, bridge.URL+"/Items/fv_001/PlaybackInfo", nil)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Emby-Authorization", `MediaBrowser Client="Emby", Device="test", Token="`+token+`"`)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PlaybackInfo: %v", err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("PlaybackInfo status=%d body=%s", resp.StatusCode, b)
+	}
+	if !strings.Contains(string(b), "api_key="+token) {
+		t.Fatalf("PlaybackInfo 的 MediaSources URL 必须带 api_key（否则 MPV 直连 401）：%s", b)
+	}
+}
+
 func TestAuthRequiredAndUserIdentity(t *testing.T) {
 	bridge, token := newV11Bridge(t)
 
