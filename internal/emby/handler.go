@@ -188,6 +188,10 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /Library/VirtualFolders", h.handleVirtualFolders)
 	mux.HandleFunc("GET /Plugins", h.handleEmptyArray)
 	mux.HandleFunc("GET /Users/{uid}/GroupingOptions", h.handleEmptyArray)
+	// 搜索建议：Rodel/Emby 搜索页先调 /Search/Hints，缺省会落兜底返回
+	// {Items:[]}，客户端按 SearchHintResult 反序列化拿不到 SearchHints → 搜索不可用。
+	mux.HandleFunc("GET /Search/Hints", h.handleSearchHints)
+	mux.HandleFunc("GET /Users/{uid}/Search/Hints", h.handleSearchHints)
 
 	mux.HandleFunc("GET /Items/{id}", h.handleItemByID)
 	// 详情页（UserLibraryService 标准路径）：Yamby 点开剧/季/集详情走
@@ -1874,15 +1878,197 @@ func (h *Handler) playableItems(ctx context.Context, client *fn.Client) ([]fn.Me
 // searchItems 调 /search/list 并做缓存（按用户，结果带用户观看状态）。
 func (h *Handler) searchItems(ctx context.Context, client *fn.Client, user, term string) ([]fn.MediaItem, error) {
 	term = strings.TrimSpace(term)
+	if term == "" {
+		return nil, nil
+	}
 	key := "search:" + user + ":" + term
 	v, err := h.cache.Do(key, 60*time.Second, func() (any, error) {
 		return client.Search(ctx, term)
 	})
 	if err != nil {
-		return nil, err
+		// 飞牛 search/list 在部分版本/账号下 500；不能让客户端搜索页直接 500。
+		log.Printf("[search] 飞牛 search/list 失败，回退库内标题搜索: %v", err)
+		return h.localSearch(ctx, client, user, term), nil
 	}
 	list, _ := v.([]fn.MediaItem)
 	return cloneItems(list), nil
+}
+
+// localSearch 在库容器（电影/剧/目录）里按标题做兜底搜索。
+// 只在飞牛 search/list 不可用时使用，避免搜索页 500。
+func (h *Handler) localSearch(ctx context.Context, client *fn.Client, user, term string) []fn.MediaItem {
+	term = strings.ToLower(strings.TrimSpace(term))
+	if term == "" {
+		return nil
+	}
+	v, err := h.cache.Do("localsearch:"+user+":"+term, 30*time.Second, func() (any, error) {
+		dbs, err := h.mediaDBs(ctx, client)
+		if err != nil {
+			return nil, err
+		}
+		seen := map[string]bool{}
+		out := make([]fn.MediaItem, 0, 32)
+		for _, db := range dbs {
+			list, err := h.typedItems(ctx, client, db.Guid, []string{"Movie", "TV", "Directory", "Video"}, 0)
+			if err != nil {
+				continue
+			}
+			for _, m := range list {
+				if seen[m.Guid] {
+					continue
+				}
+				for _, name := range []string{m.Title, m.OriginalTitle, m.TvTitle, m.FileName} {
+					if strings.Contains(strings.ToLower(name), term) {
+						seen[m.Guid] = true
+						out = append(out, m)
+						break
+					}
+				}
+			}
+		}
+		return out, nil
+	})
+	if err != nil {
+		return nil
+	}
+	list, _ := v.([]fn.MediaItem)
+	return cloneItems(list)
+}
+
+// handleSearchHints 实现 POST/GET /Search/Hints（Emby SearchHintResult）。
+// 返回 {"SearchHints":[...],"TotalRecordCount":N}；不能返回 Items 形态。
+func (h *Handler) handleSearchHints(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	term := strings.TrimSpace(queryGet(q, "SearchTerm"))
+	limit := parseInt(queryGet(q, "Limit"))
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	start := parseInt(queryGet(q, "StartIndex"))
+	if start < 0 {
+		start = 0
+	}
+	empty := map[string]any{"SearchHints": []any{}, "TotalRecordCount": 0}
+	if term == "" {
+		writeJSON(w, http.StatusOK, empty)
+		return
+	}
+	user := h.sessionUserName(r)
+	client := h.fnOf(r.Context())
+	list, err := h.searchItems(r.Context(), client, user, term)
+	if err != nil {
+		log.Printf("[search] hints %q: %v", term, err)
+		writeJSON(w, http.StatusOK, empty)
+		return
+	}
+	include := strings.ToUpper(queryGet(q, "IncludeItemTypes"))
+	hints := make([]map[string]any, 0, len(list))
+	for _, m := range list {
+		itemType, isFolder := embyTypeOf(m)
+		if include != "" && !hintTypeAllowed(itemType, include) {
+			continue
+		}
+		name := m.Title
+		if name == "" {
+			name = m.TvTitle
+		}
+		if name == "" {
+			name = m.FileName
+		}
+		primary := m.PosterPath()
+		if primary == "" {
+			primary = m.BackdropPath()
+		}
+		hint := map[string]any{
+			"ItemId":         m.Guid,
+			"Id":             m.Guid,
+			"Name":           name,
+			"MatchedTerm":    term,
+			"Type":           itemType,
+			"IsFolder":       isFolder,
+			"MediaType":      "Video",
+			"ProductionYear": yearOf(m.AirDate, m.ReleaseDate, m.FirstAirDate),
+			"RunTimeTicks":   int64(m.Duration) * 10_000_000,
+			"ParentId":       m.ParentGuid,
+		}
+		if primary != "" {
+			hint["PrimaryImageTag"] = imageTagFor(primary)
+		}
+		if tags := imageTags(m); len(tags) > 0 {
+			hint["ImageTags"] = tags
+		}
+		if backdrops := backdropImageTags(m); len(backdrops) > 0 {
+			hint["BackdropImageTags"] = backdrops
+		}
+		if m.Type == "Episode" || m.Type == "Season" {
+			hint["SeriesId"] = firstNonEmpty(m.SeriesGuid, m.ParentGuid)
+			hint["SeriesName"] = firstNonEmpty(m.TvTitle, m.AncestorName)
+			hint["IndexNumber"] = m.EpisodeNumber
+			hint["ParentIndexNumber"] = m.SeasonNumber
+		}
+		hints = append(hints, hint)
+	}
+	total := len(hints)
+	if start > len(hints) {
+		start = len(hints)
+	}
+	hints = hints[start:]
+	if len(hints) > limit {
+		hints = hints[:limit]
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"SearchHints":      hints,
+		"TotalRecordCount": total,
+	})
+}
+
+// embyTypeOf 把飞牛 type 映射为 Emby BaseItemDto.Type。
+func embyTypeOf(m fn.MediaItem) (string, bool) {
+	switch m.Type {
+	case "TV":
+		return "Series", true
+	case "Season":
+		return "Season", true
+	case "Episode":
+		return "Episode", false
+	case "Directory", "MediaDB":
+		return "Folder", true
+	case "Video":
+		return "Video", false
+	case "Person":
+		return "Person", false
+	default:
+		return "Movie", false
+	}
+}
+
+func hintTypeAllowed(itemType, include string) bool {
+	for _, t := range strings.Split(include, ",") {
+		t = strings.TrimSpace(t)
+		switch t {
+		case "SERIES", "TVSHOW":
+			if itemType == "Series" {
+				return true
+			}
+		case "MOVIE":
+			if itemType == "Movie" {
+				return true
+			}
+		case "EPISODE":
+			if itemType == "Episode" {
+				return true
+			}
+		case "SEASON":
+			if itemType == "Season" {
+				return true
+			}
+		case "FOLDER":
+			if itemType == "Folder" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // favoriteItems 分页拉收藏（最多 max 条），避免固定 200 条截断。
