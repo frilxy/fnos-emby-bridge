@@ -416,6 +416,23 @@ func TestAuthenticateByIDAndDetailFallback(t *testing.T) {
 	}
 }
 
+func TestImageWithoutTokenUsesSession(t *testing.T) {
+	bridge, _ := newV11Bridge(t, mock.WithBrokenDetail("fv_001"))
+	// 图片端点不要求 token；handler 会选已登录会话的飞牛 client。
+	// fv_001 的 item/{guid} 故意 404，走 play/info 兜底。
+	resp, err := http.Get(bridge.URL + "/Items/fv_001/Images/Primary")
+	if err != nil {
+		t.Fatalf("image no-token: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("无 token 图片应 200（图片端点公开），实际 %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "image/") {
+		t.Fatalf("无 token 图片 Content-Type 应为 image/*，实际 %q", ct)
+	}
+}
+
 func TestAuthRequiredAndUserIdentity(t *testing.T) {
 	bridge, token := newV11Bridge(t)
 

@@ -671,6 +671,23 @@ func (h *Handler) sessionUserName(r *http.Request) string {
 	return ""
 }
 
+// imageClient 选择图片请求用的飞牛客户端：
+// 图片组件常常不带 token；优先用请求会话，其次任意有效登录会话，最后 admin。
+func (h *Handler) imageClient(r *http.Request) *fn.Client {
+	if s, ok := h.sessionFor(r); ok && s.client != nil {
+		return s.client
+	}
+	h.sessMu.Lock()
+	defer h.sessMu.Unlock()
+	h.loadSessionsLocked()
+	for _, s := range h.sessions {
+		if s != nil && s.client != nil && s.client.Token != "" {
+			return s.client
+		}
+	}
+	return h.FN
+}
+
 // userIDFor 由用户名派生稳定 Emby UserId（32 位 hex，符合 Emby 形态）。
 func userIDFor(name string) string {
 	if name == "" {
@@ -693,6 +710,11 @@ func isPublicPath(p string) bool {
 		return true
 	}
 	if strings.HasPrefix(p, "/branding/") || strings.HasPrefix(p, "/localization/") {
+		return true
+	}
+	// 图片：很多客户端的图片组件不会带 token（只对 API 请求带），
+	// 图片是只读封面，放开匿名访问；handler 会选一个有效会话的飞牛 token。
+	if strings.Contains(p, "/images/") {
 		return true
 	}
 	// /Users/{id}/Authenticate 是登录/刷新入口，不能要求 token
@@ -3738,7 +3760,7 @@ func (h *Handler) handleProgress(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleItemImages(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	out := []map[string]any{}
-	it, err := h.itemDetail(r.Context(), h.fnOf(r.Context()), id)
+	it, err := h.itemDetail(r.Context(), h.imageClient(r), id)
 	if err == nil && it != nil {
 		tags := imageTags(*it)
 		for _, t := range []string{"Primary", "Logo", "Thumb", "Backdrop", "Banner", "Art"} {
@@ -3823,9 +3845,18 @@ func (h *Handler) handleItemImage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	item, err := h.itemDetail(r.Context(), h.fnOf(r.Context()), id)
+	client := h.imageClient(r)
+	item, err := h.itemDetail(r.Context(), client, id)
 	if err != nil || item == nil {
-		log.Printf("[poster] item %q detail: %v", id, err)
+		// 与详情接口一致：item/{guid} 失败时用 play/info 兜底（可播条目）
+		if pi, perr := h.playInfo(r.Context(), client, id); perr == nil && pi != nil && pi.Guid == id {
+			fb := playInfoMediaItem(pi)
+			item = &fb
+			err = nil
+		}
+	}
+	if err != nil || item == nil {
+		log.Printf("[poster] item=%q detail: %v", id, err)
 		servePNG()
 		return
 	}
@@ -3843,7 +3874,7 @@ func (h *Handler) handleItemImage(w http.ResponseWriter, r *http.Request) {
 		if p == "" && (item.Type == "Season" || item.Type == "Episode") {
 			g := item.ParentGuid
 			for i := 0; i < 2 && g != "" && g != item.Guid; i++ {
-				det, err := h.itemDetail(r.Context(), h.fnOf(r.Context()), g)
+				det, err := h.itemDetail(r.Context(), h.imageClient(r), g)
 				if err != nil || det == nil {
 					break
 				}
@@ -3863,9 +3894,40 @@ func (h *Handler) handleItemImage(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// 条目自身没有对应图时：先用横版图兜底竖版位，再沿 parent 链找季/剧/库的图。
+	if p == "" && imgType != "logo" {
+		p = item.BackdropPath()
+	}
+	if p == "" && item.ParentGuid != "" {
+		g := item.ParentGuid
+		for i := 0; i < 2 && g != "" && g != item.Guid; i++ {
+			par, err := h.itemDetail(r.Context(), h.imageClient(r), g)
+			if err != nil || par == nil {
+				break
+			}
+			if imgType == "logo" {
+				p = par.LogoPath()
+			} else if strings.HasPrefix(imgType, "backdrop") || imgType == "thumb" ||
+				imgType == "art" || imgType == "banner" {
+				p = par.BackdropPath()
+				if p == "" {
+					p = par.PosterPath()
+				}
+			} else {
+				p = par.PosterPath()
+				if p == "" {
+					p = par.BackdropPath()
+				}
+			}
+			if p != "" {
+				break
+			}
+			g = par.ParentGuid
+		}
+	}
 	if p == "" && (item.Type == "MediaDB" || item.Type == "Directory" || item.Type == "TV") {
 		// 库/剧等容器自身无海报：回退库内第一个有海报的作品
-		if list, err := h.allItems(r.Context(), h.fnOf(r.Context()), id); err == nil {
+		if list, err := h.allItems(r.Context(), h.imageClient(r), id); err == nil {
 			for _, it := range list {
 				if it.Type != "TV" && it.Type != "Movie" {
 					continue
@@ -3886,7 +3948,7 @@ func (h *Handler) handleItemImage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if p == "" {
-		log.Printf("[poster] item %q 无海报路径", id)
+		log.Printf("[poster] item=%q type=%q img=%q idx=%d 无图片路径", id, item.Type, imgType, idx)
 		servePNG()
 		return
 	}
@@ -3925,16 +3987,16 @@ func (h *Handler) serveSysImg(w http.ResponseWriter, r *http.Request, p string, 
 	// 当成空响应显示为空白。图片 URL 已用 tag 哈希做缓存失效，这里只给较短缓存。
 	w.Header().Set("Cache-Control", "public, max-age=3600")
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet,
-		h.fnOf(r.Context()).BaseURL+"/v/api/v1/sys/img"+p+"?w="+strconv.Itoa(wParam), nil)
+		h.imageClient(r).BaseURL+"/v/api/v1/sys/img"+p+"?w="+strconv.Itoa(wParam), nil)
 	if err != nil {
 		servePNG()
 		return
 	}
-	req.Header.Set("User-Agent", h.fnOf(r.Context()).UserAgent)
-	for k, v := range h.fnOf(r.Context()).AuthHeaders() {
+	req.Header.Set("User-Agent", h.imageClient(r).UserAgent)
+	for k, v := range h.imageClient(r).AuthHeaders() {
 		req.Header.Set(k, v)
 	}
-	resp, err := h.fnOf(r.Context()).DoRaw(req)
+	resp, err := h.imageClient(r).DoRaw(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		if resp != nil {
 			b, _ := io.ReadAll(io.LimitReader(resp.Body, 120))
