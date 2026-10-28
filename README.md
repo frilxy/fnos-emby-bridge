@@ -64,10 +64,9 @@
 ```yaml
 services:
   fnos-emby-bridge:
-    image: ghcr.io/ssabv/fnos-emby-bridge:latest
+    image: ghcr.io/frilxy/fnos-emby-bridge:1.1.0
     container_name: fnos-emby-bridge
     restart: unless-stopped
-    entrypoint: ["/data/fnos-emby-bridge-patched"]
     ports: ["8096:8096"]
     environment:
       - PORT=8096
@@ -78,8 +77,10 @@ services:
       - FNOS_USER=<飞牛影视账号>
       - FNOS_PASS=<飞牛影视密码>
     volumes:
-      - ./data:/data   # 把 ./build.sh 产出的 dist/fnos-emby-bridge-patched 放进这个目录
+      - ./data:/data
 ```
+
+镜像由本仓库的 Docker 工作流构建（amd64/arm64），也可用 `:latest`（指向最新 Release）。
 
 ---
 
