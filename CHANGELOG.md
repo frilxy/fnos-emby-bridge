@@ -3,6 +3,20 @@
 本项目（**飞牛影视 Emby 桥接**）的版本历史。每个版本的改动都附带**实机验证依据**
 （客户端日志 / 官方 API 文档）。
 
+## v1.1.1（预发布）
+
+针对小幻影视 v2.2610.32 实测日志的兼容修复：
+
+- **修复 token 刷新 401 循环**：新增 `POST /Users/{id}/Authenticate`（Emby 的按 id
+  刷新入口），并列入免鉴权路径；body/query 里的 `Pw` 都支持。此前该路径被
+  `requireAuth` 拦成 401，客户端会反复重试登录。
+- **修复部分条目详情 404**：`item/{guid}` 失败时用 `play/info` 兜底（仅当返回的
+  `Guid` 与请求 id 一致，避免把剧 guid 误当下一集）；404 时打印 item id 与飞牛错误，
+  便于继续排查。
+- **play/list 优先 `item_guid`**：少数版本把媒体文件 guid 放在 `guid`，直接当条目
+  id 会导致详情 404；现在优先用 `item_guid`/`itemGuid`。
+- 新增回归：`TestAuthenticateByIDAndDetailFallback`（刷新入口免 token、play/info 兜底）。
+
 ## v1.1.0（预发布）
 
 这一版把「能看」补齐到 Emby 客户端常用的查询/筛选/字幕/多用户语义。12 项：

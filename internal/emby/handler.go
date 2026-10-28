@@ -152,6 +152,9 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /Branding/Configuration", h.handleBranding)
 	mux.HandleFunc("GET /Branding/Icon/{key}", h.handleBrandingIcon)
 	mux.HandleFunc("POST /Users/AuthenticateByName", h.handleAuthenticate)
+	// Emby 客户端在 token 过期/刷新时可能走 /Users/{id}/Authenticate（body 里带 Pw），
+	// 这条也必须免鉴权，否则刷新会被 requireAuth 拦成 401，客户端进入重试循环。
+	mux.HandleFunc("POST /Users/{uid}/Authenticate", h.handleAuthenticateByID)
 	mux.HandleFunc("GET /Users/Me", h.handleUsersMe)
 	mux.HandleFunc("GET /Users/{uid}", h.handleUsersByID)
 	// /Users/Public 官方返回纯 UserDto 数组（web 客户端 getPublicUsers 直接
@@ -401,7 +404,7 @@ func (h *Handler) Handler() http.Handler {
 // （/emby/system/info/public 等），Go ServeMux 大小写敏感，必须归一。
 var routeSegmentCase = map[string]string{
 	"system": "System", "info": "Info", "public": "Public",
-	"users": "Users", "authenticatebyname": "AuthenticateByName", "me": "Me",
+	"users": "Users", "authenticatebyname": "AuthenticateByName", "authenticate": "Authenticate", "me": "Me",
 	"views": "Views", "items": "Items", "latest": "Latest", "resume": "Resume",
 	"shows": "Shows", "seasons": "Seasons", "episodes": "Episodes", "nextup": "NextUp",
 	"videos": "Videos", "stream": "Stream", "playbackinfo": "PlaybackInfo",
@@ -689,7 +692,11 @@ func isPublicPath(p string) bool {
 		"/localization/countries", "/localization/parentalratings":
 		return true
 	}
-	return strings.HasPrefix(p, "/branding/") || strings.HasPrefix(p, "/localization/")
+	if strings.HasPrefix(p, "/branding/") || strings.HasPrefix(p, "/localization/") {
+		return true
+	}
+	// /Users/{id}/Authenticate 是登录/刷新入口，不能要求 token
+	return strings.HasPrefix(p, "/users/") && strings.HasSuffix(p, "/authenticate")
 }
 
 // requireAuth 对媒体端点强制有效 Emby token，避免无 token 请求回落到 admin 会话。
@@ -1199,26 +1206,92 @@ func (h *Handler) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"Error": err.Error()})
 		return
 	}
-	uid := userIDFor(req.UserName)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"User": map[string]any{"Name": req.UserName, "Id": uid, "ServerId": h.ServerID,
-			// Configuration 必须存在：官方 web 客户端登录后读 User.Configuration.ProfilePin
-			// （undefined 直接 TypeError 中断登录流程）
+	writeJSON(w, http.StatusOK, h.authPayload(req.UserName, embyToken))
+}
+
+// authPayload 生成 Emby 登录/刷新响应（AuthenticateByName 与 Authenticate 共用）。
+func (h *Handler) authPayload(userName, token string) map[string]any {
+	uid := userIDFor(userName)
+	return map[string]any{
+		"User": map[string]any{"Name": userName, "Id": uid, "ServerId": h.ServerID,
 			"Configuration": userConfiguration(),
-			"Policy":        userPolicy(req.UserName),
+			"Policy":        userPolicy(userName),
 		},
 		"SessionInfo": map[string]any{
-			"UserId":   uid,
-			"UserName": req.UserName,
-			"Client":   "Emby",
-			"Id":       "fnos-" + uid[:12],
-			"ServerId": h.ServerID,
+			"UserId": uid, "UserName": userName, "Client": "Emby",
+			"Id": "fnos-" + uid[:12], "ServerId": h.ServerID,
 		},
 		"ServerId":    h.ServerID,
-		"AccessToken": embyToken,
-		"Token":       embyToken,
-		"UserSecret":  embyToken,
-	})
+		"AccessToken": token,
+		"Token":       token,
+		"UserSecret":  token,
+	}
+}
+
+// handleAuthenticateByID 实现 POST /Users/{id}/Authenticate（Emby 的 token 刷新入口）。
+// body 形如 {"Pw":"..."}；User 名优先取 body.Username，其次按会话里的 userId 反查。
+func (h *Handler) handleAuthenticateByID(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	var req struct {
+		UserName string `json:"UserName"`
+		Pw       string `json:"Pw"`
+		Pwd      string `json:"Pwd"`
+		Password string `json:"Password"`
+	}
+	if strings.Contains(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
+		_ = r.ParseForm()
+		req.UserName = r.PostFormValue("Username")
+		req.Pw = r.PostFormValue("Pw")
+		req.Pwd = r.PostFormValue("Pwd")
+		req.Password = r.PostFormValue("Password")
+	} else {
+		decodeJSON(r, &req)
+	}
+	if req.UserName == "" {
+		req.UserName = queryGet(r.URL.Query(), "Username")
+	}
+	if req.Pw == "" {
+		req.Pw = queryGet(r.URL.Query(), "Pw")
+	}
+	user := req.UserName
+	if user == "" {
+		user = h.userNameByID(uid)
+	}
+	if user == "" {
+		user = "admin"
+	}
+	pass := firstNonEmpty(req.Pw, req.Pwd, req.Password)
+	fnPass := pass
+	if !fn.IsSHA256Hex(pass) {
+		fnPass = fn.SHA256Hex(pass)
+	}
+	token, err := h.acquireSession(r.Context(), user, fnPass)
+	if err != nil {
+		log.Printf("[auth] 用户 %q 刷新登录失败: %v", user, err)
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"Error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, h.authPayload(user, token))
+}
+
+// userNameByID 按 Emby UserId 反查会话用户名；兼容旧的固定 id。
+func (h *Handler) userNameByID(uid string) string {
+	if uid == "" || uid == "fnos-user" {
+		return "admin"
+	}
+	h.sessMu.Lock()
+	defer h.sessMu.Unlock()
+	h.loadSessionsLocked()
+	for _, s := range h.sessions {
+		if s != nil && userIDFor(s.UserName) == uid {
+			return s.UserName
+		}
+	}
+	// 非 hex 的 id 可能是用户名本身（部分客户端）
+	if len(uid) != 32 {
+		return uid
+	}
+	return ""
 }
 
 func (h *Handler) handleUsersMe(w http.ResponseWriter, r *http.Request) {
@@ -2304,10 +2377,52 @@ func collectionType(c string) string {
 	return ""
 }
 
+// playInfoMediaItem 把 play/info 响应转成 MediaItem（item/{guid} 失败时的详情兜底）。
+func playInfoMediaItem(pi *fn.PlayInfo) fn.MediaItem {
+	m := fn.MediaItem{
+		Guid:          pi.Guid,
+		ParentGuid:    pi.ParentGuid,
+		Type:          pi.Type,
+		Title:         pi.Item.Title,
+		TvTitle:       pi.Item.TvTitle,
+		OriginalTitle: pi.Item.OriginalTitle,
+		ParentTitle:   pi.Item.ParentTitle,
+		Duration:      pi.Item.Duration,
+		Runtime:       pi.Item.Runtime,
+		IsWatched:     pi.Item.IsWatched,
+		WatchedTs:     pi.Item.WatchedTs,
+		Ts:            pi.Ts,
+		SeasonNumber:  pi.Item.SeasonNum,
+		EpisodeNumber: pi.Item.EpisodeNum,
+		AirDate:       pi.Item.AirDate,
+		ReleaseDate:   pi.Item.ReleaseDate,
+		Overview:      pi.Item.Overview,
+		CanPlay:       pi.Item.CanPlay,
+		PlayError:     pi.Item.PlayError,
+		Poster:        pi.Item.Poster,
+		Posters:       pi.Item.Posters,
+		Backdrops:     pi.Item.Backdrops,
+	}
+	if pi.Type == "Episode" {
+		m.SeriesGuid = pi.GrandGuid
+	}
+	return m
+}
+
 func (h *Handler) handleItemByID(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	// 详情用 item/{guid}：对 TV/Season 等容器类型也能正确返回（play/info 只适用于可播条目）
 	item, err := h.itemDetail(r.Context(), h.fnOf(r.Context()), id)
+	if err != nil {
+		origErr := err
+		// 兜底：部分 fnOS 版本 item/{guid} 对集/STRM 条目返回 404，但 play/info 可用。
+		// 仅在 play/info 回的是同一条目（Guid==id）时使用，避免把"剧 guid"误当下一集。
+		if pi, perr := h.playInfo(r.Context(), h.fnOf(r.Context()), id); perr == nil && pi != nil && pi.Guid == id {
+			fb := playInfoMediaItem(pi)
+			item, err = &fb, nil
+			log.Printf("[detail] %s item 详情失败（%v），已用 play/info 兜底", id, origErr)
+		}
+	}
 	if err != nil {
 		// 人物 guid（详情页 People 注入的 Id 非条目）：条目 404 → 演员详情
 		// （Yamby/Hills 详情页点演员进人物页走 /Users/{uid}/Items/{personId}）
@@ -2315,6 +2430,7 @@ func (h *Handler) handleItemByID(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, personToEmby(pd))
 			return
 		}
+		log.Printf("[detail] 404 item=%s: %v", id, err)
 		writeJSON(w, http.StatusNotFound, map[string]any{"Error": err.Error()})
 		return
 	}

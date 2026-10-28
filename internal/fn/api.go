@@ -1056,9 +1056,29 @@ func (c *Client) PlayList(ctx context.Context) ([]MediaItem, error) {
 	}
 	out := make([]MediaItem, 0, len(raws))
 	for _, raw := range raws {
-		out = append(out, parseLooseItem(raw))
+		out = append(out, parsePlayItem(raw))
 	}
 	return out, nil
+}
+
+// parsePlayItem 解析 play/list 条目：优先 item_guid（真正的条目 id），
+// 避免个别版本把媒体文件 guid 放在 guid 字段导致详情 404。
+func parsePlayItem(raw json.RawMessage) MediaItem {
+	m := parseLooseItem(raw)
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil {
+		return m
+	}
+	for _, k := range []string{"item_guid", "itemGuid"} {
+		if v, ok := obj[k]; ok {
+			var s string
+			if json.Unmarshal(v, &s) == nil && s != "" {
+				m.Guid = s
+				break
+			}
+		}
+	}
+	return m
 }
 
 // decodeItemArray 兼容 data 为数组或 {list:[...]} / {data:[...]} 两种形态。

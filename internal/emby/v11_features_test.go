@@ -385,6 +385,37 @@ func TestRatingAndHideFromResume(t *testing.T) {
 	}
 }
 
+func TestAuthenticateByIDAndDetailFallback(t *testing.T) {
+	bridge, token := newV11Bridge(t, mock.WithBrokenDetail("fv_001"))
+
+	// play/info 兜底：item/{guid} 404 时详情仍应 200
+	body := getWithToken(t, bridge.URL+"/Items/fv_001", token)
+	if !strings.Contains(string(body), `"Id":"fv_001"`) || strings.Contains(string(body), `"Error"`) {
+		t.Fatalf("item 详情 404 时应回退 play/info：%s", body)
+	}
+
+	// /Users/{id}/Authenticate 必须免 token（客户端刷新入口）
+	me := getWithToken(t, bridge.URL+"/Users/Me", token)
+	var user map[string]any
+	_ = json.Unmarshal(me, &user)
+	uid := fmt.Sprint(user["Id"])
+	if uid == "" {
+		t.Fatalf("/Users/Me 缺 Id：%s", me)
+	}
+	req, _ := http.NewRequest(http.MethodPost, bridge.URL+"/Users/"+uid+"/Authenticate",
+		strings.NewReader(`{"Pw":"p"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || !strings.Contains(string(b), "AccessToken") {
+		t.Fatalf("/Users/{id}/Authenticate 应免 token 且返回 token：%d %s", resp.StatusCode, b)
+	}
+}
+
 func TestAuthRequiredAndUserIdentity(t *testing.T) {
 	bridge, token := newV11Bridge(t)
 
