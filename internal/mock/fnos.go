@@ -134,6 +134,7 @@ type Option func(*mockOpts)
 type mockOpts struct {
 	otherLibrary bool
 	tvLibrary    bool
+	brokenDetail string
 }
 
 // WithOtherLibrary 额外提供一个 Other 类库（条目 type=Video）。
@@ -141,6 +142,11 @@ type mockOpts struct {
 // 客户端猜成 IncludeItemTypes=Movie,Series 会把 Type=Video 条目全过滤掉。
 func WithOtherLibrary() Option {
 	return func(o *mockOpts) { o.otherLibrary = true }
+}
+
+// WithBrokenDetail 让 item/{guid} 对指定条目返回 404（验证 play/info 详情兜底）。
+func WithBrokenDetail(guid string) Option {
+	return func(o *mockOpts) { o.brokenDetail = guid }
 }
 
 // WithTVLibrary 增加一个 TV 类库（含季/集），用于验证 Latest 剧集语义与 NextUp。
