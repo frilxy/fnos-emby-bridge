@@ -16,6 +16,13 @@
 > `4K HEVC Main10 + TrueHD Atmos`、`DTS-HD MA` 这类格式手机端普遍解不动——那是设计边界，
 > 不是 bug。需要任何格式都能播，请用真正的 Jellyfin/Emby，或让客户端走软解。
 
+## 版本号约定
+
+- **正式版**：`1.x.y`（tag `v1.x.y`）。
+- **预发布版**：`1.x.y-b###`（manifest），tag / Docker 镜像用 `b###`（`b001`、`b002`…），
+  每次修改递增构建号。fnOS/fnpack 要求 manifest 为 `x.y.z[-r]` 形态，因此不能直接把
+  manifest 写成裸 `b001`。
+
 ## v1.1 新增
 
 - **搜索**：`SearchTerm` 接飞牛 `/search/list`，不再"搜什么都返回整库"。
@@ -64,7 +71,7 @@
 ```yaml
 services:
   fnos-emby-bridge:
-    image: ghcr.io/frilxy/fnos-emby-bridge:1.1.1
+    image: ghcr.io/frilxy/fnos-emby-bridge:b001
     container_name: fnos-emby-bridge
     restart: unless-stopped
     ports: ["8096:8096"]
