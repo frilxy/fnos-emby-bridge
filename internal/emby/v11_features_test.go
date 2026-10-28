@@ -475,6 +475,30 @@ func TestTVPrimaryAspectRatio(t *testing.T) {
 	}
 }
 
+func TestSeasonDetailAndImageFallback(t *testing.T) {
+	// 季的 item/{guid} 故意 404：应通过 series 的 season/list 找回季，
+	// 详情和封面都不能空白。
+	bridge, token := newV11Bridge(t, mock.WithTVLibrary(), mock.WithBrokenDetail("fv_s2"))
+	body := getWithToken(t, bridge.URL+"/Items/fv_s2", token)
+	var it map[string]any
+	if err := json.Unmarshal(body, &it); err != nil {
+		t.Fatalf("season detail decode: %v (%s)", err, body)
+	}
+	if fmt.Sprint(it["Type"]) != "Season" || fmt.Sprint(it["Id"]) != "fv_s2" {
+		t.Fatalf("季详情兜底失败：%v", it)
+	}
+	req, _ := http.NewRequest(http.MethodGet, bridge.URL+"/Items/fv_s2/Images/Primary", nil)
+	req.Header.Set("X-Emby-Token", token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("season image: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("季封面应 200，实际 %d", resp.StatusCode)
+	}
+}
+
 func TestAuthRequiredAndUserIdentity(t *testing.T) {
 	bridge, token := newV11Bridge(t)
 
