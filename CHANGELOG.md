@@ -3,6 +3,20 @@
 本项目（**飞牛影视 Emby 桥接**）的版本历史。每个版本的改动都附带**实机验证依据**
 （客户端日志 / 官方 API 文档）。
 
+## b007（预发布，构建号）
+
+针对「电视库封面是横版艺术图、点进 TV 库无封面、点剧集无内容」：
+
+- **TV 库 Latest 默认返回剧容器**：之前为符合 Emby「TV 库返回最新集」的语义，默认返回
+  Episode；Rodel 的 TV 行因此显示每集的横版剧照。现在默认返回 Series（竖版封面），
+  客户端显式带 `IncludeItemTypes=Episode` 时才返回最新集。
+- **ImageTags.Primary 始终声明**：TV 剧条目经常只有 backdrop、没有 poster；之前 Primary
+  只在有 poster 时声明，客户端根本不发封面请求 → 电视库空白。现在始终给 Primary tag，
+  handler 再依次用季海报/backdrop 兜底。
+- **TV 详情兜底**：`item/{guid}` 对部分 TV 剧返回 404 时，改从 `item/list` 的库列表里
+  按 guid 找条目，详情页不再 404、点剧集不再「没有内容」。
+- 包含 b006 的主图宽高比/季海报修复与 b005 的播放 token 修复。
+
 ## b006（预发布，构建号）
 
 针对「电影/AV 封面正常，电视节目封面不对」：

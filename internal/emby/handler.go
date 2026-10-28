@@ -1703,6 +1703,43 @@ func (h *Handler) itemDetail(ctx context.Context, client *fn.Client, guid string
 	return it, nil
 }
 
+// itemDetailAnywhere 取条目详情：item/{guid} → play/info → 库列表里按 guid 找。
+// 部分 fnOS 版本 item/{guid} 对 TV 剧条目返回 404，但 item/list 明明有该剧；
+// 此时用库列表里的条目兜底，详情页/封面才不会 404/空白。
+func (h *Handler) itemDetailAnywhere(ctx context.Context, client *fn.Client, id string) (*fn.MediaItem, error) {
+	if it, err := h.itemDetail(ctx, client, id); err == nil && it != nil && it.Guid != "" {
+		return it, nil
+	}
+	if pi, err := h.playInfo(ctx, client, id); err == nil && pi != nil && pi.Guid == id {
+		fb := playInfoMediaItem(pi)
+		return &fb, nil
+	}
+	v, err := h.cache.Do("detailany:"+client.Token+":"+id, 60*time.Second, func() (any, error) {
+		dbs, err := h.mediaDBs(ctx, client)
+		if err != nil {
+			return nil, err
+		}
+		for _, db := range dbs {
+			list, err := h.typedItems(ctx, client, db.Guid, []string{"Movie", "TV", "Directory", "Video"}, 0)
+			if err != nil {
+				continue
+			}
+			for i := range list {
+				if list[i].Guid == id {
+					it := list[i]
+					return &it, nil
+				}
+			}
+		}
+		return nil, fmt.Errorf("item %s not found in library lists", id)
+	})
+	if err != nil {
+		return nil, err
+	}
+	it, _ := v.(*fn.MediaItem)
+	return it, nil
+}
+
 // playInfo 播放信息（30s 缓存）。
 func (h *Handler) playInfo(ctx context.Context, client *fn.Client, guid string) (*fn.PlayInfo, error) {
 	v, err := h.cache.Do("playinfo:"+client.Token+":"+guid, 30*time.Second, func() (any, error) {
@@ -2434,7 +2471,7 @@ func playInfoMediaItem(pi *fn.PlayInfo) fn.MediaItem {
 func (h *Handler) handleItemByID(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	// 详情用 item/{guid}：对 TV/Season 等容器类型也能正确返回（play/info 只适用于可播条目）
-	item, err := h.itemDetail(r.Context(), h.fnOf(r.Context()), id)
+	item, err := h.itemDetailAnywhere(r.Context(), h.fnOf(r.Context()), id)
 	if err != nil {
 		origErr := err
 		// 兜底：部分 fnOS 版本 item/{guid} 对集/STRM 条目返回 404，但 play/info 可用。
@@ -3767,7 +3804,7 @@ func (h *Handler) handleProgress(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleItemImages(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	out := []map[string]any{}
-	it, err := h.itemDetail(r.Context(), h.imageClient(r), id)
+	it, err := h.itemDetailAnywhere(r.Context(), h.imageClient(r), id)
 	if err == nil && it != nil {
 		tags := imageTags(*it)
 		for _, t := range []string{"Primary", "Logo", "Thumb", "Backdrop", "Banner", "Art"} {
@@ -3853,7 +3890,7 @@ func (h *Handler) handleItemImage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	client := h.imageClient(r)
-	item, err := h.itemDetail(r.Context(), client, id)
+	item, err := h.itemDetailAnywhere(r.Context(), client, id)
 	if err != nil || item == nil {
 		// 与详情接口一致：item/{guid} 失败时用 play/info 兜底（可播条目）
 		if pi, perr := h.playInfo(r.Context(), client, id); perr == nil && pi != nil && pi.Guid == id {
@@ -4205,23 +4242,27 @@ func imageTagFor(p string) string {
 // （集 poster 本身即 1920×1080 横版剧照，回退海报裁剪显示）。
 func imageTags(m fn.MediaItem) map[string]any {
 	tags := map[string]any{}
-	if p := m.PosterPath(); p != "" {
-		tags["Primary"] = imageTagFor(p)
+	// Primary 必须始终声明：TV 剧条目经常只有 backdrop、没有 poster，若这里不声明，
+	// 客户端根本不会请求封面（表现为电视库全空白，而电影有 poster 正常）。
+	primary := m.PosterPath()
+	if primary == "" {
+		primary = m.BackdropPath()
 	}
-	// Logo：剧用自有 logos；季/集无自有资源但 handleItemImage 会回退所属剧的
-	// logos，同样声明（客户端只有看到 tag 才会发请求——季/集详情页标题图）
+	if primary == "" {
+		primary = "primary" // 交给 handleItemImage 再做季/parent 兜底
+	}
+	tags["Primary"] = imageTagFor(primary)
 	if p := m.LogoPath(); p != "" {
 		tags["Logo"] = imageTagFor(p)
 	} else if m.Type == "Season" || m.Type == "Episode" {
 		tags["Logo"] = "logo"
 	}
-	if p := m.BackdropPath(); p != "" {
-		tags["Backdrop"] = imageTagFor(p)
-		tags["Thumb"] = tags["Backdrop"]
-		tags["Art"] = tags["Backdrop"]
-		tags["Banner"] = tags["Backdrop"]
-	} else if m.PosterPath() != "" {
-		t := imageTagFor(m.PosterPath())
+	backdrop := m.BackdropPath()
+	if backdrop == "" {
+		backdrop = m.PosterPath()
+	}
+	if backdrop != "" {
+		t := imageTagFor(backdrop)
 		tags["Backdrop"] = t
 		tags["Thumb"] = t
 		tags["Art"] = t
@@ -5182,20 +5223,11 @@ func (h *Handler) handleLatest(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, []any{})
 		return
 	}
-	catOf := func(guid string) string {
-		for _, db := range dbs {
-			if db.Guid == guid {
-				return collectionType(db.Category)
-			}
-		}
-		return ""
-	}
 	parent := queryGet(q, "ParentId")
 	types := strings.ToUpper(queryGet(q, "IncludeItemTypes"))
 
 	if parent != "" {
-		cat := catOf(parent)
-		if (types == "" && cat == "tvshows") || strings.Contains(types, "EPISODE") {
+		if strings.Contains(types, "EPISODE") {
 			list, err := h.typedItems(ctx, client, parent, []string{"Episode"}, limit*3)
 			if err != nil {
 				list = nil
@@ -5216,13 +5248,13 @@ func (h *Handler) handleLatest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 全局 Latest：TV 库取最新集，其它库取容器；合并后按入库时间倒序。
+	// 全局 Latest：默认取容器（TV 库即剧集，客户端封面才正常）；
+	// 客户端明确要 Episode 时才取最新集。合并后按入库时间倒序。
 	var all []fn.MediaItem
 	for _, db := range dbs {
-		cat := collectionType(db.Category)
 		var list []fn.MediaItem
 		var e error
-		if cat == "tvshows" && types == "" {
+		if strings.Contains(types, "EPISODE") {
 			list, e = h.typedItems(ctx, client, db.Guid, []string{"Episode"}, limit*3)
 			if e == nil {
 				h.enrichEpisodeSeries(ctx, client, list, 60)
