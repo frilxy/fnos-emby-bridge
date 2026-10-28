@@ -72,7 +72,7 @@
 ```yaml
 services:
   fnos-emby-bridge:
-    image: ghcr.io/frilxy/fnos-emby-bridge:b007
+    image: ghcr.io/frilxy/fnos-emby-bridge:b008
     container_name: fnos-emby-bridge
     restart: unless-stopped
     ports: ["8096:8096"]

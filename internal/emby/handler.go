@@ -1730,6 +1730,22 @@ func (h *Handler) itemDetailAnywhere(ctx context.Context, client *fn.Client, id 
 					return &it, nil
 				}
 			}
+			// 季不在库级容器列表里：对 TV 剧逐个 season/list 找（仅详情/图片兜底时）。
+			for i := range list {
+				if list[i].Type != "TV" {
+					continue
+				}
+				seasons, err := client.SeasonList(ctx, list[i].Guid)
+				if err != nil {
+					continue
+				}
+				for j := range seasons {
+					if seasons[j].Guid == id {
+						it := seasons[j]
+						return &it, nil
+					}
+				}
+			}
 		}
 		return nil, fmt.Errorf("item %s not found in library lists", id)
 	})
@@ -3959,7 +3975,7 @@ func (h *Handler) handleItemImage(w http.ResponseWriter, r *http.Request) {
 	if p == "" && item.ParentGuid != "" {
 		g := item.ParentGuid
 		for i := 0; i < 2 && g != "" && g != item.Guid; i++ {
-			par, err := h.itemDetail(r.Context(), h.imageClient(r), g)
+			par, err := h.itemDetailAnywhere(r.Context(), h.imageClient(r), g)
 			if err != nil || par == nil {
 				break
 			}
