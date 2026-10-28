@@ -18,6 +18,7 @@ bridge.env.bak
 admin.pass
 bridge-progress.json
 bridge-sessions.json
+bridge-userstate.json
 
 # 系统杂物
 .DS_Store

@@ -105,6 +105,11 @@ func main() {
 
 	h := emby.NewHandler(client, name, host)
 	h.SetLibImageResolver(store.LibraryImage)
+	// 排障用：ALLOW_ANON=1 时允许无 token 访问（默认严格鉴权，不建议长期开启）
+	if os.Getenv("ALLOW_ANON") == "1" {
+		h.AllowAnonymous = true
+		log.Printf("警告：ALLOW_ANON=1，媒体端点允许匿名访问")
+	}
 
 	// 后台管理：/admin（UI + 配置 API）
 	adminHandler := store.Handler(func() []admin.LibInfo {
