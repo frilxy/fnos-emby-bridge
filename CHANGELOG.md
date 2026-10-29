@@ -3,6 +3,14 @@
 本项目（**飞牛影视 Emby 桥接**）的版本历史。每个版本的改动都附带**实机验证依据**
 （客户端日志 / 官方 API 文档）。
 
+## 1.1.16
+
+- **修复 Yamby 搜索为空**：Yamby 请求带 `IncludeItemTypes=Movie,Series,BoxSet`，桥接之前
+  只要看到 `BoxSet` 就按“纯合集查询”返回空，导致搜索结果被全部丢掉。现在只有**只含**
+  合集/歌单/类型时才空返回，混合查询继续走 Movie/Series。
+- `/debug/genres` 改用有效登录会话，并返回 `tag/genres` 原始 data，便于排查类型为空。
+- 其余同 1.1.15。
+
 ## 1.1.15
 
 - 修复 `/debug/search`、`/debug/genres` 被路径大小写归一改写成 `/debug/Search`、

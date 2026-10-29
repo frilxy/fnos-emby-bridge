@@ -1220,6 +1220,18 @@ func (c *Client) TagGenres(ctx context.Context, lang string) ([]Genre, error) {
 	return out, nil
 }
 
+// TagGenresRaw 返回 /tag/genres 的原始 data，用于排查不同 fnOS 版本的字段形态。
+func (c *Client) TagGenresRaw(ctx context.Context, lang string) ([]byte, error) {
+	if lang == "" {
+		lang = "zh-CN"
+	}
+	res, err := c.doPath(ctx, "GET", "/v/api/v1/tag/genres?lan="+url.QueryEscape(lang), nil)
+	if err != nil {
+		return nil, fmt.Errorf("tag/genres: %w", err)
+	}
+	return res.Data, nil
+}
+
 // TagOptions 是 /tag/list 返回的当前库可用筛选维度。
 type TagOptions struct {
 	Genres            []int    `json:"genres"`
