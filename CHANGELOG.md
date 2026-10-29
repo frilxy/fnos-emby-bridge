@@ -3,6 +3,12 @@
 本项目（**飞牛影视 Emby 桥接**）的版本历史。每个版本的改动都附带**实机验证依据**
 （客户端日志 / 官方 API 文档）。
 
+## 1.1.15
+
+- 修复 `/debug/search`、`/debug/genres` 被路径大小写归一改写成 `/debug/Search`、
+  `/debug/Genres`，导致诊断端点落到兜底返回空列表的问题；`/debug/*` 不再参与归一。
+- 其余同 1.1.14。
+
 ## 1.1.14
 
 - 本机诊断端点 `/debug/requests`、`/debug/genres`、`/debug/search` 改为免鉴权
