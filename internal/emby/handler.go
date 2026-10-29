@@ -1893,6 +1893,7 @@ func (h *Handler) searchItems(ctx context.Context, client *fn.Client, user, term
 		return h.localSearch(ctx, client, user, term), nil
 	}
 	list, _ := v.([]fn.MediaItem)
+	log.Printf("[search] term=%q user=%q fn_results=%d", term, user, len(list))
 	if len(list) == 0 {
 		// 飞牛 search/list 有时返回 200 + 空数组（不是错误）；Yamby 会因此显示无结果。
 		// 标题兜底搜索能覆盖中文/刮削名与飞牛搜索不一致的情况。
@@ -1949,6 +1950,20 @@ func (h *Handler) localSearch(ctx context.Context, client *fn.Client, user, term
 func (h *Handler) handleSearchHints(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	term := strings.TrimSpace(queryGet(q, "SearchTerm"))
+	if term == "" && r.Method == http.MethodPost {
+		// 少数客户端 POST /Search/Hints，SearchTerm 放在 JSON/form body。
+		var payload struct {
+			SearchTerm string `json:"SearchTerm"`
+		}
+		if strings.Contains(strings.ToLower(r.Header.Get("Content-Type")), "json") {
+			_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&payload)
+			term = strings.TrimSpace(payload.SearchTerm)
+		}
+		if term == "" {
+			_ = r.ParseForm()
+			term = strings.TrimSpace(r.FormValue("SearchTerm"))
+		}
+	}
 	limit := parseInt(queryGet(q, "Limit"))
 	if limit <= 0 || limit > 100 {
 		limit = 20
@@ -2111,6 +2126,20 @@ func (h *Handler) filterItems(ctx context.Context, client *fn.Client, user strin
 	notFolder := strings.Contains(filters, "ISNOTFOLDER")
 
 	genres := splitPipe(queryGet(q, "Genres"))
+	// Emby 官方筛选同时有 Genres（名称）和 GenreIds（id）；Yamby 常用 GenreIds。
+	// 桥接的 GenreItems.Id 就是名称，所以这里既能接数字 id（映射名称）也能接名称。
+	genreIDs := splitCSV(queryGet(q, "GenreIds"))
+	var genreMap map[int]string
+	if len(genreIDs) > 0 {
+		genreMap = h.genreNames(ctx, client)
+		for _, id := range genreIDs {
+			if n, ok := genreMap[parseInt(id)]; ok && n != "" {
+				genres = append(genres, n)
+			} else {
+				genres = append(genres, id)
+			}
+		}
+	}
 	years := splitCSV(queryGet(q, "Years"))
 	ratings := splitPipe(queryGet(q, "OfficialRatings"))
 	countries := splitPipe(firstNonEmpty(queryGet(q, "Countries"), queryGet(q, "Country")))
@@ -2123,8 +2152,7 @@ func (h *Handler) filterItems(ctx context.Context, client *fn.Client, user strin
 	nameStarts := strings.ToLower(strings.TrimSpace(queryGet(q, "NameStartsWith")))
 	is4k := strings.EqualFold(queryGet(q, "Is4K"), "true")
 	ishd := strings.EqualFold(queryGet(q, "IsHD"), "true")
-	var genreMap map[int]string
-	if len(genres) > 0 {
+	if len(genres) > 0 && genreMap == nil {
 		genreMap = h.genreNames(ctx, client)
 	}
 	out := items[:0]
@@ -5222,10 +5250,11 @@ func (h *Handler) handleQueryFilters(w http.ResponseWriter, r *http.Request) {
 // 名称来自 /tag/genres；同名 genre 在不同库 id 不同，但展示名可以直接合并。
 func (h *Handler) handleGenres(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	names := h.genreNames(ctx, h.fnOf(ctx))
-	items := make([]map[string]any, 0, len(names))
+	// Yamby 的库筛选会带 ParentId；按库返回该库实际存在的类型，避免把全站类型都列出来。
+	fd := h.filterDictFor(ctx, h.fnOf(ctx), queryGet(r.URL.Query(), "ParentId"))
+	items := make([]map[string]any, 0, len(fd.Genres))
 	seen := map[string]bool{}
-	for _, name := range names {
+	for _, name := range fd.Genres {
 		if name == "" || seen[name] {
 			continue
 		}

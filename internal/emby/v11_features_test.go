@@ -235,6 +235,13 @@ func TestGenresFiltersAndDictionary(t *testing.T) {
 		t.Fatalf("genres=剧情 应包含 fv_tv2：%v", ids)
 	}
 
+	// Yamby 常用 GenreIds（id）而不是 Genres（名称）
+	body = getWithToken(t, bridge.URL+"/Items?GenreIds=1&IncludeItemTypes=Movie,Series", token)
+	ids = idsOf(decodeItems(t, body))
+	if len(ids) == 0 {
+		t.Fatalf("GenreIds=1 应返回剧情条目：%s", body)
+	}
+
 	body = getWithToken(t, bridge.URL+"/Items/Filters?ParentId=lib_tv", token)
 	var f map[string]any
 	if err := json.Unmarshal(body, &f); err != nil {
