@@ -1497,8 +1497,9 @@ func (h *Handler) handleItems(w http.ResponseWriter, r *http.Request) {
 	}
 
 	types := strings.ToUpper(queryGet(q, "IncludeItemTypes"))
-	if strings.Contains(types, "PLAYLIST") || strings.Contains(types, "BOXSET") ||
-		strings.Contains(types, "COLLECTION") || strings.Contains(types, "GENRE") {
+	// 只有“纯合集/歌单/类型”查询才直接空返回；Yamby 搜索会带
+	// IncludeItemTypes=Movie,Series,BoxSet，不能因为含 BoxSet 就把 Movie/Series 也丢掉。
+	if types != "" && onlyUnsupportedTypes(types) {
 		writeItems(nil)
 		return
 	}
@@ -1558,6 +1559,19 @@ func cloneItems(in []fn.MediaItem) []fn.MediaItem {
 	out := make([]fn.MediaItem, len(in))
 	copy(out, in)
 	return out
+}
+
+// onlyUnsupportedTypes 判断 IncludeItemTypes 是否只包含桥接不支持的合集/歌单/类型。
+func onlyUnsupportedTypes(types string) bool {
+	for _, t := range strings.Split(types, ",") {
+		switch strings.TrimSpace(t) {
+		case "", "PLAYLIST", "BOXSET", "COLLECTION", "GENRE":
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // filterItemTypes 把 Emby 的 IncludeItemTypes/ExcludeItemTypes 映射到飞牛 type。
@@ -2017,17 +2031,28 @@ func (h *Handler) handleDebugGenres(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	parent := queryGet(r.URL.Query(), "ParentId")
-	dict := h.genreNames(ctx, h.FN)
-	fd := h.filterDictFor(ctx, h.FN, parent)
+	client := h.imageClient(r) // 优先有效登录会话，admin token 过期时也能拿到数据
+	dict := h.genreNames(ctx, client)
+	fd := h.filterDictFor(ctx, client, parent)
 	names := make(map[string]string, len(dict))
 	for id, name := range dict {
 		names[strconv.Itoa(id)] = name
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	raw, rawErr := client.TagGenresRaw(ctx, "zh-CN")
+	rawStr := string(raw)
+	if len(rawStr) > 1200 {
+		rawStr = rawStr[:1200] + "..."
+	}
+	resp := map[string]any{
 		"parent_id": parent,
 		"dict":      names,
 		"filter":    fd.Genres,
-	})
+		"raw":       rawStr,
+	}
+	if rawErr != nil {
+		resp["raw_error"] = rawErr.Error()
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleDebugSearch 返回本机 admin 搜索 + 库内标题搜索结果，用于确认 Yamby 搜索无结果

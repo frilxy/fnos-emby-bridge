@@ -554,6 +554,12 @@ func TestSearchFallbackAndHints(t *testing.T) {
 		t.Fatalf("搜索兜底应找到电影A：%s", body)
 	}
 
+	// Yamby 搜索会带 BoxSet；不能因为含 BoxSet 就把 Movie/Series 结果全丢掉。
+	body = getWithToken(t, bridge.URL+"/Items?SearchTerm=%E7%94%B5%E5%BD%B1&IncludeItemTypes=Movie,Series,BoxSet", token)
+	if err := json.Unmarshal(body, &res); err != nil || len(res.Items) == 0 {
+		t.Fatalf("Movie,Series,BoxSet 搜索不应为空：%v (%s)", err, body)
+	}
+
 	hintsBody := getWithToken(t, bridge.URL+"/Search/Hints?SearchTerm=%E7%94%B5%E5%BD%B1", token)
 	var hints struct {
 		SearchHints      []map[string]any `json:"SearchHints"`
