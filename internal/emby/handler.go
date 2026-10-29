@@ -195,6 +195,8 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /Users/{uid}/Search/Hints", h.handleSearchHints)
 	// 仅 loopback 可读的最近请求（临时排查 Yamby 搜索/类型端点用）
 	mux.HandleFunc("GET /debug/requests", h.handleDebugRequests)
+	mux.HandleFunc("GET /debug/genres", h.handleDebugGenres)
+	mux.HandleFunc("GET /debug/search", h.handleDebugSearch)
 	mux.HandleFunc("POST /Users/{uid}/Search/Hints", h.handleSearchHints)
 
 	mux.HandleFunc("GET /Items/{id}", h.handleItemByID)
@@ -745,6 +747,10 @@ func isPublicPath(p string) bool {
 		return true
 	}
 	if strings.HasPrefix(p, "/branding/") || strings.HasPrefix(p, "/localization/") {
+		return true
+	}
+	// 本机诊断端点（loopback 校验在 handler 内），不带 token 也能读请求记录。
+	if strings.HasPrefix(p, "/debug/") {
 		return true
 	}
 	// 图片：很多客户端的图片组件不会带 token（只对 API 请求带），
@@ -1982,9 +1988,13 @@ func (h *Handler) localSearch(ctx context.Context, client *fn.Client, user, term
 }
 
 // handleDebugRequests 返回最近请求路径；仅允许本机访问。
-func (h *Handler) handleDebugRequests(w http.ResponseWriter, r *http.Request) {
+func loopbackOnly(r *http.Request) bool {
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	if host != "127.0.0.1" && host != "::1" {
+	return host == "127.0.0.1" || host == "::1"
+}
+
+func (h *Handler) handleDebugRequests(w http.ResponseWriter, r *http.Request) {
+	if !loopbackOnly(r) {
 		http.NotFound(w, r)
 		return
 	}
@@ -1992,6 +2002,62 @@ func (h *Handler) handleDebugRequests(w http.ResponseWriter, r *http.Request) {
 	for _, line := range recentRequests() {
 		_, _ = fmt.Fprintln(w, line)
 	}
+}
+
+// handleDebugGenres 返回本机类型字典/筛选字典，用于确认飞牛 genres 是否可读。
+func (h *Handler) handleDebugGenres(w http.ResponseWriter, r *http.Request) {
+	if !loopbackOnly(r) {
+		http.NotFound(w, r)
+		return
+	}
+	ctx := r.Context()
+	parent := queryGet(r.URL.Query(), "ParentId")
+	dict := h.genreNames(ctx, h.FN)
+	fd := h.filterDictFor(ctx, h.FN, parent)
+	names := make(map[string]string, len(dict))
+	for id, name := range dict {
+		names[strconv.Itoa(id)] = name
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"parent_id": parent,
+		"dict":      names,
+		"filter":    fd.Genres,
+	})
+}
+
+// handleDebugSearch 返回本机 admin 搜索 + 库内标题搜索结果，用于确认 Yamby 搜索无结果
+// 是飞牛 search/list 的问题还是端点没覆盖。
+func (h *Handler) handleDebugSearch(w http.ResponseWriter, r *http.Request) {
+	if !loopbackOnly(r) {
+		http.NotFound(w, r)
+		return
+	}
+	ctx := r.Context()
+	q := queryGet(r.URL.Query(), "q")
+	if q == "" {
+		q = queryGet(r.URL.Query(), "SearchTerm")
+	}
+	fnList, fnErr := h.FN.Search(ctx, q)
+	local := h.localSearch(ctx, h.FN, "debug", q)
+	fnIDs := make([]string, 0, len(fnList))
+	for _, m := range fnList {
+		fnIDs = append(fnIDs, m.Guid+":"+m.Title)
+	}
+	localIDs := make([]string, 0, len(local))
+	for _, m := range local {
+		localIDs = append(localIDs, m.Guid+":"+m.Title)
+	}
+	resp := map[string]any{
+		"query":       q,
+		"fn_count":    len(fnList),
+		"local_count": len(local),
+		"fn_items":    fnIDs,
+		"local_items": localIDs,
+	}
+	if fnErr != nil {
+		resp["fn_error"] = fnErr.Error()
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleSearchHints 实现 POST/GET /Search/Hints（Emby SearchHintResult）。
