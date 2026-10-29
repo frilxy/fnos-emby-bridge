@@ -10,7 +10,6 @@ on:
   push:
     tags:
       - 'v*'
-      - 'b*'
   workflow_dispatch:
     inputs:
       tag:
@@ -46,14 +45,8 @@ jobs:
           TAG="${INPUT_TAG:-$REF_NAME}"
           VER="$(sed -n 's/^version[[:space:]]*= *//p' fpk/fnos-emby-bridge/manifest | head -1)"
           echo "tag=${TAG}  manifest version=${VER}"
-          if [[ "${TAG}" =~ ^b[0-9]{3}$ ]]; then
-            # 预发布构建号：tag=b001，manifest=1.1.2-b001
-            case "${VER}" in
-              *-"${TAG}") ;;
-              *) echo "::error::tag ${TAG} 与 manifest ${VER} 不一致（应形如 1.1.2-${TAG}）"; exit 1 ;;
-            esac
-          elif [ "${TAG}" != "${VER}" ] && [ "${TAG}" != "v${VER}" ]; then
-            echo "::error::tag ${TAG} 与 manifest 里的版本 ${VER} 不一致——请先改 manifest 再打 tag"
+          if [ "${TAG}" != "v${VER}" ]; then
+            echo "::error::tag ${TAG} 与 manifest 里的版本 ${VER} 不一致（应为 v${VER}）"
             exit 1
           fi
 
