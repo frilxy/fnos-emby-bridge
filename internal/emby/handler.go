@@ -198,6 +198,7 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /debug/genres", h.handleDebugGenres)
 	mux.HandleFunc("GET /debug/search", h.handleDebugSearch)
 	mux.HandleFunc("GET /debug/library", h.handleDebugLibrary)
+	mux.HandleFunc("GET /debug/genre-filter", h.handleDebugGenreFilter)
 	mux.HandleFunc("POST /Users/{uid}/Search/Hints", h.handleSearchHints)
 
 	mux.HandleFunc("GET /Items/{id}", h.handleItemByID)
@@ -1564,8 +1565,19 @@ func (h *Handler) handleItems(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"Error": err.Error(), "Items": []any{}})
 		return
 	}
-	// 飞牛 item/list 对部分库（尤其 AV/Other）不返回 genres；只按 item/list 过滤会全空。
-	// 有类型筛选时，从 item/{guid} 并发补齐缺失的 genres，再做本地 matchGenre。
+	// 飞牛 item/list/detail 对部分库（尤其 AV）不返回 genres，本地无法匹配。
+	// 但 item/list 支持服务端 tags.genres 过滤；优先用它，再补齐/本地兜底。
+	if parentID != "" && queryGet(q, "SearchTerm") == "" &&
+		(queryGet(q, "Genres") != "" || queryGet(q, "GenreIds") != "") {
+		if list, ok, err := h.itemsByGenres(ctx, client, parentID, q); ok && err == nil {
+			all = list
+			deleteQueryKey(q, "Genres")
+			deleteQueryKey(q, "GenreIds")
+			log.Printf("[genre-filter] parent=%s -> %d 条（服务端过滤）", parentID, len(list))
+		} else if err != nil {
+			log.Printf("[genre-filter] parent=%s 服务端过滤失败，回退详情补齐: %v", parentID, err)
+		}
+	}
 	if len(all) > 0 && (queryGet(q, "Genres") != "" || queryGet(q, "GenreIds") != "") {
 		h.hydrateItemGenres(ctx, client, all)
 	}
@@ -1720,6 +1732,85 @@ func allItemsAreVideo(items []fn.MediaItem) bool {
 		}
 	}
 	return true
+}
+
+// deleteQueryKey 大小写不敏感删除 query key（服务端已过滤后避免本地再次丢弃）。
+func deleteQueryKey(q map[string][]string, key string) {
+	for k := range q {
+		if strings.EqualFold(k, key) {
+			delete(q, k)
+		}
+	}
+}
+
+// genreFilterNames 把 Genres（名称）和 GenreIds（名称或数字 id）统一成名称列表。
+func (h *Handler) genreFilterNames(ctx context.Context, client *fn.Client, q map[string][]string) []string {
+	out := append([]string{}, splitPipe(queryGet(q, "Genres"))...)
+	rawIDs := splitCSV(queryGet(q, "GenreIds"))
+	if len(rawIDs) == 0 {
+		return out
+	}
+	dict := h.genreNames(ctx, client)
+	for _, v := range rawIDs {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		if id := parseInt(v); id > 0 {
+			if name := dict[id]; name != "" {
+				out = append(out, name)
+				continue
+			}
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+// itemsByGenres 调 item/list 的服务端 tags.genres 过滤。
+// 部分 fnOS 版本 genres 接受数组，部分只接受单个 int；两种都试。
+func (h *Handler) itemsByGenres(ctx context.Context, client *fn.Client, parentID string, q map[string][]string) ([]fn.MediaItem, bool, error) {
+	names := h.genreFilterNames(ctx, client, q)
+	if len(names) == 0 {
+		return nil, false, nil
+	}
+	dict := h.genreNames(ctx, client)
+	byName := make(map[string]int, len(dict))
+	for id, name := range dict {
+		byName[strings.ToLower(strings.TrimSpace(name))] = id
+	}
+	ids := make([]int, 0, len(names))
+	for _, name := range names {
+		if id := byName[strings.ToLower(strings.TrimSpace(name))]; id > 0 {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, false, fmt.Errorf("类型 %v 没有匹配到飞牛 genre id", names)
+	}
+	var lastErr error
+	var empty []fn.MediaItem
+	for _, val := range []any{ids, ids[0]} {
+		body := map[string]any{
+			"ancestor_guid": parentID,
+			"tags":          map[string]any{"genres": val},
+			"page":          1,
+			"page_size":     1000,
+		}
+		list, _, err := client.ItemListQuery(ctx, body)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if len(list) > 0 {
+			return list, true, nil
+		}
+		empty = list
+	}
+	if empty != nil {
+		return empty, true, nil
+	}
+	return nil, false, lastErr
 }
 
 // hydrateItemGenres 对 item/list 缺 genres 的条目从 item/{guid} 补齐。
@@ -2135,6 +2226,34 @@ func (h *Handler) handleDebugGenres(w http.ResponseWriter, r *http.Request) {
 	if rawErr != nil {
 		resp["raw_error"] = rawErr.Error()
 	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleDebugGenreFilter 直接测 item/list 的 tags.genres 服务端过滤。
+func (h *Handler) handleDebugGenreFilter(w http.ResponseWriter, r *http.Request) {
+	if !loopbackOnly(r) {
+		http.NotFound(w, r)
+		return
+	}
+	ctx := r.Context()
+	q := r.URL.Query()
+	resp := map[string]any{"parent_id": queryGet(q, "ParentId")}
+	names := h.genreFilterNames(ctx, h.FN, q)
+	resp["names"] = names
+	list, ok, err := h.itemsByGenres(ctx, h.FN, queryGet(q, "ParentId"), q)
+	resp["ok"] = ok
+	resp["count"] = len(list)
+	if err != nil {
+		resp["error"] = err.Error()
+	}
+	samples := make([]string, 0, 5)
+	for _, m := range list {
+		if len(samples) >= 5 {
+			break
+		}
+		samples = append(samples, m.Guid+":"+m.Title)
+	}
+	resp["samples"] = samples
 	writeJSON(w, http.StatusOK, resp)
 }
 

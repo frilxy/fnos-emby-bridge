@@ -3,6 +3,15 @@
 本项目（**飞牛影视 Emby 桥接**）的版本历史。每个版本的改动都附带**实机验证依据**
 （客户端日志 / 官方 API 文档）。
 
+## 1.1.20
+
+- **类型筛选改用服务端过滤**：飞牛该库的 `item/list` 和 `item/{guid}` 都不返回 `genres`
+  （`with_genres=0`、`detail_genres` 为空），本地匹配无解。现在把 `Genres`/`GenreIds`
+  映射成 genre id，调用 `item/list` 的 `tags.genres` 让飞牛服务端过滤；
+  同时兼容该字段接受数组和单值两种形态。
+- 新增 `/debug/genre-filter?ParentId=&GenreIds=`（loopback）直接验证服务端过滤。
+- 包含 1.1.19 的详情 genres 补齐兜底与原生-only（无 Docker）。
+
 ## 1.1.19
 
 - **修复 AV/电影库类型筛选无结果**：飞牛 `item/list` 对部分库不返回 `genres`，列表里
