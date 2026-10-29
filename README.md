@@ -16,6 +16,16 @@
 > `4K HEVC Main10 + TrueHD Atmos`、`DTS-HD MA` 这类格式手机端普遍解不动——那是设计边界，
 > 不是 bug。需要任何格式都能播，请用真正的 Jellyfin/Emby，或让客户端走软解。
 
+## 元数据支持
+
+| 字段 | 支持情况 |
+|---|---|
+| 类型 / Genres | ✅ 飞牛 `genres` id 经 `/tag/genres` 映射为名称，详情/筛选可用 |
+| 标签 / Tags | ❌ 飞牛 item 接口没有用户标签字段；`/Tags`、`Tags`、`TagItems` 只能返回空 |
+| 官方分级 / OfficialRating | ✅ 来自 `content_ratings` |
+| 年份 / 国家 / 工作室 | 年份、国家支持；工作室飞牛无数据，返回空 |
+| 人物 / Persons | ✅ 演员/导演等 |
+
 ## 版本号约定
 
 - **正式版**：`1.x.y`（tag `v1.x.y`）。
@@ -72,7 +82,7 @@
 ```yaml
 services:
   fnos-emby-bridge:
-    image: ghcr.io/frilxy/fnos-emby-bridge:b009
+    image: ghcr.io/frilxy/fnos-emby-bridge:b010
     container_name: fnos-emby-bridge
     restart: unless-stopped
     ports: ["8096:8096"]

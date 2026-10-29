@@ -191,7 +191,9 @@ func (h *Handler) Routes() *http.ServeMux {
 	// 搜索建议：Rodel/Emby 搜索页先调 /Search/Hints，缺省会落兜底返回
 	// {Items:[]}，客户端按 SearchHintResult 反序列化拿不到 SearchHints → 搜索不可用。
 	mux.HandleFunc("GET /Search/Hints", h.handleSearchHints)
+	mux.HandleFunc("POST /Search/Hints", h.handleSearchHints)
 	mux.HandleFunc("GET /Users/{uid}/Search/Hints", h.handleSearchHints)
+	mux.HandleFunc("POST /Users/{uid}/Search/Hints", h.handleSearchHints)
 
 	mux.HandleFunc("GET /Items/{id}", h.handleItemByID)
 	// 详情页（UserLibraryService 标准路径）：Yamby 点开剧/季/集详情走
@@ -1891,6 +1893,13 @@ func (h *Handler) searchItems(ctx context.Context, client *fn.Client, user, term
 		return h.localSearch(ctx, client, user, term), nil
 	}
 	list, _ := v.([]fn.MediaItem)
+	if len(list) == 0 {
+		// 飞牛 search/list 有时返回 200 + 空数组（不是错误）；Yamby 会因此显示无结果。
+		// 标题兜底搜索能覆盖中文/刮削名与飞牛搜索不一致的情况。
+		if local := h.localSearch(ctx, client, user, term); len(local) > 0 {
+			return local, nil
+		}
+	}
 	return cloneItems(list), nil
 }
 
