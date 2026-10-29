@@ -193,6 +193,8 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /Search/Hints", h.handleSearchHints)
 	mux.HandleFunc("POST /Search/Hints", h.handleSearchHints)
 	mux.HandleFunc("GET /Users/{uid}/Search/Hints", h.handleSearchHints)
+	// 仅 loopback 可读的最近请求（临时排查 Yamby 搜索/类型端点用）
+	mux.HandleFunc("GET /debug/requests", h.handleDebugRequests)
 	mux.HandleFunc("POST /Users/{uid}/Search/Hints", h.handleSearchHints)
 
 	mux.HandleFunc("GET /Items/{id}", h.handleItemByID)
@@ -472,6 +474,32 @@ func collapseSlashes(p string) string {
 
 // logRequests 全量访问日志（排障期）。stream 大流量长连接结束时打一行，不影响吞吐。
 // api_key/token 值打码，避免日志落凭据。
+// 最近的请求环形缓冲：用于排查客户端（Yamby）实际请求了哪些端点。
+// 只保留方法/路径/状态/客户端标识，api_key 已打码；仅 loopback 的 /debug/requests 可读。
+var (
+	reqLogMu   sync.Mutex
+	reqLogRing []string
+)
+
+const reqLogMax = 300
+
+func recordRecentRequest(line string) {
+	reqLogMu.Lock()
+	defer reqLogMu.Unlock()
+	reqLogRing = append(reqLogRing, line)
+	if len(reqLogRing) > reqLogMax {
+		reqLogRing = reqLogRing[len(reqLogRing)-reqLogMax:]
+	}
+}
+
+func recentRequests() []string {
+	reqLogMu.Lock()
+	defer reqLogMu.Unlock()
+	out := make([]string, len(reqLogRing))
+	copy(out, reqLogRing)
+	return out
+}
+
 func logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
@@ -500,6 +528,7 @@ func logRequests(next http.Handler) http.Handler {
 			}
 		}
 		log.Printf("[http] %d %s %s?%s (%s) [%s]", rw.status, r.Method, origPath, q, time.Since(start).Round(time.Millisecond), cl)
+		recordRecentRequest(fmt.Sprintf("%d %s %s?%s (%s) [%s]", rw.status, r.Method, origPath, q, time.Since(start).Round(time.Millisecond), cl))
 	})
 }
 
@@ -1804,6 +1833,13 @@ func (h *Handler) genreNames(ctx context.Context, client *fn.Client) map[int]str
 		return h.genreMap
 	}
 	genres, err := client.TagGenres(ctx, "zh-CN")
+	if (err != nil || len(genres) == 0) && h.FN != nil && h.FN != client {
+		// 普通用户 token 可能没有 tag/genres 权限；类型字典是公共元数据，用 admin 再试。
+		if g2, e2 := h.FN.TagGenres(ctx, "zh-CN"); e2 == nil && len(g2) > 0 {
+			genres, err = g2, nil
+			log.Printf("[genres] 用户 token 取类型失败，已用 admin token 兜底")
+		}
+	}
 	if err != nil {
 		if h.genreMap != nil {
 			return h.genreMap
@@ -1943,6 +1979,19 @@ func (h *Handler) localSearch(ctx context.Context, client *fn.Client, user, term
 	}
 	list, _ := v.([]fn.MediaItem)
 	return cloneItems(list)
+}
+
+// handleDebugRequests 返回最近请求路径；仅允许本机访问。
+func (h *Handler) handleDebugRequests(w http.ResponseWriter, r *http.Request) {
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if host != "127.0.0.1" && host != "::1" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	for _, line := range recentRequests() {
+		_, _ = fmt.Fprintln(w, line)
+	}
 }
 
 // handleSearchHints 实现 POST/GET /Search/Hints（Emby SearchHintResult）。
