@@ -446,6 +446,11 @@ var routeSegmentCase = map[string]string{
 // guid/未知段（如 32 位 hex）原样保留；query 不受影响。
 func normalizePathCase(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// /debug/* 是本地诊断路由，注册为小写；不要被下面的 Search/Genres 规范化改写。
+		if strings.HasPrefix(strings.ToLower(r.URL.Path), "/debug/") {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if strings.Contains(r.URL.Path, "//") {
 			r.URL.Path = collapseSlashes(r.URL.Path)
 			if r.URL.Path == "" {
