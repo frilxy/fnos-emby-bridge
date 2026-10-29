@@ -576,6 +576,21 @@ func TestSearchFallbackAndHints(t *testing.T) {
 	}
 }
 
+func TestOtherLibraryFiltersIncludeVideo(t *testing.T) {
+	bridge, token := newV11Bridge(t, mock.WithOtherLibrary())
+	mock.SetItemField("fv_vid", "air_date", "2024-01-01")
+	mock.SetItemField("fv_vid", "genres", []int{1})
+
+	body := getWithToken(t, bridge.URL+"/Items?ParentId=lib_other&IncludeItemTypes=Movie&GenreIds=%E5%89%A7%E6%83%85", token)
+	if ids := idsOf(decodeItems(t, body)); len(ids) == 0 || ids[0] != "fv_vid" {
+		t.Fatalf("Other 库 GenreIds=剧情 应包含 Video 条目 fv_vid：%v (%s)", ids, body)
+	}
+	body = getWithToken(t, bridge.URL+"/Items?ParentId=lib_other&IncludeItemTypes=Movie&Years=2020s", token)
+	if ids := idsOf(decodeItems(t, body)); len(ids) == 0 || ids[0] != "fv_vid" {
+		t.Fatalf("Other 库 Years=2020s 应包含 Video 条目 fv_vid：%v (%s)", ids, body)
+	}
+}
+
 func TestAuthRequiredAndUserIdentity(t *testing.T) {
 	bridge, token := newV11Bridge(t)
 

@@ -3,6 +3,14 @@
 本项目（**飞牛影视 Emby 桥接**）的版本历史。每个版本的改动都附带**实机验证依据**
 （客户端日志 / 官方 API 文档）。
 
+## 1.1.18
+
+- **修复 AV/Other 库筛选为空**：这类库的条目 type=Video，Yamby 会发
+  `IncludeItemTypes=Movie&GenreIds=...` 或 `Years=...`；桥接按 Movie 过滤把 Video 全丢掉。
+  现在：Other 库自动把 Video 加入 include；若库内条目全是 Video，则先放行再按类型/年代过滤。
+- 新增 `/debug/library?ParentId=`（loopback）输出库 category、type 分布、带 genres 条目数。
+- 包含 1.1.17 的 GET query Authx 签名修复。
+
 ## 1.1.17
 
 - **修复 GET 带 query 的 Authx 签名**：飞牛要求 `bodyHash = MD5(按键升序的原始 k=v&k=v)`，
