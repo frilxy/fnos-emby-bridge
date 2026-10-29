@@ -4,7 +4,8 @@
 //     后续请求带 Authorization: <token> 或 Cookie: Trim-MC-token=<token>; mode=relay
 //   - Authx 签名（所有 /v/api/v1 请求必须）：
 //     sign = MD5(apiKey + "_" + path(不含query) + "_" + nonce + "_" + ts毫秒 + "_" + MD5(body) + "_" + apiSecret)
-//     GET 请求 body 为空时 bodyHash = MD5("")
+//     GET 无 body 但有 query 时 bodyHash = MD5(按键升序的原始 k=v&k=v，不做 URL 编码)
+//     GET 无 body 无 query 时 bodyHash = MD5("")
 //     header: authx: nonce=<6位>&timestamp=<毫秒>&sign=<md5>
 package fn
 
@@ -19,6 +20,8 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"net/url"
+	"sort"
 	"strings"
 	"time"
 )
@@ -119,6 +122,39 @@ func IsSHA256Hex(s string) bool {
 	return true
 }
 
+// querySignData 返回 GET query 的签名载荷：按 key 升序的 k=v&k=v，
+// 使用 URL 解码后的原始值（与飞牛 authx 规则一致）。
+//
+// 之前 GET 带 query 仍按 MD5("") 签名，导致 /tag/genres?lan=、/tag/list?ancestor_guid=、
+// /search/list?q= 全部返回 code=5000 invalid sign；表现为“类型为空、搜索无结果”。
+func querySignData(fullPath string) string {
+	i := strings.IndexByte(fullPath, '?')
+	if i < 0 || i == len(fullPath)-1 {
+		return ""
+	}
+	vals, err := url.ParseQuery(fullPath[i+1:])
+	if err != nil {
+		return fullPath[i+1:]
+	}
+	keys := make([]string, 0, len(vals))
+	for k := range vals {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		for _, v := range vals[k] {
+			if b.Len() > 0 {
+				b.WriteByte('&')
+			}
+			b.WriteString(k)
+			b.WriteByte('=')
+			b.WriteString(v)
+		}
+	}
+	return b.String()
+}
+
 // authx 构造签名头。path 不含 query；body 为空串时 bodyHash=MD5("")。
 // nonce 必须为 6 位且不以 0 开头（真机验证：前导零 nonce 返回 code=5000 invalid sign）。
 func authx(path, body string) string {
@@ -154,7 +190,11 @@ func (c *Client) doRawBody(ctx context.Context, method, fullPath, rawBody string
 	if c.UserAgent != "" {
 		req.Header.Set("User-Agent", c.UserAgent)
 	}
-	req.Header.Set("Authx", authx(signPath, rawBody))
+	signData := rawBody
+	if q := querySignData(fullPath); q != "" {
+		signData = q
+	}
+	req.Header.Set("Authx", authx(signPath, signData))
 	if c.Token != "" {
 		req.Header.Set("Authorization", c.Token)
 		req.Header.Set("Cookie", "Trim-MC-token="+c.Token+"; mode=relay")
@@ -210,7 +250,11 @@ func (c *Client) doPath(ctx context.Context, method, fullPath string, body inter
 	if c.UserAgent != "" {
 		req.Header.Set("User-Agent", c.UserAgent)
 	}
-	req.Header.Set("Authx", authx(signPath, bodyJSON))
+	signData := bodyJSON
+	if q := querySignData(fullPath); q != "" {
+		signData = q
+	}
+	req.Header.Set("Authx", authx(signPath, signData))
 	if c.Token != "" {
 		req.Header.Set("Authorization", c.Token)
 		// 真机验证：图片等端点认 Cookie（mode=relay），双保险都带上
