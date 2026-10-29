@@ -3,6 +3,16 @@
 本项目（**飞牛影视 Emby 桥接**）的版本历史。每个版本的改动都附带**实机验证依据**
 （客户端日志 / 官方 API 文档）。
 
+## 1.1.17
+
+- **修复 GET 带 query 的 Authx 签名**：飞牛要求 `bodyHash = MD5(按键升序的原始 k=v&k=v)`，
+  之前一律按 `MD5("")` 签，导致：
+  - `/tag/genres?lan=zh-CN` → `code=5000 invalid sign`（**类型为空**）；
+  - `/tag/list?ancestor_guid=...` → 同上（筛选字典为空）；
+  - `/search/list?q=...` → 同上（**搜索无结果**）。
+  现在 GET query 按飞牛规则签名，类型/搜索可用。
+- 包含 1.1.16 的 `IncludeItemTypes=Movie,Series,BoxSet` 混合查询修复。
+
 ## 1.1.16
 
 - **修复 Yamby 搜索为空**：Yamby 请求带 `IncludeItemTypes=Movie,Series,BoxSet`，桥接之前
