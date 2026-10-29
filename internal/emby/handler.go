@@ -197,6 +197,7 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /debug/requests", h.handleDebugRequests)
 	mux.HandleFunc("GET /debug/genres", h.handleDebugGenres)
 	mux.HandleFunc("GET /debug/search", h.handleDebugSearch)
+	mux.HandleFunc("GET /debug/library", h.handleDebugLibrary)
 	mux.HandleFunc("POST /Users/{uid}/Search/Hints", h.handleSearchHints)
 
 	mux.HandleFunc("GET /Items/{id}", h.handleItemByID)
@@ -1467,9 +1468,14 @@ func (h *Handler) handleItems(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		// 库级浏览的空结果兜底：只对"客户端按 Movie/Series 猜类型、而库是 Other/Video"
-		// 这种已知错配生效；不要把它变成"任何类型查不到就把别的类型塞回去"。
-		if len(filtered) == 0 && len(all) > 0 && parentID != "" && folderTypes &&
+		// 库级浏览的空结果兜底：客户端按 Movie/Series 猜类型，而库内条目是 Video
+		// （AV/Other 库常见）。即使带 Genres/Years 筛选，也要先把 Video 放进来，
+		// 再交给 filterItems 按类型/年代/类型名过滤，否则整个库筛选都是空。
+		if len(filtered) == 0 && len(all) > 0 && parentID != "" && allItemsAreVideo(all) {
+			log.Printf("[items] 库 %s 条目均为 Video，IncludeItemTypes=%q 不匹配，放行 Video 后再筛选（%d 条）",
+				parentID, queryGet(q, "IncludeItemTypes"), len(all))
+			filtered = all
+		} else if len(filtered) == 0 && len(all) > 0 && parentID != "" && folderTypes &&
 			queryGet(q, "SearchTerm") == "" && queryGet(q, "Filters") == "" &&
 			queryGet(q, "Genres") == "" && queryGet(q, "Years") == "" {
 			log.Printf("[items] IncludeItemTypes=%q 在库 %s 过滤为空，回退为容器列表（%d 条）",
@@ -1494,6 +1500,16 @@ func (h *Handler) handleItems(w http.ResponseWriter, r *http.Request) {
 			"TotalRecordCount": total,
 			"StartIndex":       start,
 		})
+	}
+
+	// AV/Other 类库的条目 type=Video，但客户端会按电影库习惯发
+	// IncludeItemTypes=Movie。只按 Movie 过滤会把整库条目丢光（筛选/年份都空）。
+	// 对 Other 库把 Video 加进 include，让电影类型筛选也能命中 Video 条目。
+	if parentID != "" && h.isOtherLibrary(ctx, client, parentID) {
+		if inc := queryGet(q, "IncludeItemTypes"); inc != "" &&
+			!strings.Contains(strings.ToUpper(inc), "VIDEO") {
+			q["IncludeItemTypes"] = []string{inc + ",Video"}
+		}
 	}
 
 	types := strings.ToUpper(queryGet(q, "IncludeItemTypes"))
@@ -1686,6 +1702,36 @@ func (h *Handler) browseParent(ctx context.Context, client *fn.Client, parentID 
 		}
 		return list, nil
 	}
+}
+
+// allItemsAreVideo 判断列表是否全部为 type=Video（AV/Other 自定义库）。
+func allItemsAreVideo(items []fn.MediaItem) bool {
+	if len(items) == 0 {
+		return false
+	}
+	for _, m := range items {
+		if m.Type != "Video" {
+			return false
+		}
+	}
+	return true
+}
+
+// isOtherLibrary 判断 parentID 是否为 Other/HomeVideo 类库。
+// 这类库的条目是 type=Video，客户端按 Movie 过滤时必须把 Video 一并放行。
+func (h *Handler) isOtherLibrary(ctx context.Context, client *fn.Client, parentID string) bool {
+	dbs, err := h.mediaDBs(ctx, client)
+	if err != nil {
+		return false
+	}
+	for _, db := range dbs {
+		if db.Guid != parentID {
+			continue
+		}
+		c := strings.ToLower(strings.TrimSpace(db.Category))
+		return c == "other" || c == "homevideo" || c == "homevideos"
+	}
+	return false
 }
 
 // browseAll 根级：聚合全部库；递归查集时按 Episode 类型拉取。
@@ -2052,6 +2098,55 @@ func (h *Handler) handleDebugGenres(w http.ResponseWriter, r *http.Request) {
 	if rawErr != nil {
 		resp["raw_error"] = rawErr.Error()
 	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleDebugLibrary 返回库 category、条目 type 分布、带 genres 的条目数，
+// 用于确认 AV/Other 库被 IncludeItemTypes=Movie 过滤为空的原因。
+func (h *Handler) handleDebugLibrary(w http.ResponseWriter, r *http.Request) {
+	if !loopbackOnly(r) {
+		http.NotFound(w, r)
+		return
+	}
+	ctx := r.Context()
+	parent := queryGet(r.URL.Query(), "ParentId")
+	resp := map[string]any{"parent_id": parent}
+	dbs, err := h.mediaDBs(ctx, h.FN)
+	if err != nil {
+		resp["error"] = err.Error()
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	for _, db := range dbs {
+		if db.Guid != parent {
+			continue
+		}
+		resp["category"] = db.Category
+		resp["library_name"] = db.Title
+		break
+	}
+	list, err := h.typedItems(ctx, h.FN, parent, []string{"Movie", "TV", "Video", "Directory"}, 0)
+	if err != nil {
+		resp["items_error"] = err.Error()
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	types := map[string]int{}
+	withGenres := 0
+	samples := make([]string, 0, 5)
+	for _, m := range list {
+		types[m.Type]++
+		if len(m.Genres) > 0 {
+			withGenres++
+		}
+		if len(samples) < 5 {
+			samples = append(samples, m.Guid+":"+m.Title+":genres="+fmt.Sprint(m.Genres))
+		}
+	}
+	resp["count"] = len(list)
+	resp["types"] = types
+	resp["with_genres"] = withGenres
+	resp["samples"] = samples
 	writeJSON(w, http.StatusOK, resp)
 }
 
