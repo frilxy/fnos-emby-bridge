@@ -2302,13 +2302,37 @@ func matchGenre(m fn.MediaItem, want []string, names map[int]string) bool {
 
 func matchYear(m fn.MediaItem, years []string) bool {
 	y := yearOf(m.AirDate, m.ReleaseDate, m.FirstAirDate)
+	if y <= 0 {
+		return false
+	}
 	for _, s := range years {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		// 飞牛按年代合并：2001/2002 → "2000s"；同时兼容客户端发单年 "2001"。
+		if strings.HasSuffix(strings.ToLower(s), "s") {
+			var decade int
+			if _, err := fmt.Sscanf(strings.TrimSuffix(s, "s"), "%d", &decade); err == nil &&
+				decade == y/10*10 {
+				return true
+			}
+			continue
+		}
 		var n int
 		if _, err := fmt.Sscanf(s, "%d", &n); err == nil && n == y {
 			return true
 		}
 	}
 	return false
+}
+
+// decadeOf 把年份转成飞牛筛选使用的年代标签（2001 → 2000s）。
+func decadeOf(y int) string {
+	if y <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%ds", y/10*10)
 }
 
 func matchCountry(m fn.MediaItem, want []string) bool {
@@ -5240,18 +5264,20 @@ func (h *Handler) filterDictFor(ctx context.Context, client *fn.Client, parentID
 				}
 			}
 			if list, e := h.typedItems(ctx, client, parentID, []string{"Movie", "TV", "Video", "Directory"}, 0); e == nil {
-				years := map[int]bool{}
+				decades := map[string]bool{}
 				ratings := map[string]bool{}
 				for _, m := range list {
 					if y := yearOf(m.AirDate, m.ReleaseDate, m.FirstAirDate); y > 0 {
-						years[y] = true
+						if d := decadeOf(y); d != "" {
+							decades[d] = true
+						}
 					}
 					if r := strings.ToUpper(strings.TrimSpace(string(m.ContentRatings))); r != "" {
 						ratings[r] = true
 					}
 				}
-				for y := range years {
-					fd.Years = append(fd.Years, strconv.Itoa(y))
+				for d := range decades {
+					fd.Years = append(fd.Years, d)
 				}
 				for r := range ratings {
 					fd.Ratings = append(fd.Ratings, r)

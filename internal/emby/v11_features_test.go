@@ -242,6 +242,38 @@ func TestGenresFiltersAndDictionary(t *testing.T) {
 		t.Fatalf("GenreIds=1 应返回剧情条目：%s", body)
 	}
 
+	// 年份按飞牛习惯合并为年代；Yamby 不应同时出现 2020 和 2020s。
+	body = getWithToken(t, bridge.URL+"/Years?ParentId=lib_tv", token)
+	var yres struct {
+		Items []map[string]any `json:"Items"`
+	}
+	if err := json.Unmarshal(body, &yres); err != nil {
+		t.Fatalf("/Years decode: %s", body)
+	}
+	foundDecade := false
+	for _, it := range yres.Items {
+		if fmt.Sprint(it["Name"]) == "2020s" {
+			foundDecade = true
+		}
+		if fmt.Sprint(it["Name"]) == "2020" {
+			t.Fatalf("/Years 应只返回年代（2020s），不应再有单年 2020：%s", body)
+		}
+	}
+	if !foundDecade {
+		t.Fatalf("/Years 应包含 2020s：%s", body)
+	}
+	body = getWithToken(t, bridge.URL+"/Items?Years=2020s&IncludeItemTypes=Movie,Series", token)
+	ids = idsOf(decodeItems(t, body))
+	found = false
+	for _, id := range ids {
+		if id == "fv_tv2" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Years=2020s 应包含 fv_tv2：%v", ids)
+	}
+
 	body = getWithToken(t, bridge.URL+"/Items/Filters?ParentId=lib_tv", token)
 	var f map[string]any
 	if err := json.Unmarshal(body, &f); err != nil {

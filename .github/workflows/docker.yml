@@ -6,7 +6,6 @@ on:
       - main
     tags:
       - "v*"
-      - "b*"
   workflow_dispatch:
 
 env:

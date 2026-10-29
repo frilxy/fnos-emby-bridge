@@ -23,16 +23,14 @@
 | 类型 / Genres | ✅ 飞牛 `genres` id 经 `/tag/genres` 映射为名称，详情/筛选可用 |
 | 标签 / Tags | ❌ 飞牛 item 接口没有用户标签字段；`/Tags`、`Tags`、`TagItems` 只能返回空 |
 | 官方分级 / OfficialRating | ✅ 来自 `content_ratings` |
-| 年份 / 国家 / 工作室 | 年份、国家支持；工作室飞牛无数据，返回空 |
+| 年份 / 国家 / 工作室 | 年份按飞牛习惯合并为**年代**（`2000s`，同时兼容单年筛选）；国家支持；工作室飞牛无数据 |
 | 人物 / Persons | ✅ 演员/导演等 |
 
 ## 版本号约定
 
-- **正式版**：`1.x.y`（tag `v1.x.y`）。
-- **预发布版**：`1.x.y-b###`（manifest），tag / Docker 镜像用 `b###`（`b001`、`b002`…）。
-  fnOS 应用中心比较版本时会忽略 `-b###` 后缀，所以**每次修改要同时递增补丁号和构建号**
-  （如 `1.1.3-b003` → `1.1.4-b004`），否则会报「已安装相同版本」。
-  fnOS/fnpack 要求 manifest 为 `x.y.z[-r]` 形态，因此不能直接写成裸 `b001`。
+- 只发**正式版**：`1.x.y`，tag `v1.x.y`，全部为普通 Release，不再使用预发布/构建号后缀。
+- 每次修改递增 patch：`1.1.13` → `1.1.14`；安装器按数字段比较，不会报「已安装相同版本」。
+- Docker 镜像同步使用 `1.1.x` 标签，`latest` 跟随最新 `v*`。
 
 ## v1.1 新增
 
@@ -82,7 +80,7 @@
 ```yaml
 services:
   fnos-emby-bridge:
-    image: ghcr.io/frilxy/fnos-emby-bridge:b012
+    image: ghcr.io/frilxy/fnos-emby-bridge:1.1.13
     container_name: fnos-emby-bridge
     restart: unless-stopped
     ports: ["8096:8096"]

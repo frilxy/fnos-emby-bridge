@@ -3,184 +3,27 @@
 本项目（**飞牛影视 Emby 桥接**）的版本历史。每个版本的改动都附带**实机验证依据**
 （客户端日志 / 官方 API 文档）。
 
-## b012（预发布，构建号）
+## 1.1.13
 
-- **类型字典兜底**：普通用户 token 取 `/tag/genres` 失败时，自动用 admin token 再取一次；
-  避免 Yamby 的“类型”为空。
-- **请求诊断**：新增仅 loopback 可读的 `GET /debug/requests`，保留最近 300 条
-  方法/路径/状态/客户端标识（`api_key` 已打码），用于确认 Yamby 搜索/筛选实际走了哪个端点。
-- 包含 b011 的 GenreIds/按库 Genres 与搜索诊断。
+从本版起只发 `1.1.x` 正式版，不再使用预发布/构建号后缀。
 
-## b011（预发布，构建号）
-
-- **类型筛选支持 `GenreIds`**：Yamby 常用 id 形式筛选；桥接会把数字 id 映射成类型名再过滤。
-- **`/Genres` 按 `ParentId` 返回该库实际存在的类型**，不再把全站类型都列出来。
-- **搜索诊断日志**：`[search] term=... fn_results=...`，便于确认 Yamby 搜索到底有没有命中。
-- `/Search/Hints` 支持 POST body 里的 `SearchTerm`（少数客户端这样发）。
-- 包含 b010 的搜索回退与 Yamby 兼容。
-
-## b010（预发布，构建号）
-
-- **Yamby 搜索兼容**：
-  - `/Search/Hints`、`/Users/{uid}/Search/Hints` 同时支持 GET/POST；
-  - 飞牛 `search/list` 返回 **200 + 空数组** 时也回退库内标题搜索（之前只在 500/404 时回退，
-    Yamby 会显示无结果）。
-- 标签/类型说明：类型（Genres）已支持；标签（Tags）飞牛接口没有该数据，桥接只能返回空，
-  不是过滤掉了。详见 README。
-
-## b009（预发布，构建号）
-
-- **修复搜索 500**：Rodel 搜索页请求 `/Items?SearchTerm=...` 时，飞牛
-  `/v/api/v1/search/list` 返回 500/404，桥接直接把 500 透给客户端 → “搜索不可用”。
-  现在 `searchItems` 失败会自动回退到**库内标题搜索**（片名/原名/剧名/文件名），
-  返回 200 + 结果。
-- **新增 `/Search/Hints`**（含 `/Users/{uid}/Search/Hints`）：返回标准
-  `{"SearchHints":[...],"TotalRecordCount":N}`，不再落到兜底的 `{"Items":[]}` 形状。
-- 包含 b008 的季封面/季详情兜底、b007 的 TV 封面/详情。
-
-## b008（预发布，构建号）
-
-针对「剧集每季的图片没有」：
-
-- **图片 parent 链改用 `itemDetailAnywhere`**：季没有自己的 poster/backdrop 时，要沿
-  parent 找剧的海报；之前这条链仍用普通 `itemDetail`，剧详情 404 时季图就变成 1×1。
-- **季详情兜底**：`item/{seasonGuid}` 404 时，遍历 TV 剧的 `season/list` 找回该季，
-  季详情和季封面都能正常返回。
-- 包含 b007 的 TV Latest/封面/详情修复，b006 的宽高比/季海报，b005 的播放修复。
-
-## b007（预发布，构建号）
-
-针对「电视库封面是横版艺术图、点进 TV 库无封面、点剧集无内容」：
-
-- **TV 库 Latest 默认返回剧容器**：之前为符合 Emby「TV 库返回最新集」的语义，默认返回
-  Episode；Rodel 的 TV 行因此显示每集的横版剧照。现在默认返回 Series（竖版封面），
-  客户端显式带 `IncludeItemTypes=Episode` 时才返回最新集。
-- **ImageTags.Primary 始终声明**：TV 剧条目经常只有 backdrop、没有 poster；之前 Primary
-  只在有 poster 时声明，客户端根本不发封面请求 → 电视库空白。现在始终给 Primary tag，
-  handler 再依次用季海报/backdrop 兜底。
-- **TV 详情兜底**：`item/{guid}` 对部分 TV 剧返回 404 时，改从 `item/list` 的库列表里
-  按 guid 找条目，详情页不再 404、点剧集不再「没有内容」。
-- 包含 b006 的主图宽高比/季海报修复与 b005 的播放 token 修复。
-
-## b006（预发布，构建号）
-
-针对「电影/AV 封面正常，电视节目封面不对」：
-
-- **`PrimaryImageAspectRatio` 按实际尺寸输出**：飞牛 TV/集的 poster 常是 16:9 横图，
-  之前固定 0.6667 会让客户端按竖版卡片裁剪，显示成错误构图。现在用
-  `poster_width/poster_height` 计算；无尺寸才回退 0.6667。
-- **TV 优先用季海报**：剧条目 poster 为空或为横图时，先找该剧第一季的**竖版**海报
-  （同一作品），再退回自己的 backdrop；不借别的剧海报。
-- 包含 b005 的播放 401 修复。
-
-## b005（预发布，构建号）
-
-- **修复播放 401**：`streamURL` 之前只读 `X-Emby-Token`/query，漏掉
-  `X-Emby-Authorization: MediaBrowser ..., Token="..."`；现在统一走 `h.apiKey()`，
-  生成的流 URL 会带 `api_key`，MPV/播放器直连不再 401。
-- **修复 PlaybackInfo 崩溃**：`PlaySessionId` 用 `id[:12]`，短 id 会 slice 越界；已加保护。
-- **电视图片兜底调整**：Primary 先找同剧/季的 parent 图，再退回自己的 backdrop；
-  不再用“库内第一张图”给 TV 兜底，避免电视节目显示成别的剧海报。
-- 包含 b004 的图片公开/会话 client/playinfo 兜底。
-
-## b004（预发布，构建号）
-
-针对「演员图正常、内容图全空」的修复（演员图走 tag 直连，不经过 item 详情，说明问题在
-内容图的条目解析/鉴权链路）：
-
-- **图片端点公开**：`/Items/{id}/Images/...`、`/Users/{uid}/Items/{id}/Images/...` 不再要求
-  token（很多客户端的图片组件不会带 token）；图片 handler 会自动选一个**有效登录会话**的
-  飞牛 client，而不是回落到可能已过期的 admin token。
-- **item 详情兜底**：图片解析 `item/{guid}` 失败时用 `play/info` 的 poster/backdrop；
-  还没有就沿 parent 链（集→季→剧）找图。
-- **竖版位兜底**：Primary 没有海报时用横版 backdrop；Backdrop 没有横图时用海报。
-- 无图/上游失败会打印 `[poster] item=<id> type=<type> img=<type> ...`，便于定位。
-- 版本：`1.1.4-b004`（tag/镜像 `b004`）。
-
-## b003（预发布，构建号）
-
-- **修正预发布版本策略**：实测 fnOS 应用中心对 `1.1.2-b001` 与 `1.1.2-b002` 仍判定为
-  同一版本（忽略 `-b###` 后缀），导致 b002 无法覆盖安装。从本版起**补丁号与构建号一起递增**：
-  `1.1.3-b003`，下一版 `1.1.4-b004`。
-- 内容包含 b002 的图片修复（图片路径哈希 tag、去掉 304、Content-Length/Content-Type 兜底）。
-
-## b002（预发布，构建号）
-
-针对「所有图片不显示」的修复：
-
-- **图片 tag 改为路径哈希**：`ImageTags.Primary/Logo/Backdrop/...` 与
-  `BackdropImageTags` 不再用固定的 `"Primary"`/`"0"`，而是图片路径的短哈希。
-  海报/背景图变化或旧缓存是 1×1 占位图时，客户端 URL 会变，从而重新拉取。
-- **去掉图片 304**：部分客户端（含小幻影视）对图片条件请求处理不一致，304 可能被当成
-  空响应显示为空白；现在条件请求也返回 200 + 图片。
-- **补 Content-Length / Content-Type 兜底**：上游没给图片类型时按扩展名推断；
-  非图片响应会打日志，便于定位。
-- 图片失败时仍回 1×1 PNG，但带 `Cache-Control: no-store`，避免被长期缓存。
-
-## b001（预发布，构建号）
-
-预发布版从本版起使用 **`b` + 三位构建号**（b001、b002…），每次修改递增；正式版仍用
-`1.x.y`。
-
-- fnOS/fnpack 要求 manifest 版本为 `x.y.z[-r]`，所以 manifest 写成
-  **`1.1.2-b001`**，Release/镜像 tag 用 **`b001`**（不带 v）。
-- 工作流支持 `b*` tag；Docker 镜像打 `b001` 标签（不打 latest）。
-- 内容包含 v1.1.1 的小幻影视 token 刷新与详情 404 修复。
-
-## v1.1.1（预发布）
-
-针对小幻影视 v2.2610.32 实测日志的兼容修复：
-
-- **修复 token 刷新 401 循环**：新增 `POST /Users/{id}/Authenticate`（Emby 的按 id
-  刷新入口），并列入免鉴权路径；body/query 里的 `Pw` 都支持。此前该路径被
-  `requireAuth` 拦成 401，客户端会反复重试登录。
-- **修复部分条目详情 404**：`item/{guid}` 失败时用 `play/info` 兜底（仅当返回的
-  `Guid` 与请求 id 一致，避免把剧 guid 误当下一集）；404 时打印 item id 与飞牛错误，
-  便于继续排查。
-- **play/list 优先 `item_guid`**：少数版本把媒体文件 guid 放在 `guid`，直接当条目
-  id 会导致详情 404；现在优先用 `item_guid`/`itemGuid`。
-- 新增回归：`TestAuthenticateByIDAndDetailFallback`（刷新入口免 token、play/info 兜底）。
-
-## v1.1.0（预发布）
-
-这一版把「能看」补齐到 Emby 客户端常用的查询/筛选/字幕/多用户语义。12 项：
-
-- **搜索**：`/Items?SearchTerm=` 与 `/Users/{uid}/Items?SearchTerm=` 接飞牛
-  `GET /v/api/v1/search/list?q=`；按 IncludeItemTypes 过滤、桥接侧分页；兼容只认
-  POST body 的版本。
-- **真实入库时间**：解析 `item/list` / `item/{guid}` 的 `create_time`（秒/毫秒/日期串），
-  写入 `DateCreated`；缺失才回退首播日期，不再用 `time.Now()`。
-- **排序语义**：`SortBy` 支持多键（如 `ProductionYear,PremiereDate`），
-  `DateCreated` 与 `PremiereDate` 分离，新增 `PlayCount`；`Random` 首页随机、
-  翻页复用同一 seed（避免分页重复/漏项）；`/Shows/{id}/Seasons|Episodes` 也支持 SortBy。
-- **元数据**：解析并输出 `Genres`/`GenreItems`、`OriginalTitle`、`OfficialRating`
-  （content_ratings）、`ProductionLocations`（production_countries）、`EndDate`
-  （last_air_date）、`ProviderIds`（IMDb/TMDB/豆瓣）与外部链接。
-- **筛选**：`Genres`、`Years`、`OfficialRatings`、`Countries`、`Is4K`、`IsHD`、
-  `Filters`（IsPlayed/IsUnplayed/IsResumable/IsFavorite/Likes）、`ExcludeItemTypes`、
-  `Ids`、`NameStartsWith`、`MinCommunityRating`；`/Genres`、`/Years`、
-  `/OfficialRatings`、`/Items/Filters` 返回真实字典。
-- **Latest / NextUp**：TV 库的 `Latest` 返回最新**集**（带 SeriesId）；
-  `/Shows/NextUp` 无 SeriesId 时也能跨剧返回"下一集"。
-- **继续观看**：优先用 `GET /v/api/v1/play/list`，失败回退全库扫描；缓存按用户隔离，
-  不再共用 admin 客户端；支持 ParentId/StartIndex/Limit。
-- **外挂字幕**：`/Videos/{id}/{msId}/Subtitles/{index}/Stream.{fmt}` 从
-  `stream/list.subtitle_streams` 找外挂轨，代理 `/v/api/v1/subtitle/dl/{guid}`；
-  内嵌字幕仍由客户端直读容器（返回 404）。
-- **图片**：支持官方完整路径
-  `/Items/{id}/Images/{type}/{index}/{tag}/{format}/{maxWidth}/{maxHeight}/...`、
-  多背景图（BackdropImageTags/索引）、ETag/Cache-Control/304。
-- **评分 / 隐藏继续观看**：`POST/DELETE /Users/{uid}/Items/{id}/Rating?Likes=`、
-  `POST /Users/{uid}/Items/{id}/HideFromResume?Hide=` 落本地用户状态，并在
-  UserData.Likes / Resume 中生效。
-- **多用户与鉴权**：User.Id/Name 按飞牛账号派生，`/Users/Me`、`/Users/Public` 反映真实
-  登录用户；除握手/登录/品牌/本地化外，媒体端点默认要求有效 token（无 token/错误 token
-  返回 401）；兼容 `X-Emby-Authorization` 头。排障可用 `ALLOW_ANON=1` 临时放开。
-- **缓存与请求合并**：媒体库/详情/play-info/stream-list/search/tag 字典加 TTL 缓存与
-  singleflight；写进度/已看/收藏/评分后失效相关缓存。
-
-> 测试：`go test ./...` 覆盖上述行为（`internal/emby/v11_features_test.go`）；发布前请按
-> Release 说明里的"测试方法"在真实客户端上再验一遍。
+- **年份筛选统一为年代**：飞牛按 `2000s`、`2010s` 合并；`/Years` 与 `/Items/Filters`
+  只返回年代，不再同时出现 `2020` 和 `2020s`。筛选仍兼容客户端发单年（如 `2020`）。
+- **类型筛选**：`/Genres` 支持 `ParentId`，按库返回实际类型；支持 `Genres`（名称）与
+  `GenreIds`（数字 id）；用户 token 取类型失败时用 admin 兜底。
+- **搜索**：飞牛 `search/list` 500/404 或返回空数组时回退库内标题搜索；新增
+  `/Search/Hints`（GET/POST）返回标准 `SearchHintResult`，修复搜索页 500/无结果。
+- **TV/季封面与详情**：`ImageTags.Primary` 始终声明；TV 无 poster 时先用季竖版海报，
+  再退回自己的 backdrop；TV 详情 `item/{guid}` 404 时从库列表兜底；季详情/季封面
+  通过 `season/list` 兜底；TV 库 `Latest` 默认返回剧容器，避免横版剧照当封面。
+- **播放**：流 URL 使用 `X-Emby-Authorization` 里的 Token，MPV 不再 401；
+  `PlaySessionId` 短 id 越界保护。
+- **图片**：图片端点公开并自动选有效登录会话；图片 tag 改为路径哈希，去掉 304，
+  避免客户端缓存 1×1 空白图。
+- **详情/认证**：新增 `/Users/{id}/Authenticate` 免鉴权；详情 `item/{guid}` 失败时用
+  `play/info`/库列表兜底；`play/list` 优先 `item_guid`。
+- **元数据**：Genres、官方分级、年份、国家、人物支持；Tags/工作室飞牛无数据，返回空。
+- **诊断**：仅 loopback 可读的 `/debug/requests` 保留最近 300 条请求，便于定位客户端端点。
 
 ## v1.0.17
 
