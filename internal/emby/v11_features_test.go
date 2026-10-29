@@ -577,7 +577,7 @@ func TestSearchFallbackAndHints(t *testing.T) {
 }
 
 func TestOtherLibraryFiltersIncludeVideo(t *testing.T) {
-	bridge, token := newV11Bridge(t, mock.WithOtherLibrary())
+	bridge, token := newV11Bridge(t, mock.WithOtherLibrary(), mock.WithStripListGenres())
 	mock.SetItemField("fv_vid", "air_date", "2024-01-01")
 	mock.SetItemField("fv_vid", "genres", []int{1})
 

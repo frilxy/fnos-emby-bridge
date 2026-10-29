@@ -1564,6 +1564,11 @@ func (h *Handler) handleItems(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"Error": err.Error(), "Items": []any{}})
 		return
 	}
+	// 飞牛 item/list 对部分库（尤其 AV/Other）不返回 genres；只按 item/list 过滤会全空。
+	// 有类型筛选时，从 item/{guid} 并发补齐缺失的 genres，再做本地 matchGenre。
+	if len(all) > 0 && (queryGet(q, "Genres") != "" || queryGet(q, "GenreIds") != "") {
+		h.hydrateItemGenres(ctx, client, all)
+	}
 	writeItems(all)
 }
 
@@ -1715,6 +1720,38 @@ func allItemsAreVideo(items []fn.MediaItem) bool {
 		}
 	}
 	return true
+}
+
+// hydrateItemGenres 对 item/list 缺 genres 的条目从 item/{guid} 补齐。
+// 只在有类型筛选时调用；最多 8 并发，itemDetail 有 30s 缓存。
+func (h *Handler) hydrateItemGenres(ctx context.Context, client *fn.Client, list []fn.MediaItem) {
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	hydrated := 0
+	var mu sync.Mutex
+	for i := range list {
+		if len(list[i].Genres) > 0 {
+			continue
+		}
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			det, err := h.itemDetail(ctx, client, list[i].Guid)
+			if err != nil || det == nil || len(det.Genres) == 0 {
+				return
+			}
+			list[i].Genres = det.Genres
+			mu.Lock()
+			hydrated++
+			mu.Unlock()
+		}(i)
+	}
+	wg.Wait()
+	if hydrated > 0 {
+		log.Printf("[genres] 从详情补齐 %d/%d 条目的 genres", hydrated, len(list))
+	}
 }
 
 // isOtherLibrary 判断 parentID 是否为 Other/HomeVideo 类库。
@@ -2140,7 +2177,11 @@ func (h *Handler) handleDebugLibrary(w http.ResponseWriter, r *http.Request) {
 			withGenres++
 		}
 		if len(samples) < 5 {
-			samples = append(samples, m.Guid+":"+m.Title+":genres="+fmt.Sprint(m.Genres))
+			detailGenres := ""
+			if det, err := h.itemDetail(ctx, h.FN, m.Guid); err == nil && det != nil {
+				detailGenres = fmt.Sprint(det.Genres)
+			}
+			samples = append(samples, m.Guid+":"+m.Title+":list_genres="+fmt.Sprint(m.Genres)+":detail_genres="+detailGenres)
 		}
 	}
 	resp["count"] = len(list)

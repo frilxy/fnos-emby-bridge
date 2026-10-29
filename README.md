@@ -30,7 +30,7 @@
 
 - 只发**正式版**：`1.x.y`，tag `v1.x.y`，全部为普通 Release，不再使用预发布/构建号后缀。
 - 每次修改递增 patch：`1.1.13` → `1.1.14`；安装器按数字段比较，不会报「已安装相同版本」。
-- Docker 镜像同步使用 `1.1.x` 标签，`latest` 跟随最新 `v*`。
+- 只发布原生 fpk；不再构建 Docker 镜像。
 
 ## v1.1 新增
 
@@ -75,29 +75,6 @@
 > 随机密码（随机值只写在文件里、没人会看到，反而与真正生效的凭据不一致）。现在没设密码、
 > 或仍沿用 `admin123` 时服务会**拒绝启动**，并在应用中心给出提示，引导你显式设置。
 
-### 方式 B：Docker
-
-```yaml
-services:
-  fnos-emby-bridge:
-    image: ghcr.io/frilxy/fnos-emby-bridge:1.1.18
-    container_name: fnos-emby-bridge
-    restart: unless-stopped
-    ports: ["8096:8096"]
-    environment:
-      - PORT=8096
-      - ADMIN_USER=admin
-      - ADMIN_PASS=<强密码>
-      - CONFIG_PATH=/data/bridge-config.json
-      - FNOS_BASE=http://<NAS_IP>:8005
-      - FNOS_USER=<飞牛影视账号>
-      - FNOS_PASS=<飞牛影视密码>
-    volumes:
-      - ./data:/data
-```
-
-镜像由本仓库的 Docker 工作流构建（amd64/arm64），也可用 `:latest`（指向最新 Release）。
-
 ---
 
 ## 客户端连接
@@ -127,7 +104,7 @@ services:
 | `ALLOW_ANON` | 排障用：`1` 时允许无 token 访问媒体端点（默认严格鉴权，不建议长期开启） |
 
 > 飞牛影视实际端口是 **8005**（上游 `main.go` 注释里的示例端口是错的）。
-> 容器/应用内不要用 `127.0.0.1` 访问飞牛影视。
+> 应用内不要用 `127.0.0.1` 访问飞牛影视（除非与影视服务同网络命名空间）。
 
 ---
 

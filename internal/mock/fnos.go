@@ -132,10 +132,11 @@ func MockReset() {
 type Option func(*mockOpts)
 
 type mockOpts struct {
-	otherLibrary bool
-	tvLibrary    bool
-	brokenDetail string
-	brokenSearch bool
+	otherLibrary    bool
+	tvLibrary       bool
+	brokenDetail    string
+	brokenSearch    bool
+	stripListGenres bool
 }
 
 // WithOtherLibrary 额外提供一个 Other 类库（条目 type=Video）。
@@ -153,6 +154,12 @@ func WithBrokenDetail(guid string) Option {
 // WithTVLibrary 增加一个 TV 类库（含季/集），用于验证 Latest 剧集语义与 NextUp。
 func WithTVLibrary() Option {
 	return func(o *mockOpts) { o.tvLibrary = true }
+}
+
+// WithStripListGenres 让 item/list 不返回 genres（模拟 AV/Other 库），
+// 验证桥接从 item/{guid} 补齐 genres 后再按类型筛选。
+func WithStripListGenres() Option {
+	return func(o *mockOpts) { o.stripListGenres = true }
 }
 
 // WithBrokenSearch 让 /search/list 返回 500，验证桥接的库内标题搜索兜底。
@@ -310,6 +317,16 @@ func NewHandler(cloudDirect bool, cdnBase string, opts ...Option) *http.ServeMux
 		sort.SliceStable(list, func(i, j int) bool {
 			return int64Of(list[i]["create_time"]) > int64Of(list[j]["create_time"])
 		})
+		if o.stripListGenres {
+			for i, it := range list {
+				cp := make(map[string]any, len(it))
+				for k, v := range it {
+					cp[k] = v
+				}
+				delete(cp, "genres")
+				list[i] = cp
+			}
+		}
 		writeResult(w, 0, "", map[string]any{"list": list, "total": len(list)})
 	})
 
