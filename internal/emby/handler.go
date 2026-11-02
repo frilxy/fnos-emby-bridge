@@ -3055,7 +3055,7 @@ func (h *Handler) handleViews(w http.ResponseWriter, r *http.Request) {
 			"IsFolder":                true,
 			"CanDelete":               false,
 			"ServerId":                h.ServerID,
-			"ImageTags":               map[string]any{"Primary": "Primary"},
+			"ImageTags":               map[string]any{"Primary": collageTag(db.Guid)},
 			"PrimaryImageAspectRatio": 0.6667,
 		}
 		if cat := collectionType(db.Category); cat != "" {
@@ -4567,6 +4567,18 @@ func (h *Handler) handleItemImage(w http.ResponseWriter, r *http.Request) {
 		servePNG()
 		return
 	}
+	// 媒体库封面：用库内 3 张海报拼接（飞牛原生库封面效果），失败再走旧兜底。
+	if item.Type == "MediaDB" && imgType == "primary" {
+		if data, err := h.libraryCollage(r.Context(), client, id); err == nil && len(data) > 0 {
+			w.Header().Set("Content-Type", "image/jpeg")
+			w.Header().Set("Cache-Control", "public, max-age=1800")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(data)
+			return
+		} else if err != nil {
+			log.Printf("[collage] 库 %s 封面失败，回退单图: %v", id, err)
+		}
+	}
 	p := item.PosterPath()
 	switch imgType {
 	case "logo":
@@ -4915,6 +4927,10 @@ func imageTags(m fn.MediaItem) map[string]any {
 		primary = "primary" // 交给 handleItemImage 再做季/parent 兜底
 	}
 	tags["Primary"] = imageTagFor(primary)
+	// 媒体库（MediaDB）使用桥接生成的 3 张海报拼接封面；tag 跟时间桶变化。
+	if m.Type == "MediaDB" {
+		tags["Primary"] = collageTag(m.Guid)
+	}
 	if p := m.LogoPath(); p != "" {
 		tags["Logo"] = imageTagFor(p)
 	} else if m.Type == "Season" || m.Type == "Episode" {

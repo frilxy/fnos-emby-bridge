@@ -3,6 +3,8 @@ package emby_test
 import (
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/jpeg"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -573,6 +575,41 @@ func TestSearchFallbackAndHints(t *testing.T) {
 	}
 	if fmt.Sprint(hints.SearchHints[0]["Type"]) != "Movie" || fmt.Sprint(hints.SearchHints[0]["Name"]) != "电影A" {
 		t.Fatalf("SearchHint 字段不对：%v", hints.SearchHints[0])
+	}
+}
+
+func TestLibraryCollageCover(t *testing.T) {
+	bridge, token := newV11Bridge(t)
+	views := getWithToken(t, bridge.URL+"/UserViews", token)
+	var vr struct {
+		Items []map[string]any `json:"Items"`
+	}
+	if err := json.Unmarshal(views, &vr); err != nil || len(vr.Items) == 0 {
+		t.Fatalf("/UserViews decode: %s", views)
+	}
+	tags, _ := vr.Items[0]["ImageTags"].(map[string]any)
+	if got := fmt.Sprint(tags["Primary"]); !strings.HasPrefix(got, "c") {
+		t.Fatalf("媒体库 Primary tag 应为 collage tag（c...），实际 %q", got)
+	}
+	req, _ := http.NewRequest(http.MethodGet, bridge.URL+"/Items/lib_001/Images/Primary", nil)
+	req.Header.Set("X-Emby-Token", token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("library image: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("库封面应 200，实际 %d", resp.StatusCode)
+	}
+	img, format, err := image.Decode(resp.Body)
+	if err != nil {
+		t.Fatalf("库封面应可解码：%v", err)
+	}
+	if format != "jpeg" {
+		t.Fatalf("库封面应为 jpeg，实际 %s", format)
+	}
+	if b := img.Bounds(); b.Dx() != 600 || b.Dy() != 900 {
+		t.Fatalf("库封面应为 600x900，实际 %dx%d", b.Dx(), b.Dy())
 	}
 }
 

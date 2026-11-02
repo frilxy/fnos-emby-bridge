@@ -14,8 +14,12 @@
 package mock
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"net/http"
 	"sort"
@@ -569,7 +573,7 @@ func NewHandler(cloudDirect bool, cdnBase string, opts ...Option) *http.ServeMux
 	})
 
 	// 0.9.8 海报端点：/v/api/v1/sys/img/{path}?w=400（mock 不校验 relay cookie）
-	mux.HandleFunc("GET /v/api/v1/sys/img/{rest}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /v/api/v1/sys/img/{rest...}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/webp")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(png1x1())
@@ -677,12 +681,13 @@ func str(v any) string {
 
 // 1x1 透明 PNG，用于模拟 poster
 func png1x1() []byte {
-	return []byte{
-		0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
-		0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-		0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00,
-		0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
-		0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2B, 0x3E, 0x00, 0x00, 0x00, 0x00, 0x49,
-		0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+	img := image.NewRGBA(image.Rect(0, 0, 2, 3))
+	for y := 0; y < 3; y++ {
+		for x := 0; x < 2; x++ {
+			img.SetRGBA(x, y, color.RGBA{R: 40, G: 80, B: 120, A: 255})
+		}
 	}
+	var b bytes.Buffer
+	_ = png.Encode(&b, img)
+	return b.Bytes()
 }
