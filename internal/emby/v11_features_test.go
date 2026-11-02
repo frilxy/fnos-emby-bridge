@@ -608,8 +608,8 @@ func TestLibraryCollageCover(t *testing.T) {
 	if format != "jpeg" {
 		t.Fatalf("库封面应为 jpeg，实际 %s", format)
 	}
-	if b := img.Bounds(); b.Dx() != 1200 || b.Dy() != 750 {
-		t.Fatalf("库封面应为 1200x750，实际 %dx%d", b.Dx(), b.Dy())
+	if b := img.Bounds(); b.Dx() != 1200 || b.Dy() != 720 {
+		t.Fatalf("库封面应为 1200x720，实际 %dx%d", b.Dx(), b.Dy())
 	}
 }
 
