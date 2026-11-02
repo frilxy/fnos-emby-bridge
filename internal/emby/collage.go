@@ -28,11 +28,12 @@ import (
 )
 
 const (
-	// 影视库卡片是横向的；竖版 600×900 会被客户端按横卡裁切，导致海报被放大。
-	// 用 1200×750 横版画布，三张 2:3 海报完整并排。
-	collageWidth  = 1200
-	collageHeight = 750
-	collageTTL    = 30 * time.Minute
+	// 影视库卡片是横向的；画布按卡片比例全幅铺满，三张海报各占 1/3，
+	// 只做轻微居中裁剪，避免黑边和之前的极端放大。
+	collageWidth         = 1200
+	collageHeight        = 720
+	collageLayoutVersion = "v3"
+	collageTTL           = 30 * time.Minute
 )
 
 func collageBucket() int64 { return time.Now().Unix() / int64(collageTTL/time.Second) }
@@ -40,7 +41,7 @@ func collageBucket() int64 { return time.Now().Unix() / int64(collageTTL/time.Se
 // collageTag 给 MediaDB 的 PrimaryImageTag：同一个 30 分钟桶内稳定，过期后变化。
 func collageTag(guid string) string {
 	h := fnv.New64a()
-	_, _ = fmt.Fprintf(h, "%s|%d", guid, collageBucket())
+	_, _ = fmt.Fprintf(h, "%s|%d|%s", guid, collageBucket(), collageLayoutVersion)
 	return fmt.Sprintf("c%x", h.Sum64())
 }
 
@@ -166,22 +167,14 @@ func composeCollage(imgs []image.Image) ([]byte, error) {
 			canvas.SetRGBA(x, y, color.RGBA{R: 18, G: 18, B: 18, A: 255})
 		}
 	}
-	const (
-		cols    = 3
-		posterW = 300
-		posterH = 450
-		gap     = 40
-	)
-	totalW := cols*posterW + (cols-1)*gap
-	startX := (collageWidth - totalW) / 2
-	startY := (collageHeight - posterH) / 2
+	const cols = 3
+	colW := collageWidth / cols
 	for i := 0; i < cols; i++ {
 		img := imgs[len(imgs)-1]
 		if i < len(imgs) {
 			img = imgs[i]
 		}
-		x := startX + i*(posterW+gap)
-		rect := image.Rect(x, startY, x+posterW, startY+posterH)
+		rect := image.Rect(i*colW, 0, (i+1)*colW, collageHeight)
 		drawCover(canvas, rect, img)
 	}
 	var buf bytes.Buffer
