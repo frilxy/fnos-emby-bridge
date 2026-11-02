@@ -3,6 +3,15 @@
 本项目（**飞牛影视 Emby 桥接**）的版本历史。每个版本的改动都附带**实机验证依据**
 （客户端日志 / 官方 API 文档）。
 
+## 1.1.21
+
+- **影视库封面默认支持 3 张海报拼接**：从库内稳定随机挑 3 个有 poster 的条目，取飞牛
+  `sys/img`，按 600×900 竖版三栏拼接成 JPEG；30 分钟轮换一次。
+  - `MediaDB` 的 `ImageTags.Primary` 改为 `collageTag`，随轮换变化，客户端会重新拉取；
+  - `/Items/{libraryGuid}/Images/Primary` 直接返回拼接封面，失败才回退旧的单图逻辑。
+- 新增 `golang.org/x/image` 依赖（解码飞牛 WebP 海报）。
+- 包含 1.1.20 服务端 `tags.genres` 类型筛选。
+
 ## 1.1.20
 
 - **类型筛选改用服务端过滤**：飞牛该库的 `item/list` 和 `item/{guid}` 都不返回 `genres`
