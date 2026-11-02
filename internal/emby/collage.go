@@ -28,8 +28,10 @@ import (
 )
 
 const (
-	collageWidth  = 600
-	collageHeight = 900
+	// 影视库卡片是横向的；竖版 600×900 会被客户端按横卡裁切，导致海报被放大。
+	// 用 1200×750 横版画布，三张 2:3 海报完整并排。
+	collageWidth  = 1200
+	collageHeight = 750
 	collageTTL    = 30 * time.Minute
 )
 
@@ -164,21 +166,23 @@ func composeCollage(imgs []image.Image) ([]byte, error) {
 			canvas.SetRGBA(x, y, color.RGBA{R: 18, G: 18, B: 18, A: 255})
 		}
 	}
-	const cols = 3
-	colW := collageWidth / cols
+	const (
+		cols    = 3
+		posterW = 300
+		posterH = 450
+		gap     = 40
+	)
+	totalW := cols*posterW + (cols-1)*gap
+	startX := (collageWidth - totalW) / 2
+	startY := (collageHeight - posterH) / 2
 	for i := 0; i < cols; i++ {
 		img := imgs[len(imgs)-1]
 		if i < len(imgs) {
 			img = imgs[i]
 		}
-		rect := image.Rect(i*colW, 0, (i+1)*colW, collageHeight)
+		x := startX + i*(posterW+gap)
+		rect := image.Rect(x, startY, x+posterW, startY+posterH)
 		drawCover(canvas, rect, img)
-		// 1px 分隔线
-		if i > 0 {
-			for y := 0; y < collageHeight; y++ {
-				canvas.SetRGBA(i*colW, y, color.RGBA{R: 8, G: 8, B: 8, A: 255})
-			}
-		}
 	}
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, canvas, &jpeg.Options{Quality: 88}); err != nil {

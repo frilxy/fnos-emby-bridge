@@ -3056,7 +3056,7 @@ func (h *Handler) handleViews(w http.ResponseWriter, r *http.Request) {
 			"CanDelete":               false,
 			"ServerId":                h.ServerID,
 			"ImageTags":               map[string]any{"Primary": collageTag(db.Guid)},
-			"PrimaryImageAspectRatio": 0.6667,
+			"PrimaryImageAspectRatio": 1.6,
 		}
 		if cat := collectionType(db.Category); cat != "" {
 			item["CollectionType"] = cat
@@ -4791,6 +4791,10 @@ func playCountOf(played bool) int {
 // primaryAspect 返回主图宽高比：飞牛 TV/集的 poster 可能是 16:9 横图，
 // 之前固定 0.6667 会让客户端按竖版裁剪，显示成错误构图。
 func primaryAspect(m fn.MediaItem) float64 {
+	// 媒体库封面是 1200×750 横版拼接图。
+	if m.Type == "MediaDB" {
+		return 1.6
+	}
 	if m.PosterWidth > 0 && m.PosterHeight > 0 {
 		a := float64(m.PosterWidth) / float64(m.PosterHeight)
 		if a > 0.4 && a < 4 {
