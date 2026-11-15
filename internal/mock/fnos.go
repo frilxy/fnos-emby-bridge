@@ -88,6 +88,14 @@ var (
 				"job": "Actor", "order": 1, "biography": "", "profile_path": ""},
 		},
 	}
+	// 人物详情夹具：per_001 带飞牛头像（在线刮削），per_002 头像为空
+	// （「其他」类型库的典型情况，需要桥接读 .actors 兜底）。
+	mockPersonDetail = map[string]map[string]any{
+		"per_001": {"guid": "per_001", "name": "演员甲", "original_name": "Actor A",
+			"profile": "/1c/09/mock_actor.webp", "biography": "演员甲简介", "is_favorite": 0},
+		"per_002": {"guid": "per_002", "name": "演员乙", "original_name": "Actor B",
+			"profile": "", "biography": "", "is_favorite": 0},
+	}
 	// 人物作品夹具：真机 person/item/list 按 job 分桶，job 缺失/为空直接返回空列表
 	// （不是"查全部"）。per_001 既是 fv_001 的演员、又是 fv_tv 的导演，
 	// 用来验证桥接按 job 逐个查再合并。
@@ -577,11 +585,18 @@ func NewHandler(cloudDirect bool, cdnBase string, opts ...Option) *http.ServeMux
 	// 流列表：供详情/字幕使用（字幕 index=3 为外挂 srt）
 	mux.HandleFunc("GET /v/api/v1/stream/list/{guid}", func(w http.ResponseWriter, r *http.Request) {
 		guid := r.PathValue("guid")
+		file := map[string]any{
+			"guid": "md_" + guid, "file_name": "a.mkv", "size": 4096, "can_play": 1,
+			"create_time": 1700000000000,
+		}
+		// 目录型测试（本地演员图 .actors 兜底）需要真实路径：条目里设了 path 就透出
+		if it, ok := items[guid]; ok {
+			if p := str(it["path"]); p != "" {
+				file["path"] = p
+			}
+		}
 		writeResult(w, 0, "", map[string]any{
-			"files": []map[string]any{{
-				"guid": "md_" + guid, "file_name": "a.mkv", "size": 4096, "can_play": 1,
-				"create_time": 1700000000000,
-			}},
+			"files": []map[string]any{file},
 			"video_streams": []map[string]any{{
 				"media_guid": "md_" + guid, "codec_name": "hevc", "width": 1920, "height": 1080,
 				"bps": 8000000, "profile": "Main 10", "bit_depth": 10, "duration": 2400,
@@ -623,14 +638,12 @@ func NewHandler(cloudDirect bool, cdnBase string, opts ...Option) *http.ServeMux
 	// GET person/{guid}：人物详情
 	mux.HandleFunc("GET /v/api/v1/person/{guid}", func(w http.ResponseWriter, r *http.Request) {
 		guid := r.PathValue("guid")
-		if _, ok := mockPersonWorks[guid]; !ok {
+		d, ok := mockPersonDetail[guid]
+		if !ok {
 			writeResult(w, 1, "person not found", nil)
 			return
 		}
-		writeResult(w, 0, "", map[string]any{
-			"guid": guid, "name": "演员甲", "original_name": "Actor A",
-			"profile": "/1c/09/mock_actor.webp", "biography": "演员甲简介", "is_favorite": 0,
-		})
+		writeResult(w, 0, "", d)
 	})
 	// POST person/item/list：某人物参演作品，**job 必填**——缺省/为空返回空列表，
 	// 与真机一致（真机 nginx 日志：同人物 4 次请求 3 次 48 字节空响应）。
