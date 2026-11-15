@@ -156,10 +156,10 @@ GitHub Actions：
 
 ```bash
 # 1) 只列清单（dry-run）
-sudo ./actorart -config /vol5/@appdata/fnos-emby-bridge/bridge-config.json
+sudo ./actorart                       # 自动找配置（@appconf / @appdata、bridge.env / bridge-config.json）
 
 # 2) 确认后写入（自动生成备份 json）
-sudo ./actorart -config /vol5/@appdata/fnos-emby-bridge/bridge-config.json -apply
+sudo ./actorart -apply
 
 # 3) 需要时回滚
 sudo ./actorart -restore actorart-backup-<时间>.json

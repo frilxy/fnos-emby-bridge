@@ -177,9 +177,11 @@ func defaultConfigPath() string {
 		return p
 	}
 	for _, vol := range []string{"/vol1", "/vol2", "/vol3", "/vol4", "/vol5", "/vol6"} {
-		root := vol + "/@appdata/fnos-emby-bridge"
-		if p := findConfigFile(root, 0); p != "" {
-			return p
+		// 不同 fnOS 版本把应用配置放在 @appconf 或 @appdata 下，两个都找
+		for _, base := range []string{"/@appconf/fnos-emby-bridge", "/@appdata/fnos-emby-bridge"} {
+			if p := findConfigFile(vol+base, 0); p != "" {
+				return p
+			}
 		}
 	}
 	return "bridge.config.json"
