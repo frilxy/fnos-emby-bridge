@@ -1159,11 +1159,30 @@ func (h *Handler) servePersonImage(w http.ResponseWriter, r *http.Request, perso
 	servePlaceholderPNG(w)
 }
 
-// personImageTag 人物头像 tag：没有飞牛头像时用 `person:<guid>` 标记，
+// personImageTag 人物头像 tag：没有飞牛头像时用 `person:<guid>:<ver>` 标记，
 // 让客户端照常来请求图片，桥接再用本地 .actors 兜底出图。
 // （tag 为空时客户端根本不会发图片请求。）
+//
+// tag 里带 30 分钟时间桶：客户端是按「URL + tag」缓存图片的，tag 恒定的话，
+// 第一次拿到占位图（比如媒体目录还没授权）之后即使权限生效也不会重取。
+// 轮换 tag 让这类缺失在半小时内自愈。
 func personImageTag(guid string) string {
-	return base64.URLEncoding.EncodeToString([]byte("person:" + guid))
+	h := fnv.New64a()
+	_, _ = fmt.Fprintf(h, "%s|%d|person-v1", guid, collageBucket())
+	return base64.URLEncoding.EncodeToString([]byte(fmt.Sprintf("person:%s:%x", guid, h.Sum64())))
+}
+
+// parsePersonTag 解析 person:<guid>:<ver>，返回 guid。
+func parsePersonTag(s string) (string, bool) {
+	if !strings.HasPrefix(s, "person:") {
+		return "", false
+	}
+	rest := strings.TrimPrefix(s, "person:")
+	guid, _, _ := strings.Cut(rest, ":")
+	if guid == "" {
+		return "", false
+	}
+	return guid, true
 }
 
 // handleSystemConfiguration 实现 GET /System/Configuration。
@@ -4859,8 +4878,8 @@ func (h *Handler) handleItemImage(w http.ResponseWriter, r *http.Request) {
 	//   - base64url("person:<guid>")：飞牛没头像（「其他」库），交给本地 .actors 兜底
 	if len(tag) >= 8 && !strings.HasPrefix(tag, "h") {
 		if b, err := base64.URLEncoding.DecodeString(tag); err == nil && len(b) > 0 {
-			if strings.HasPrefix(string(b), "person:") {
-				h.servePersonImage(w, r, strings.TrimPrefix(string(b), "person:"))
+			if guid, ok := parsePersonTag(string(b)); ok {
+				h.servePersonImage(w, r, guid)
 				return
 			}
 			if b[0] == '/' {

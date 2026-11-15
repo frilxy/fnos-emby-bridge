@@ -32,7 +32,7 @@ const (
 	// 只做轻微居中裁剪，避免黑边和之前的极端放大。
 	collageWidth         = 1200
 	collageHeight        = 720
-	collageLayoutVersion = "v3"
+	collageLayoutVersion = "v4"
 	collageTTL           = 30 * time.Minute
 )
 
@@ -59,14 +59,8 @@ func (h *Handler) libraryCollage(ctx context.Context, client *fn.Client, libID s
 			return nil, fmt.Errorf("库 %s 没有可用的海报", libID)
 		}
 		imgs := make([]image.Image, 0, len(picks))
-		for _, it := range picks {
-			p := it.PosterPath()
-			if p == "" {
-				p = it.BackdropPath()
-			}
-			if p == "" {
-				continue
-			}
+		for _, pick := range picks {
+			p := pick.path
 			img, err := h.fetchCollageImage(ctx, client, p)
 			if err != nil {
 				log.Printf("[collage] 库 %s 取图 %q 失败: %v", libID, p, err)
@@ -94,13 +88,38 @@ func (h *Handler) libraryCollage(ctx context.Context, client *fn.Client, libID s
 	return data, nil
 }
 
-// pickCollageItems 用库 guid + 时间桶做种子，稳定随机挑 3 个有图的条目。
-func pickCollageItems(list []fn.MediaItem, libID string, bucket int64) []fn.MediaItem {
-	candidates := make([]fn.MediaItem, 0, len(list))
+// collagePick 选中的海报：条目 + 实际要取的那张图路径。
+type collagePick struct {
+	item fn.MediaItem
+	path string
+}
+
+// pickCollageItems 用库 guid + 时间桶做种子，稳定随机挑最多 3 张**互不相同**的海报。
+//
+// 只按条目去重不够：同一次刮削经常让多个条目（剧集与它的季、同一部的多个版本、
+// 目录容器与里面的视频）共用同一个 poster 路径，按条目挑 3 个会拼出 3 张一模一样的图。
+// 这里按「实际取图路径」去重，保证三栏是三张不同的海报。
+func pickCollageItems(list []fn.MediaItem, libID string, bucket int64) []collagePick {
+	seenPath := make(map[string]struct{}, len(list))
+	seenItem := make(map[string]struct{}, len(list))
+	candidates := make([]collagePick, 0, len(list))
 	for _, m := range list {
-		if m.PosterPath() != "" || m.BackdropPath() != "" {
-			candidates = append(candidates, m)
+		if _, dup := seenItem[m.Guid]; dup {
+			continue
 		}
+		p := m.PosterPath()
+		if p == "" {
+			p = m.BackdropPath()
+		}
+		if p == "" {
+			continue
+		}
+		if _, dup := seenPath[p]; dup {
+			continue
+		}
+		seenItem[m.Guid] = struct{}{}
+		seenPath[p] = struct{}{}
+		candidates = append(candidates, collagePick{item: m, path: p})
 	}
 	if len(candidates) == 0 {
 		return nil
@@ -155,10 +174,17 @@ func (h *Handler) fetchCollageImage(ctx context.Context, client *fn.Client, p st
 	return img, nil
 }
 
-// composeCollage 把 1–3 张海报按竖版三栏拼接；不足 3 张时重复最后一张。
+// composeCollage 把 1–3 张**互不相同**的海报按等宽分栏拼接。
+//
+// 只有 1 张就整幅铺满，2 张就左右各半——不再「不足 3 张时重复最后一张」：
+// 那个兜底会让库里只有一张图（或多个条目共用同一张海报）时拼出三张一样的，
+// 看起来就像封面坏了。
 func composeCollage(imgs []image.Image) ([]byte, error) {
 	if len(imgs) == 0 {
 		return nil, fmt.Errorf("没有图片")
+	}
+	if len(imgs) > 3 {
+		imgs = imgs[:3]
 	}
 	canvas := image.NewRGBA(image.Rect(0, 0, collageWidth, collageHeight))
 	// 深色底，避免透明 PNG 出现白边
@@ -167,15 +193,14 @@ func composeCollage(imgs []image.Image) ([]byte, error) {
 			canvas.SetRGBA(x, y, color.RGBA{R: 18, G: 18, B: 18, A: 255})
 		}
 	}
-	const cols = 3
+	cols := len(imgs)
 	colW := collageWidth / cols
 	for i := 0; i < cols; i++ {
-		img := imgs[len(imgs)-1]
-		if i < len(imgs) {
-			img = imgs[i]
-		}
 		rect := image.Rect(i*colW, 0, (i+1)*colW, collageHeight)
-		drawCover(canvas, rect, img)
+		if i == cols-1 {
+			rect.Max.X = collageWidth // 整除余数归到最后一行，避免右侧留缝
+		}
+		drawCover(canvas, rect, imgs[i])
 	}
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, canvas, &jpeg.Options{Quality: 88}); err != nil {

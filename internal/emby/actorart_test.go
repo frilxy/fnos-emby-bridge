@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"fnos-emby-bridge/internal/mock"
@@ -50,8 +51,8 @@ func TestActorArtFallback(t *testing.T) {
 		t.Fatalf("People[0] 无 PrimaryImageTag，客户端不会请求头像")
 	}
 	decoded, err := base64.URLEncoding.DecodeString(tag)
-	if err != nil || string(decoded) != "person:per_002" {
-		t.Fatalf("PrimaryImageTag 解出 %q want person:per_002", decoded)
+	if err != nil || !strings.HasPrefix(string(decoded), "person:per_002") {
+		t.Fatalf("PrimaryImageTag 解出 %q want person:per_002[:ver]", decoded)
 	}
 
 	// 2. /Persons 头像走本地 .actors
