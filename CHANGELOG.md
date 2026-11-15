@@ -3,23 +3,29 @@
 本项目（**飞牛影视 Emby 桥接**）的版本历史。每个版本的改动都附带**实机验证依据**
 （客户端日志 / 官方 API 文档）。
 
+## 1.1.26
+
+- **真正修复「Emby 点开演员看不到其他作品」**：`/debug/person` 实测数据表明，人物作品
+  `total=6` 全部是 `type=Video`（Other/AV 库条目），而客户端按 `IncludeItemTypes=Movie`
+  请求，`filterItemTypes` 把 Video 全部过滤掉 → 空列表。现在人物作品查询在
+  `IncludeItemTypes` 含 Movie（或未指定类型）时放行 Video；`Series`/`Episode` 分区不放行，
+  避免同一批视频在三个分区里重复出现。
+- 作品查询改回单次 `job=""`：实测空 job 就是「不按职务过滤」，一次返回全部；只有空结果时
+  才回退到按 `Actor`/`Director`/… 逐个查。人物页首屏上游请求从 5 次降到 1 次。
+
+## 1.1.25
+
+- 新增 `/debug/person` 诊断端点（仅 loopback）：把某 `person_guid` 在 `person/item/list` 上
+  各 job / 各 page_size 的原始返回与错误码摊开，用于定位人物页问题。
+- 人物作品查询加 page_size 回退（200 → 50），避免服务端对分页上限报错时静默变成空列表。
+
 ## 1.1.24
 
-- **修复「Emby 点开演员看不到其他作品」**：飞牛 `person/item/list` 的 `job` 是**必填枚举**
-  （`Actor` / `Director` / `Screenplay` / `Writer` / `Producer`），桥接此前传空 `job`，
-  服务端按「无匹配」返回空列表，人物页作品网格因此恒为空。现在按 job 逐个查询并按
-  `guid` 去重合并（同一个人可能既是演员又是导演），job 大小写自动探测。
-- **新增人物详情端点** `GET /Persons/{id}`：此前未注册，落到兜底返回 `QueryResult`
-  对象，客户端按 `BaseItemDto` 反序列化失败。现返回标准人物 DTO（名字/原名/简介/头像标签）。
-- **新增人物头像** `GET /Persons/{id}/Images/{type}`（含官方长路径），复用无状态
-  `tag` 机制代理飞牛 `sys/img`。
-- 人物详情与作品列表各加 5 分钟缓存，**缓存键带会话 token**：一次点演员会触发
-  1 次人物 + 3 次作品查询，而每次作品查询内部按 5 个 job 拉取，不缓存就是十几刀上游；
-  作品条目带按用户的观看进度，不分会话会把多用户状态串掉。
-- 实机依据：桥接 `/debug/requests` 抓到人物页请求
-  `/Users/{uid}/Items/{personId}` 与三条 `PersonIds=` 作品查询；飞牛 nginx 日志中
-  同一人物 4 次 `person/item/list` 里 3 次返回 **48 字节**空响应、1 次 4794 字节，
-  证明 `job` 是严格过滤而非可选。
+- 新增 `GET /Persons/{id}`（人物 BaseItemDto）与 `GET /Persons/{id}/Images/{type}`（人物头像，
+  含官方长路径）：此前未注册，落到兜底返回 `QueryResult` 对象，客户端按 `BaseItemDto`
+  反序列化失败。
+- 人物作品列表接入 `PersonIds=` 查询并加 5 分钟缓存（缓存键带会话 token，作品条目带
+  按用户的观看进度）。本版取到的数据仍会被类型过滤清空，实际修复见 1.1.26。
 
 ## 1.1.23
 
