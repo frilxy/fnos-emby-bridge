@@ -200,6 +200,7 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /debug/library", h.handleDebugLibrary)
 	mux.HandleFunc("GET /debug/genre-filter", h.handleDebugGenreFilter)
 	mux.HandleFunc("GET /debug/person", h.handleDebugPerson)
+	mux.HandleFunc("GET /debug/actor", h.handleDebugActor)
 	mux.HandleFunc("POST /Users/{uid}/Search/Hints", h.handleSearchHints)
 
 	mux.HandleFunc("GET /Items/{id}", h.handleItemByID)
@@ -1043,9 +1044,11 @@ func personToEmby(pd *fn.PersonDetail) map[string]any {
 			"PlaybackPositionTicks": 0,
 		},
 	}
+	tag := personImageTag(pd.Guid)
 	if pd.Profile != "" {
-		out["ImageTags"] = map[string]any{"Primary": base64.URLEncoding.EncodeToString([]byte(pd.Profile))}
+		tag = base64.URLEncoding.EncodeToString([]byte(pd.Profile))
 	}
+	out["ImageTags"] = map[string]any{"Primary": tag}
 	return out
 }
 
@@ -1123,7 +1126,16 @@ func (h *Handler) handlePersonByID(w http.ResponseWriter, r *http.Request) {
 // 头像走 sys/img 代理；客户端缓存的 URL 带 tag（base64url(profile)）时
 // 即使人物详情查不到也能直接出图。
 func (h *Handler) handlePersonImage(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+	h.servePersonImage(w, r, r.PathValue("id"))
+}
+
+// servePersonImage 人物头像，按优先级取图：
+//  1. tag 里带飞牛 sys/img 路径（客户端缓存的旧 URL）
+//  2. 人物详情里的 profile（在线刮削到的头像）
+//  3. 作品目录下的 .actors/.actor/actors/<演员名>.jpg —— 飞牛「其他」类型库
+//     从不刮演员头像，profile 恒为空，只能靠本地文件兜底
+//  4. 1x1 透明占位
+func (h *Handler) servePersonImage(w http.ResponseWriter, r *http.Request, personGuid string) {
 	_, tag, _, maxW, maxH := imagePathParams(r)
 	if len(tag) >= 8 && !strings.HasPrefix(tag, "h") {
 		if b, err := base64.URLEncoding.DecodeString(tag); err == nil && len(b) > 0 && b[0] == '/' {
@@ -1131,14 +1143,27 @@ func (h *Handler) handlePersonImage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if pd := h.personDetailFor(r.Context(), id); pd != nil && pd.Profile != "" {
+	pd := h.personDetailFor(r.Context(), personGuid)
+	if pd != nil && pd.Profile != "" {
 		h.serveSysImg(w, r, pd.Profile, maxW, maxH)
 		return
 	}
-	w.Header().Set("Content-Type", "image/png")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(png1x1())
+	name, orig := "", ""
+	if pd != nil {
+		name, orig = pd.Name, pd.OriginalName
+	}
+	if path := h.localActorArt(r.Context(), personGuid, name, orig); path != "" {
+		serveLocalImage(w, r, path)
+		return
+	}
+	servePlaceholderPNG(w)
+}
+
+// personImageTag 人物头像 tag：没有飞牛头像时用 `person:<guid>` 标记，
+// 让客户端照常来请求图片，桥接再用本地 .actors 兜底出图。
+// （tag 为空时客户端根本不会发图片请求。）
+func personImageTag(guid string) string {
+	return base64.URLEncoding.EncodeToString([]byte("person:" + guid))
 }
 
 // handleSystemConfiguration 实现 GET /System/Configuration。
@@ -2398,6 +2423,86 @@ func (h *Handler) handleDebugPerson(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// handleDebugActor 排查本地演员图（仅 loopback）。
+//
+// 飞牛「其他」类型库不刮演员头像（person 接口 profile 恒为空），演员图通常是
+// 刮削工具写进影片目录的 `.actors/演员名.jpg`。这个端点把作品路径、候选目录、
+// 目录内文件、读权限和最终命中一次摊开。
+//
+// 用法：/debug/actor?guid=<person_guid>
+func (h *Handler) handleDebugActor(w http.ResponseWriter, r *http.Request) {
+	if !loopbackOnly(r) {
+		http.NotFound(w, r)
+		return
+	}
+	q := r.URL.Query()
+	guid := queryGet(q, "guid")
+	if guid == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"Error": "需要 guid"})
+		return
+	}
+	ctx := r.Context()
+	client := h.fnOf(ctx)
+
+	out := map[string]any{"guid": guid}
+	name, orig := "", ""
+	if pd := h.personDetailFor(ctx, guid); pd != nil {
+		name, orig = pd.Name, pd.OriginalName
+		out["name"], out["original_name"], out["profile"] = pd.Name, pd.OriginalName, pd.Profile
+	} else {
+		out["detail_error"] = "查不到人物详情"
+	}
+	names := actorNames(name, orig)
+	out["name_keys"] = names
+
+	works := h.personWorks(ctx, guid)
+	out["works_count"] = len(works)
+	probes := make([]any, 0, actorArtMaxWorks)
+	for i, it := range works {
+		if i >= actorArtMaxWorks {
+			break
+		}
+		path := h.mediaPathOf(ctx, client, it.Guid)
+		entry := map[string]any{"guid": it.Guid, "title": it.Title, "path": path}
+		dir := ""
+		if path != "" {
+			dir = filepath.Dir(path)
+		}
+		entry["dir"] = dir
+		// 逐级找候选目录：作品目录本身 + 上一级（剧集常见）
+		var cands []any
+		for _, base := range []string{dir, filepath.Dir(dir)} {
+			if base == "" || base == "." {
+				continue
+			}
+			for _, d := range actorArtDirs {
+				p := filepath.Join(base, d)
+				c := map[string]any{"dir": p}
+				if entries, err := os.ReadDir(p); err != nil {
+					c["read_error"] = err.Error()
+				} else {
+					files := make([]string, 0, len(entries))
+					for _, f := range entries {
+						if !f.IsDir() {
+							files = append(files, f.Name())
+						}
+					}
+					c["files"] = files
+				}
+				cands = append(cands, c)
+			}
+		}
+		entry["candidates"] = cands
+		probes = append(probes, entry)
+		if len(cands) > 0 && dir != "" {
+			break // 有一个作品目录能列出候选就够了，避免刷屏
+		}
+	}
+	out["works"] = probes
+	out["matched"] = h.findActorArt(ctx, guid, name, orig)
+	writeJSON(w, http.StatusOK, out)
+}
+
 // handleDebugGenres 返回本机类型字典/筛选字典，用于确认飞牛 genres 是否可读。
 func (h *Handler) handleDebugGenres(w http.ResponseWriter, r *http.Request) {
 	if !loopbackOnly(r) {
@@ -3466,6 +3571,9 @@ func embyPeople(list []fn.Person) []map[string]any {
 		}
 		if p.ProfilePath != "" {
 			m["PrimaryImageTag"] = base64.URLEncoding.EncodeToString([]byte(p.ProfilePath))
+		} else {
+			// 飞牛没头像（「其他」库常见）：给 person 标记 tag，桥接再用本地 .actors 兜底
+			m["PrimaryImageTag"] = personImageTag(p.PersonGuid)
 		}
 		out = append(out, m)
 	}
@@ -4746,11 +4854,19 @@ func (h *Handler) handleItemImage(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(png1x1())
 	}
-	// 人物头像（无状态）：People.PrimaryImageTag 是 base64url(飞牛 profile_path)
+	// 人物头像（无状态）：People.PrimaryImageTag 有两种
+	//   - base64url(飞牛 profile_path)：在线刮到的头像，直接代理 sys/img
+	//   - base64url("person:<guid>")：飞牛没头像（「其他」库），交给本地 .actors 兜底
 	if len(tag) >= 8 && !strings.HasPrefix(tag, "h") {
-		if b, err := base64.URLEncoding.DecodeString(tag); err == nil && len(b) > 0 && b[0] == '/' {
-			h.serveSysImg(w, r, string(b), maxW, maxH)
-			return
+		if b, err := base64.URLEncoding.DecodeString(tag); err == nil && len(b) > 0 {
+			if strings.HasPrefix(string(b), "person:") {
+				h.servePersonImage(w, r, strings.TrimPrefix(string(b), "person:"))
+				return
+			}
+			if b[0] == '/' {
+				h.serveSysImg(w, r, string(b), maxW, maxH)
+				return
+			}
 		}
 	}
 	client := h.imageClient(r)
@@ -4764,6 +4880,11 @@ func (h *Handler) handleItemImage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err != nil || item == nil {
+		// 不是条目：可能是人物 guid（客户端直接请求 /Items/{personId}/Images/Primary）
+		if pd := h.personDetailFor(r.Context(), id); pd != nil {
+			h.servePersonImage(w, r, id)
+			return
+		}
 		log.Printf("[poster] item=%q detail: %v", id, err)
 		servePNG()
 		return
