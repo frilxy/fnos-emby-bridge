@@ -142,3 +142,52 @@ func TestPersonNotFound(t *testing.T) {
 		t.Fatalf("status=%d want 404 body=%s", resp.StatusCode, body)
 	}
 }
+
+// TestDebugPersonProbe 校验 /debug/person 诊断端点：能把每个 job 的原始返回摊开。
+func TestDebugPersonProbe(t *testing.T) {
+	base := newPersonBridge(t)
+	b := getJSONMap(t, base+"/debug/person?guid=per_001")
+	probes, _ := b["probes"].([]any)
+	if len(probes) == 0 {
+		t.Fatalf("/debug/person 无 probes: %v", b)
+	}
+	var actorOK bool
+	for _, p := range probes {
+		m, _ := p.(map[string]any)
+		if m["job"] == "Actor" && m["page_size"] == float64(200) {
+			if m["error"] != nil {
+				t.Fatalf("Actor 探测报错: %v", m["error"])
+			}
+			if n, _ := m["bytes"].(float64); n <= 0 {
+				t.Fatalf("Actor 探测没有返回数据: %v", m)
+			}
+			actorOK = true
+		}
+	}
+	if !actorOK {
+		t.Fatalf("没有 Actor/200 的探测项: %v", probes)
+	}
+}
+
+// TestPersonFilmographyVideoItems 回归「Other/AV 库演员作品为空」。
+//
+// 真机 /debug/person 证据：人物作品 total=6 全部 type=Video，而客户端按
+// IncludeItemTypes=Movie 请求；filterItemTypes 把 Video 全过滤掉 → 空列表。
+func TestPersonFilmographyVideoItems(t *testing.T) {
+	base := newPersonBridge(t)
+
+	// 电影分区：Video 条目要放行
+	movies := getJSONMap(t, base+"/Users/u/Items?PersonIds=per_002&IncludeItemTypes=Movie"+
+		"&Recursive=true&Limit=20&api_key=k")
+	if ids := itemIDs(t, movies); len(ids) != 1 || ids[0] != "fv_vid" {
+		t.Fatalf("Movie 分区=%v want [fv_vid]", ids)
+	}
+
+	// 剧集/单集分区：同一批 Video 不能重复出现在这里
+	for _, inc := range []string{"Series", "Episode"} {
+		b := getJSONMap(t, base+"/Users/u/Items?PersonIds=per_002&IncludeItemTypes="+inc+"&Recursive=true&api_key=k")
+		if ids := itemIDs(t, b); len(ids) != 0 {
+			t.Fatalf("%s 分区不该返回 Video 条目: %v", inc, ids)
+		}
+	}
+}

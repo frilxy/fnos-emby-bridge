@@ -199,6 +199,7 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /debug/search", h.handleDebugSearch)
 	mux.HandleFunc("GET /debug/library", h.handleDebugLibrary)
 	mux.HandleFunc("GET /debug/genre-filter", h.handleDebugGenreFilter)
+	mux.HandleFunc("GET /debug/person", h.handleDebugPerson)
 	mux.HandleFunc("POST /Users/{uid}/Search/Hints", h.handleSearchHints)
 
 	mux.HandleFunc("GET /Items/{id}", h.handleItemByID)
@@ -1097,6 +1098,10 @@ func (h *Handler) personWorks(ctx context.Context, personGuid string) []fn.Media
 		log.Printf("[person] 作品 %q: %v", personGuid, err)
 		return nil
 	}
+	if len(list) == 0 {
+		// 空结果不报错但通常是 job 取值/权限不符，留痕方便 /debug/person 对照
+		log.Printf("[person] 作品 %q 五个 job 均未返回条目", personGuid)
+	}
 	personWorksCache.Store(key, personWorksEntry{list: list, at: time.Now()})
 	return list
 }
@@ -1565,6 +1570,30 @@ func (h *Handler) handleItems(w http.ResponseWriter, r *http.Request) {
 				"Items": []any{}, "TotalRecordCount": 0, "StartIndex": start,
 			})
 			return
+		}
+		// 人物页「作品」：飞牛 Other/AV 库的条目 type=Video，客户端却按
+		// Movie/Series/Episode 请求（真机 /debug/person：total=6 全是 Video）。
+		// filterItemTypes 按 Movie 过滤会把它们全丢掉——1.1.18 只给「库内浏览」
+		// （parentID != ""）加了 Video 兜底，人物页（PersonIds，无 parentId）漏了。
+		// 只在包含 Movie（或未指定类型）时放行，避免同一批 Video 在
+		// 电影/剧集/单集三个分区里重复出现。
+		if strings.TrimSpace(queryGet(q, "PersonIds")) != "" && len(all) > 0 {
+			inc := strings.ToUpper(queryGet(q, "IncludeItemTypes"))
+			if inc == "" || strings.Contains(inc, "MOVIE") {
+				have := make(map[string]struct{}, len(filtered))
+				for _, it := range filtered {
+					have[it.Guid] = struct{}{}
+				}
+				for _, it := range all {
+					if it.Type != "Video" {
+						continue
+					}
+					if _, dup := have[it.Guid]; dup {
+						continue
+					}
+					filtered = append(filtered, it)
+				}
+			}
 		}
 		// 库级浏览的空结果兜底：客户端按 Movie/Series 猜类型，而库内条目是 Video
 		// （AV/Other 库常见）。即使带 Genres/Years 筛选，也要先把 Video 放进来，
@@ -2302,6 +2331,71 @@ func (h *Handler) handleDebugRequests(w http.ResponseWriter, r *http.Request) {
 	for _, line := range recentRequests() {
 		_, _ = fmt.Fprintln(w, line)
 	}
+}
+
+// handleDebugPerson 排查人物页：把某 person_guid 在 person/item/list 上
+// 各 job / 各 page_size 的原始返回摊开（仅 loopback）。
+//
+// 用法：/debug/person?guid=<person_guid>[&item=<条目guid>]
+//   - guid：Emby 里 People[].Id（飞牛 person_guid）
+//   - item：可选，顺带 dump 该条目的 person/list，用于核对 person_guid 是否一致
+func (h *Handler) handleDebugPerson(w http.ResponseWriter, r *http.Request) {
+	if !loopbackOnly(r) {
+		http.NotFound(w, r)
+		return
+	}
+	q := r.URL.Query()
+	guid := queryGet(q, "guid")
+	if guid == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"Error": "需要 guid"})
+		return
+	}
+	ctx := r.Context()
+	client := h.fnOf(ctx)
+
+	probe := func(job string, size int) map[string]any {
+		body := map[string]interface{}{
+			"person_guid": guid, "page": 1, "page_size": size,
+			"sort_column": "update_time", "sort_type": "desc", "lan": "zh-CN",
+		}
+		if job != "" {
+			body["job"] = job
+		}
+		entry := map[string]any{"job": job, "page_size": size}
+		raw, err := client.PersonItemListRaw(ctx, body)
+		if err != nil {
+			entry["error"] = err.Error()
+			return entry
+		}
+		entry["bytes"] = len(raw)
+		s := string(raw)
+		if len(s) > 500 {
+			s = s[:500] + "…"
+		}
+		entry["head"] = s
+		return entry
+	}
+
+	out := map[string]any{"guid": guid}
+	if raw, err := client.PersonDetailRaw(ctx, guid); err != nil {
+		out["detail_error"] = err.Error()
+	} else {
+		out["detail"] = string(raw)
+	}
+	if item := queryGet(q, "item"); item != "" {
+		if raw, err := client.PersonListRaw(ctx, item); err != nil {
+			out["personlist_error"] = err.Error()
+		} else {
+			out["personlist"] = string(raw)
+		}
+	}
+	probes := make([]any, 0, 12)
+	for _, job := range append([]string{""}, fn.PersonJobValues...) {
+		probes = append(probes, probe(job, 200))
+	}
+	probes = append(probes, probe("Actor", 50), probe("Actor", 500), probe("actor", 200))
+	out["probes"] = probes
+	writeJSON(w, http.StatusOK, out)
 }
 
 // handleDebugGenres 返回本机类型字典/筛选字典，用于确认飞牛 genres 是否可读。

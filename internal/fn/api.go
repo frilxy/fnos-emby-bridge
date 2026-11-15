@@ -745,10 +745,6 @@ func (c *Client) PersonItemList(ctx context.Context, personGuid, job string, pag
 // 结果就是「Emby 点开演员看不到其他作品」。
 var PersonJobValues = []string{"Actor", "Director", "Screenplay", "Writer", "Producer"}
 
-// personJobValuesLower 是 job 枚举的小写形式：不同 fnOS 版本/网关注入的
-// 枚举大小写不一致，PersonWorks 探测后按命中的那套查。
-var personJobValuesLower = []string{"actor", "director", "screenplay", "writer", "producer"}
-
 // PersonWorks 拉某演员/导演/编剧的全部关联作品。
 //
 // 按 job 逐个查询后按 guid 去重合并：同一个人可能既是演员又是导演，
@@ -777,24 +773,54 @@ func (c *Client) PersonWorks(ctx context.Context, personGuid string) ([]MediaIte
 	}
 
 	jobs := PersonJobValues
-	if list, _, err := c.PersonItemList(ctx, personGuid, "Actor", 1, 500); err == nil {
-		if add(list) == 0 {
-			if low, _, lerr := c.PersonItemList(ctx, personGuid, "actor", 1, 500); lerr == nil && add(low) > 0 {
-				jobs = personJobValuesLower
+	// fetch 带页大小回退：部分 fnOS 版本对 page_size 有上限（影视前端默认 200），
+	// 超限直接报错——报错不能让整个 job 静默变成空列表。
+	fetch := func(job string) []MediaItem {
+		for _, size := range []int{200, 50} {
+			if list, _, err := c.PersonItemList(ctx, personGuid, job, 1, size); err == nil {
+				return list
 			}
 		}
+		return nil
 	}
-	for _, job := range jobs {
-		if strings.EqualFold(job, "Actor") {
-			continue // 探测阶段已查过
+	// 真机实测（/debug/person）：job 传空串 = 不按职务过滤，一次就拿全，
+	// 且与 job=Actor 返回同样的 total。先走这条最省的路。
+	if add(fetch("")) == 0 {
+		// 少数版本空 job 无匹配：退回按职务逐个查（一个人可能既是演员又是导演）。
+		for _, job := range jobs {
+			add(fetch(job))
 		}
-		list, _, err := c.PersonItemList(ctx, personGuid, job, 1, 500)
-		if err != nil {
-			continue
-		}
-		add(list)
 	}
 	return out, nil
+}
+
+// PersonItemListRaw 原样返回 person/item/list 的 data 字段（/debug/person 排查用）。
+func (c *Client) PersonItemListRaw(ctx context.Context, body map[string]interface{}) (json.RawMessage, error) {
+	res, err := c.do(ctx, "POST", "person/item/list", body)
+	if err != nil {
+		return nil, err
+	}
+	return res.Data, nil
+}
+
+// PersonDetailRaw 原样返回 person/{guid} 的 data（排查用）。
+func (c *Client) PersonDetailRaw(ctx context.Context, guid string) (json.RawMessage, error) {
+	res, err := c.do(ctx, "GET", "person/"+guid, nil)
+	if err != nil {
+		return nil, err
+	}
+	return res.Data, nil
+}
+
+// PersonListRaw 原样返回 person/list/{guid} 的 data（排查用）。
+func (c *Client) PersonListRaw(ctx context.Context, guid string) (json.RawMessage, error) {
+	res, err := c.do(ctx, "POST", "person/list/"+guid, map[string]interface{}{
+		"guid": guid, "page": 1, "page_size": 1000, "lan": "zh-CN",
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res.Data, nil
 }
 
 // SetFavorite 收藏/取消收藏（真机抓包：PUT 收藏、DELETE 取消，body 只有 item_guid）。

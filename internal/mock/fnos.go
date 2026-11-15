@@ -81,6 +81,12 @@ var (
 			{"person_guid": "per_001", "name": "演员甲", "original_name": "Actor A", "role": "主角",
 				"job": "Actor", "order": 1, "biography": "演员甲简介", "profile_path": "/1c/09/mock_actor.webp"},
 		},
+		// Other 库里的散装视频也挂演员：飞牛这些条目 type=Video，用来复现
+		// 「人物页按 Movie 请求 → Video 全被类型过滤」的空结果。
+		"fv_vid": {
+			{"person_guid": "per_002", "name": "演员乙", "original_name": "Actor B", "role": "",
+				"job": "Actor", "order": 1, "biography": "", "profile_path": ""},
+		},
 	}
 	// 人物作品夹具：真机 person/item/list 按 job 分桶，job 缺失/为空直接返回空列表
 	// （不是"查全部"）。per_001 既是 fv_001 的演员、又是 fv_tv 的导演，
@@ -89,6 +95,10 @@ var (
 		"per_001": {
 			"Actor":    {"fv_001"},
 			"Director": {"fv_tv"},
+		},
+		// per_002 的作品是 Other 库里的 Video（真机 AV 库同型）
+		"per_002": {
+			"Actor": {"fv_vid"},
 		},
 	}
 )
