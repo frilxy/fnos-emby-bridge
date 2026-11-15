@@ -24,7 +24,7 @@
 | 标签 / Tags | ❌ 飞牛 item 接口没有用户标签字段；`/Tags`、`Tags`、`TagItems` 只能返回空 |
 | 官方分级 / OfficialRating | ✅ 来自 `content_ratings` |
 | 年份 / 国家 / 工作室 | 年份按飞牛习惯合并为**年代**（`2000s`，同时兼容单年筛选）；国家支持；工作室飞牛无数据 |
-| 人物 / Persons | ✅ 演员/导演等；人物页可点开，作品列表按 `job` 枚举合并查询（演员+导演+编剧…） |
+| 人物 / Persons | ✅ 演员/导演等；点开演员可看作品列表（含 Other/AV 库的 `Video` 条目，归入「电影」分区） |
 | 媒体库封面 | ✅ 默认用库内 3 张海报拼接（30 分钟轮换） |
 
 ## 版本号约定
@@ -147,6 +147,26 @@ GitHub Actions：
 
 ---
 
+## 排查
+
+服务端有一组**仅限本机访问**（`127.0.0.1`）的诊断端点，客户端出现异常时先看这里：
+
+| 端点 | 用途 |
+|---|---|
+| `GET /debug/requests` | 最近的 API 请求（方法/路径/状态/耗时，api_key 已打码） |
+| `GET /debug/person?guid=<person_guid>[&item=<条目guid>]` | 人物页：`person/item/list` 在各 job / 各 page_size 下的原始返回与错误码 |
+| `GET /debug/library` | 库 category、条目 type 分布、genres 可读性 |
+| `GET /debug/genres` | 类型字典原始响应 |
+| `GET /debug/search?q=` | 搜索链路（本机 admin 搜索 + 库内标题搜索） |
+| `GET /debug/genre-filter?parent=&genre=` | `item/list` 服务端 genres 过滤 |
+
+在 NAS 本机执行即可，例如：
+
+```bash
+curl -s 'http://127.0.0.1:8096/debug/requests' | tail -20
+curl -s 'http://127.0.0.1:8096/debug/person?guid=<人物guid>'
+```
+
 ## 已知限制
 
 - **不转码**（见文首说明）。
@@ -154,6 +174,8 @@ GitHub Actions：
 - 仅提供 **x86_64** 包（静态编译）。
 - 后台配置以**明文**保存飞牛密码（上游设计如此），请勿把 8096 暴露到公网。
 - 媒体端点默认要求有效 token；如果客户端无法登录，可临时设 `ALLOW_ANON=1` 排障，但不要长期开启。
+- Other/AV 类库的条目在 Emby 里是 `Video` 类型：人物页会把它们放进「电影」分区，
+  剧集/单集分区不会重复出现。
 
 ---
 
