@@ -665,6 +665,11 @@ func NewHandler(cloudDirect bool, cdnBase string, opts ...Option) *http.ServeMux
 			writeResult(w, 1, "bad multipart", nil)
 			return
 		}
+		if r.FormValue("image_type") == "" {
+			// 真机契约：缺 image_type 回 code=-1 Invalid Params
+			writeResult(w, -1, "Invalid Params", nil)
+			return
+		}
 		f, hdr, err := r.FormFile("file")
 		if err != nil {
 			writeResult(w, 2, "missing file", nil)

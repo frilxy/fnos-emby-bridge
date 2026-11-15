@@ -46,10 +46,14 @@ func (c *Client) SavePersonEditDetail(ctx context.Context, body map[string]any) 
 
 // UploadImage 上传一张图片到飞牛临时图库，返回 hash_path（可用作 profile_path）。
 //
-// 契约来自前端上传控件：multipart 字段名 file；响应 {code,data:{hash_path}}。
+// 契约来自前端上传控件：multipart 字段 file + image_type（人物头像用 poster）；
+// 响应 {code,data:{hash_path}}。
 // 签名按空 body 计算（与 GET 一致）——若某个版本对 multipart 也校验 body hash，
 // 这里会在真机上返回 invalid sign，届时按实际签名规则调整。
-func (c *Client) UploadImage(ctx context.Context, filename string, data []byte) (string, error) {
+func (c *Client) UploadImage(ctx context.Context, filename, imageType string, data []byte) (string, error) {
+	if imageType == "" {
+		imageType = "poster"
+	}
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	part, err := mw.CreateFormFile("file", filepath.Base(filename))
@@ -57,6 +61,11 @@ func (c *Client) UploadImage(ctx context.Context, filename string, data []byte) 
 		return "", err
 	}
 	if _, err := part.Write(data); err != nil {
+		return "", err
+	}
+	// 前端 buildFormData 会带 image_type（poster/backdrop/logo/thumb）；
+	// 缺了这个字段真机回 code=-1 Invalid Params。
+	if err := mw.WriteField("image_type", imageType); err != nil {
 		return "", err
 	}
 	if err := mw.Close(); err != nil {

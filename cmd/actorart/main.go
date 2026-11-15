@@ -434,7 +434,7 @@ func applyOne(ctx context.Context, client *fn.Client, c candidate, backup map[st
 	if err != nil {
 		return fmt.Errorf("读图失败（需要 root？）: %w", err)
 	}
-	hash, err := client.UploadImage(ctx, filepath.Base(c.ImagePath), data)
+	hash, err := client.UploadImage(ctx, filepath.Base(c.ImagePath), "poster", data)
 	if err != nil {
 		return err
 	}
