@@ -15,6 +15,7 @@ package mock
 
 import (
 	"bytes"
+	"crypto/md5"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -96,6 +97,8 @@ var (
 		"per_002": {"guid": "per_002", "name": "演员乙", "original_name": "Actor B",
 			"profile": "", "biography": "", "is_favorite": 0},
 	}
+	// 人物编辑夹具（getEditDetail / saveEditDetail）：guid -> 可编辑字段
+	mockPersonEdit = map[string]map[string]any{}
 	// 人物作品夹具：真机 person/item/list 按 job 分桶，job 缺失/为空直接返回空列表
 	// （不是"查全部"）。per_001 既是 fv_001 的演员、又是 fv_tv 的导演，
 	// 用来验证桥接按 job 逐个查再合并。
@@ -123,6 +126,7 @@ type RecordEntry struct {
 }
 
 var (
+	editMu     sync.Mutex
 	recordMu   sync.Mutex
 	records    []RecordEntry
 	loginMu    sync.Mutex
@@ -619,6 +623,61 @@ func NewHandler(cloudDirect bool, cdnBase string, opts ...Option) *http.ServeMux
 	})
 
 	// 0.9.8 海报端点：/v/api/v1/sys/img/{path}?w=400（mock 不校验 relay cookie）
+	// ---- 人物编辑（演员图灌注脚本用）----
+	mux.HandleFunc("POST /v/api/v1/person/getEditDetail", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Guid string `json:"guid"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		base, ok := mockPersonDetail[req.Guid]
+		if !ok {
+			writeResult(w, 1, "person not found", nil)
+			return
+		}
+		editMu.Lock()
+		d, ok := mockPersonEdit[req.Guid]
+		if !ok {
+			d = map[string]any{"guid": req.Guid, "name": base["name"], "profile_path": base["profile"]}
+			mockPersonEdit[req.Guid] = d
+		}
+		out := make(map[string]any, len(d))
+		for k, v := range d {
+			out[k] = v
+		}
+		editMu.Unlock()
+		writeResult(w, 0, "", out)
+	})
+	mux.HandleFunc("POST /v/api/v1/person/saveEditDetail", func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		guid, _ := req["guid"].(string)
+		if guid == "" {
+			writeResult(w, 1, "missing guid", nil)
+			return
+		}
+		editMu.Lock()
+		mockPersonEdit[guid] = req
+		editMu.Unlock()
+		writeResult(w, 0, "", map[string]any{"suc": true})
+	})
+	mux.HandleFunc("POST /v/api/v1/image/temp/upload", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(8 << 20); err != nil {
+			writeResult(w, 1, "bad multipart", nil)
+			return
+		}
+		f, hdr, err := r.FormFile("file")
+		if err != nil {
+			writeResult(w, 2, "missing file", nil)
+			return
+		}
+		defer f.Close()
+		b, _ := io.ReadAll(f)
+		sum := fmt.Sprintf("%x", md5.Sum(b))
+		writeResult(w, 0, "", map[string]any{
+			"hash_path": "/temp/" + sum + ".jpg", "filename": hdr.Filename, "size": len(b),
+		})
+	})
+
 	mux.HandleFunc("GET /v/api/v1/sys/img/{rest...}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/webp")
 		w.WriteHeader(http.StatusOK)

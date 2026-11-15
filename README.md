@@ -148,6 +148,28 @@ GitHub Actions：
 
 ---
 
+## 演员头像（可选）
+
+飞牛「其他」类型库不刮演员头像（`person.profile` 恒为空），而这类库的演员图通常由刮削工具
+写在影片目录的 `.actors/<演员名>.jpg`。飞牛人物编辑器本身支持上传头像，仓库带一个批量工具
+把这些图灌进人物库：
+
+```bash
+# 1) 只列清单（dry-run）
+sudo ./actorart -config /vol5/@appdata/fnos-emby-bridge/bridge-config.json
+
+# 2) 确认后写入（自动生成备份 json）
+sudo ./actorart -config /vol5/@appdata/fnos-emby-bridge/bridge-config.json -apply
+
+# 3) 需要时回滚
+sudo ./actorart -restore actorart-backup-<时间>.json
+```
+
+- **需要 root**：`.actors` 里的图片通常是刮削工具（另一个应用用户）创建的 `700` 文件；
+- 只改 `profile_path`，其余字段从 `person/getEditDetail` 原样回写，不会覆盖简介等信息；
+- 跑完后飞牛影视本体会显示演员头像，桥接直接从 `person.profile` 取到，无需改代码或调权限；
+- 支持 `-limit N`、`-only <person_guid>` 小范围试跑。
+
 ## 排查
 
 服务端有一组**仅限本机访问**（`127.0.0.1`）的诊断端点，客户端出现异常时先看这里：
