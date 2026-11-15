@@ -26,6 +26,7 @@
 | 官方分级 / OfficialRating | ✅ 来自 `content_ratings` |
 | 年份 / 国家 / 工作室 | 年份按飞牛习惯合并为**年代**（`2000s`，同时兼容单年筛选）；国家支持；工作室飞牛无数据 |
 | 人物 / Persons | ✅ 演员/导演等；点开演员可看作品列表（含 Other/AV 库的 `Video` 条目，归入「电影」分区） |
+| 演员头像 | ⚠️ 飞牛「其他」库不做刮削、`profile` 恒为空；桥接改读作品目录下 `.actors`/`.actor`/`actors` 的 `<演员名>.jpg`，**需要先给应用授权媒体目录**（见下） |
 | 媒体库封面 | ✅ 默认用库内 3 张海报拼接（30 分钟轮换） |
 
 ## 版本号约定
@@ -156,10 +157,31 @@ GitHub Actions：
 |---|---|
 | `GET /debug/requests` | 最近的 API 请求（方法/路径/状态/耗时，api_key 已打码） |
 | `GET /debug/person?guid=<person_guid>[&item=<条目guid>]` | 人物页：`person/item/list` 在各 job / 各 page_size 下的原始返回与错误码 |
+| `GET /debug/actor?guid=<person_guid>` | 演员头像：作品真实路径、`.actors` 候选目录、目录内文件、读取报错与最终命中 |
 | `GET /debug/library` | 库 category、条目 type 分布、genres 可读性 |
 | `GET /debug/genres` | 类型字典原始响应 |
 | `GET /debug/search?q=` | 搜索链路（本机 admin 搜索 + 库内标题搜索） |
 | `GET /debug/genre-filter?parent=&genre=` | `item/list` 服务端 genres 过滤 |
+
+### 演员头像空白？
+
+飞牛「其他」类型库不刮演员头像（`person.profile` 实测恒为空串），桥接改为直接读文件系统里
+刮削工具写下的 `.actors/<演员名>.jpg`（Kodi/Emby 约定，`.actor`、`actors` 也认）。
+
+这需要应用对媒体目录**有读权限**——这是飞牛的文件系统权限，不是桥接的开关：
+
+1. 应用中心 → 「飞牛影视 Emby 桥接」→ 设置 → **授权目录**，添加媒体库根目录（只读即可）；
+2. 每个媒体根目录都要加一次；
+3. 保存后**重启应用**（解析结果有 10 分钟缓存）。
+
+验证：
+
+```bash
+curl -s 'http://127.0.0.1:8096/debug/actor?guid=<人物guid>'
+```
+
+- `works[].candidates[].read_error` 出现 `permission denied` → 目录没授权到；
+- `matched` 有路径 → 已命中，客户端重进演员页即可（客户端可能缓存了旧占位图）。
 
 在 NAS 本机执行即可，例如：
 
