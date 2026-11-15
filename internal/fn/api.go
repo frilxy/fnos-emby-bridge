@@ -733,6 +733,70 @@ func (c *Client) PersonItemList(ctx context.Context, personGuid, job string, pag
 	return out.List, out.Total, nil
 }
 
+// PersonJobValues 飞牛 person/item/list 的 job 枚举。
+//
+// 真机依据（影视前端 1.12.x 源码 + nginx 访问日志）：
+//   - 人物页对同一个 person_guid 连发多次 person/item/list，每次只带一个 job；
+//   - 同一时刻 4 次 48 字节（{"total":0,"list":[]}）、1 次 4794 字节，
+//     说明 job 是**严格过滤**字段，不是可选修饰；
+//   - 前端组件默认 job=Ve.Actor，枚举值为 Actor/Director/Screenplay/Writer/Producer。
+//
+// 桥接早期版本传 job=""（注释误以为空串等于"查全部"），服务端按无匹配返回空，
+// 结果就是「Emby 点开演员看不到其他作品」。
+var PersonJobValues = []string{"Actor", "Director", "Screenplay", "Writer", "Producer"}
+
+// personJobValuesLower 是 job 枚举的小写形式：不同 fnOS 版本/网关注入的
+// 枚举大小写不一致，PersonWorks 探测后按命中的那套查。
+var personJobValuesLower = []string{"actor", "director", "screenplay", "writer", "producer"}
+
+// PersonWorks 拉某演员/导演/编剧的全部关联作品。
+//
+// 按 job 逐个查询后按 guid 去重合并：同一个人可能既是演员又是导演，
+// 只查一个 job 会漏掉另一半作品。单个 job 失败不影响整体（老版本 fnOS
+// 未必有 Screenplay 等分类）。
+//
+// 先用 Actor 探一次 job 大小写（大写的空就试小写），后面按命中的那套查，
+// 避免把 5 个分类都查两遍。
+func (c *Client) PersonWorks(ctx context.Context, personGuid string) ([]MediaItem, error) {
+	seen := make(map[string]struct{}, 64)
+	out := make([]MediaItem, 0, 64)
+	add := func(list []MediaItem) int {
+		n := 0
+		for _, it := range list {
+			if it.Guid == "" {
+				continue
+			}
+			if _, dup := seen[it.Guid]; dup {
+				continue
+			}
+			seen[it.Guid] = struct{}{}
+			out = append(out, it)
+			n++
+		}
+		return n
+	}
+
+	jobs := PersonJobValues
+	if list, _, err := c.PersonItemList(ctx, personGuid, "Actor", 1, 500); err == nil {
+		if add(list) == 0 {
+			if low, _, lerr := c.PersonItemList(ctx, personGuid, "actor", 1, 500); lerr == nil && add(low) > 0 {
+				jobs = personJobValuesLower
+			}
+		}
+	}
+	for _, job := range jobs {
+		if strings.EqualFold(job, "Actor") {
+			continue // 探测阶段已查过
+		}
+		list, _, err := c.PersonItemList(ctx, personGuid, job, 1, 500)
+		if err != nil {
+			continue
+		}
+		add(list)
+	}
+	return out, nil
+}
+
 // SetFavorite 收藏/取消收藏（真机抓包：PUT 收藏、DELETE 取消，body 只有 item_guid）。
 func (c *Client) SetFavorite(ctx context.Context, itemGuid string, on bool) error {
 	method := "PUT"
