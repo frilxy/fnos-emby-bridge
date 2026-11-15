@@ -129,12 +129,41 @@ func main() {
 	fmt.Printf("\n完成：成功 %d，失败 %d。备份：%s\n", ok, failed, *backupTo)
 }
 
+// readEnvFile 读 KEY=VALUE 形式的 env 文件（bridge.env），忽略注释与空行，
+// 去掉值两侧的单/双引号。文件不存在时返回空 map。
+func readEnvFile(path string) map[string]string {
+	out := map[string]string{}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return out
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		v = strings.TrimSpace(strings.Trim(v, `"'`))
+		out[strings.TrimSpace(k)] = v
+	}
+	return out
+}
+
 // defaultConfigPath 猜测桥接配置位置（fnOS 应用数据目录）。
 func defaultConfigPath() string {
 	if p := os.Getenv("CONFIG_PATH"); p != "" {
 		return p
 	}
 	for _, p := range []string{
+		"/vol5/@appdata/fnos-emby-bridge/bridge.env",
+		"/vol1/@appdata/fnos-emby-bridge/bridge.env",
+		"/vol2/@appdata/fnos-emby-bridge/bridge.env",
+		"/vol3/@appdata/fnos-emby-bridge/bridge.env",
+		"/vol4/@appdata/fnos-emby-bridge/bridge.env",
+		"/vol6/@appdata/fnos-emby-bridge/bridge.env",
 		"/vol5/@appdata/fnos-emby-bridge/bridge-config.json",
 		"/vol1/@appdata/fnos-emby-bridge/bridge-config.json",
 		"/vol2/@appdata/fnos-emby-bridge/bridge-config.json",
@@ -151,20 +180,34 @@ func defaultConfigPath() string {
 
 func login(ctx context.Context, cfgPath, base, user, pass string) (*fn.Client, error) {
 	if base == "" || user == "" || pass == "" {
-		st := admin.LoadStore(cfgPath)
-		cc := st.Connection()
-		if cc == nil {
-			return nil, fmt.Errorf("配置文件 %s 里没有连接信息，用 -base/-user/-pass 指定", cfgPath)
-		}
+		// 桥接的凭据有两处可能：bridge.env（向导写入，键 FNOS_*）
+		// 或 bridge-config.json（后台页面改过的连接）。两个都试。
+		env := readEnvFile(cfgPath)
 		if base == "" {
-			base = cc.Base
+			base = env["FNOS_BASE"]
 		}
 		if user == "" {
-			user = cc.User
+			user = env["FNOS_USER"]
 		}
 		if pass == "" {
-			pass = cc.Pass
+			pass = env["FNOS_PASS"]
 		}
+	}
+	if base == "" || user == "" || pass == "" {
+		if cc := admin.LoadStore(cfgPath).Connection(); cc != nil {
+			if base == "" {
+				base = cc.Base
+			}
+			if user == "" {
+				user = cc.User
+			}
+			if pass == "" {
+				pass = cc.Pass
+			}
+		}
+	}
+	if base == "" || user == "" || pass == "" {
+		return nil, fmt.Errorf("在 %s 里没找到连接信息：bridge.env 需含 FNOS_BASE/FNOS_USER/FNOS_PASS，或 bridge-config.json 需含 connection；也可用 -base/-user/-pass 直接指定", cfgPath)
 	}
 	c := fn.NewClient(base)
 	if err := c.Login(ctx, user, fn.SHA256Hex(pass)); err != nil {
