@@ -9,7 +9,8 @@
 
 本仓库 fork 自 [ssabv/fnos-emby-bridge](https://github.com/ssabv/fnos-emby-bridge)（原项目已停止维护），
 在其基础上修复了一批客户端兼容问题，并额外提供飞牛 `.fpk` 安装包。改动集中在 `internal/emby`，
-相对上游的**源码与 CI 改动**见 [`fixes.patch`](fixes.patch)（`patch -p1` 可应用），
+相对上游的**全部源码与 CI 改动**见 [`fixes.patch`](fixes.patch)（在干净的
+最新上游上 `patch -p1` 即可复现本仓库源码；图标/截图等二进制资源不在补丁内），
 逐版本修复记录见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 > ⚠️ **不做转码**：桥接只做直连/直封装，能否播放取决于客户端能否解码原文件。
@@ -143,7 +144,7 @@ GitHub Actions：
 | `fpk/fnos-emby-bridge/cmd/` | 生命周期脚本：配置在 `TRIM_PKGETC`，运行数据在 `TRIM_PKGVAR` |
 | `fpk/图标.jpg` | **唯一图标源**；`fpk/make-icons.sh` 由它派生各尺寸 PNG |
 | `docs/` | 由图标源派生的图片，供本说明使用 |
-| `fixes.patch` | 相对上游的全部源码改动，可 `patch -p1` 应用 |
+| `fixes.patch` | 相对上游的全部源码与 CI 改动，可 `patch -p1` 应用（不含二进制资源） |
 
 ---
 
