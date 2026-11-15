@@ -301,6 +301,15 @@ func (h *Handler) Routes() *http.ServeMux {
 	// QueryResult 列表语义，fallback 形态已对；显式注册避免每次命中兜底日志
 	mux.HandleFunc("GET /Genres", h.handleGenres)
 	mux.HandleFunc("GET /Persons", h.handleEmptyList)
+	// 人物页（点演员进人物详情）：
+	//   GET /Persons/{id}              人物 BaseItemDto，客户端用来渲染头像/名字/简介
+	//   GET /Persons/{id}/Images/{t}   人物头像
+	// 此前这两条都没注册，落到兜底返回 QueryResult 对象——客户端按 BaseItemDto
+	// 反序列化失败，人物页要么整页空白、要么只有空壳。作品列表走
+	// /Items?PersonIds=...，同样此前拿不到数据（见 handleItems 的 PersonIds 分支）。
+	mux.HandleFunc("GET /Persons/{id}", h.handlePersonByID)
+	mux.HandleFunc("GET /Persons/{id}/Images/{imgType}", h.handlePersonImage)
+	mux.HandleFunc("GET /Persons/{id}/Images/{imgType}/{rest...}", h.handlePersonImage)
 	mux.HandleFunc("GET /Tags", h.handleEmptyList)
 	mux.HandleFunc("GET /Years", h.handleYears)
 	mux.HandleFunc("GET /OfficialRatings", h.handleOfficialRatings)
@@ -1039,6 +1048,94 @@ func personToEmby(pd *fn.PersonDetail) map[string]any {
 	return out
 }
 
+// 人物页缓存：客户端点开一个演员会连发 /Persons/{id} 与三条 PersonIds 查询，
+// 而每条 PersonIds 内部还要按 5 个 job 查飞牛——不缓存一次点击就是十几个上游请求。
+type personDetailEntry struct {
+	pd *fn.PersonDetail
+	at time.Time
+}
+
+var personDetailCache sync.Map // guid -> personDetailEntry
+
+// personDetailFor 取演员详情（5 分钟缓存）。非人物 guid 返回 nil。
+// 缓存键带会话 token：飞牛 PersonDetail 里的 is_favorite 是**按用户**的，
+// 只按 guid 缓存会让多用户互相看到对方的收藏状态。
+func (h *Handler) personDetailFor(ctx context.Context, guid string) *fn.PersonDetail {
+	key := h.fnOf(ctx).Token + "|" + guid
+	if v, ok := personDetailCache.Load(key); ok {
+		if e, ok := v.(personDetailEntry); ok && time.Since(e.at) < 5*time.Minute {
+			return e.pd
+		}
+	}
+	pd, err := h.fnOf(ctx).PersonDetail(ctx, guid)
+	if err != nil || pd == nil || pd.Guid == "" {
+		return nil
+	}
+	personDetailCache.Store(key, personDetailEntry{pd: pd, at: time.Now()})
+	return pd
+}
+
+type personWorksEntry struct {
+	list []fn.MediaItem
+	at   time.Time
+}
+
+var personWorksCache sync.Map // person guid -> personWorksEntry
+
+// personWorks 取某人物全部作品（按 job 合并，5 分钟缓存）。
+// 与 seriesEpisodes 同理：作品条目带**按用户**的进度（ts/watched），
+// 缓存键必须带会话 token，否则多用户串状态。
+func (h *Handler) personWorks(ctx context.Context, personGuid string) []fn.MediaItem {
+	key := h.fnOf(ctx).Token + "|" + personGuid
+	if v, ok := personWorksCache.Load(key); ok {
+		if e, ok := v.(personWorksEntry); ok && time.Since(e.at) < 5*time.Minute {
+			return e.list
+		}
+	}
+	list, err := h.fnOf(ctx).PersonWorks(ctx, personGuid)
+	if err != nil {
+		log.Printf("[person] 作品 %q: %v", personGuid, err)
+		return nil
+	}
+	personWorksCache.Store(key, personWorksEntry{list: list, at: time.Now()})
+	return list
+}
+
+// handlePersonByID 实现 GET /Persons/{id}（人物页 BaseItemDto）。
+func (h *Handler) handlePersonByID(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	pd := h.personDetailFor(r.Context(), id)
+	if pd == nil {
+		// 不是人物 guid（部分客户端会拿条目 id 试探人物页）：回 404，
+		// 让客户端回落到 /Items/{id}，不要用空壳对象骗它。
+		writeJSON(w, http.StatusNotFound, map[string]any{"Error": "person not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, personToEmby(pd))
+}
+
+// handlePersonImage 实现 GET /Persons/{id}/Images/{type}（人物头像）。
+// 头像走 sys/img 代理；客户端缓存的 URL 带 tag（base64url(profile)）时
+// 即使人物详情查不到也能直接出图。
+func (h *Handler) handlePersonImage(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	_, tag, _, maxW, maxH := imagePathParams(r)
+	if len(tag) >= 8 && !strings.HasPrefix(tag, "h") {
+		if b, err := base64.URLEncoding.DecodeString(tag); err == nil && len(b) > 0 && b[0] == '/' {
+			h.serveSysImg(w, r, string(b), maxW, maxH)
+			return
+		}
+	}
+	if pd := h.personDetailFor(r.Context(), id); pd != nil && pd.Profile != "" {
+		h.serveSysImg(w, r, pd.Profile, maxW, maxH)
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(png1x1())
+}
+
 // handleSystemConfiguration 实现 GET /System/Configuration。
 // Yamby 登录后初始化拉取（dex 逆向确认）：必须是配置对象本身，
 // 客户端 Kotlin 数据类的非空字段缺一个就 MissingFieldException——
@@ -1538,13 +1635,23 @@ func (h *Handler) handleItems(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	case strings.TrimSpace(queryGet(q, "PersonIds")) != "":
+		// 人物页「作品」网格。飞牛 person/item/list 的 job 是必填枚举（见
+		// fn.PersonJobValues），早期这里传 job="" 导致永远空列表；现在按 job
+		// 逐个查并去重合并（h.personWorks），多个 PersonIds 也一并去重。
+		seen := make(map[string]struct{}, 64)
 		for _, pid := range strings.Split(queryGet(q, "PersonIds"), ",") {
 			if pid = strings.TrimSpace(pid); pid == "" {
 				continue
 			}
-			list, _, e := client.PersonItemList(ctx, pid, "", 1, 200)
-			if e == nil {
-				all = append(all, list...)
+			for _, it := range h.personWorks(ctx, pid) {
+				if it.Guid == "" {
+					continue
+				}
+				if _, dup := seen[it.Guid]; dup {
+					continue
+				}
+				seen[it.Guid] = struct{}{}
+				all = append(all, it)
 			}
 		}
 	case strings.Contains(strings.ToUpper(queryGet(q, "Filters")), "ISFAVORITE") && parentID == "":

@@ -70,6 +70,27 @@ var (
 		"fv_tv": {"fv_s1"},
 		"fv_s1": {"fv_002"},
 	}
+	// 演职员夹具：真机 person/list/{guid} 挂在「季」级（剧 guid 常常查不到人），
+	// 所以 fv_s1 也挂一份，覆盖详情页季级演员表路径。
+	mockPeople = map[string][]map[string]any{
+		"fv_001": {
+			{"person_guid": "per_001", "name": "演员甲", "original_name": "Actor A", "role": "主角",
+				"job": "Actor", "order": 1, "biography": "演员甲简介", "profile_path": "/1c/09/mock_actor.webp"},
+		},
+		"fv_s1": {
+			{"person_guid": "per_001", "name": "演员甲", "original_name": "Actor A", "role": "主角",
+				"job": "Actor", "order": 1, "biography": "演员甲简介", "profile_path": "/1c/09/mock_actor.webp"},
+		},
+	}
+	// 人物作品夹具：真机 person/item/list 按 job 分桶，job 缺失/为空直接返回空列表
+	// （不是"查全部"）。per_001 既是 fv_001 的演员、又是 fv_tv 的导演，
+	// 用来验证桥接按 job 逐个查再合并。
+	mockPersonWorks = map[string]map[string][]string{
+		"per_001": {
+			"Actor":    {"fv_001"},
+			"Director": {"fv_tv"},
+		},
+	}
 )
 
 // NewHandler 返回一个可被 http.ListenAndServe 挂载的 mock 飞牛 mux。
@@ -577,6 +598,53 @@ func NewHandler(cloudDirect bool, cdnBase string, opts ...Option) *http.ServeMux
 		w.Header().Set("Content-Type", "image/webp")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(png1x1())
+	})
+
+	// ---- 演职员（人物页）----
+	// POST person/list/{guid}：条目演员表 {total,list}
+	mux.HandleFunc("POST /v/api/v1/person/list/{guid}", func(w http.ResponseWriter, r *http.Request) {
+		guid := r.PathValue("guid")
+		list := mockPeople[guid]
+		if list == nil {
+			list = []map[string]any{}
+		}
+		writeResult(w, 0, "", map[string]any{"total": len(list), "list": list})
+	})
+	// GET person/{guid}：人物详情
+	mux.HandleFunc("GET /v/api/v1/person/{guid}", func(w http.ResponseWriter, r *http.Request) {
+		guid := r.PathValue("guid")
+		if _, ok := mockPersonWorks[guid]; !ok {
+			writeResult(w, 1, "person not found", nil)
+			return
+		}
+		writeResult(w, 0, "", map[string]any{
+			"guid": guid, "name": "演员甲", "original_name": "Actor A",
+			"profile": "/1c/09/mock_actor.webp", "biography": "演员甲简介", "is_favorite": 0,
+		})
+	})
+	// POST person/item/list：某人物参演作品，**job 必填**——缺省/为空返回空列表，
+	// 与真机一致（真机 nginx 日志：同人物 4 次请求 3 次 48 字节空响应）。
+	mux.HandleFunc("POST /v/api/v1/person/item/list", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			PersonGuid string `json:"person_guid"`
+			Job        string `json:"job"`
+			Page       int    `json:"page"`
+			PageSize   int    `json:"page_size"`
+		}
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &req)
+		if req.Job == "" {
+			writeResult(w, 0, "", map[string]any{"total": 0, "list": []any{}})
+			return
+		}
+		guids := mockPersonWorks[req.PersonGuid][req.Job]
+		list := make([]map[string]any, 0, len(guids))
+		for _, g := range guids {
+			if it, ok := items[g]; ok {
+				list = append(list, it)
+			}
+		}
+		writeResult(w, 0, "", map[string]any{"total": len(list), "list": list})
 	})
 
 	return mux
