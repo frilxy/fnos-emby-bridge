@@ -84,6 +84,20 @@ func main() {
 		return
 	}
 
+	if *cfgPath == "bridge.config.json" {
+		// 没找到：把应用数据目录的内容打出来，方便定位真实路径
+		for _, vol := range []string{"/vol1", "/vol2", "/vol3", "/vol4", "/vol5", "/vol6"} {
+			root := vol + "/@appdata/fnos-emby-bridge"
+			if entries, err := os.ReadDir(root); err == nil {
+				names := make([]string, 0, len(entries))
+				for _, e := range entries {
+					names = append(names, e.Name())
+				}
+				fmt.Fprintf(os.Stderr, "[诊断] %s 下有: %s\n", root, strings.Join(names, ", "))
+			}
+		}
+	}
+	fmt.Fprintf(os.Stderr, "使用配置：%s\n", *cfgPath)
 	client, err := login(ctx, *cfgPath, *base, *user, *pass)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "登录飞牛失败:", err)
@@ -153,29 +167,100 @@ func readEnvFile(path string) map[string]string {
 }
 
 // defaultConfigPath 猜测桥接配置位置（fnOS 应用数据目录）。
+// fnOS 的 TRIM_PKGETC 可能是 @appdata/<app> 下的任意子目录，所以找不到就直接
+// 在应用数据目录里浅递归找 bridge.env / bridge-config.json（工具本身以 root 跑）。
 func defaultConfigPath() string {
 	if p := os.Getenv("CONFIG_PATH"); p != "" {
 		return p
 	}
-	for _, p := range []string{
-		"/vol5/@appdata/fnos-emby-bridge/bridge.env",
-		"/vol1/@appdata/fnos-emby-bridge/bridge.env",
-		"/vol2/@appdata/fnos-emby-bridge/bridge.env",
-		"/vol3/@appdata/fnos-emby-bridge/bridge.env",
-		"/vol4/@appdata/fnos-emby-bridge/bridge.env",
-		"/vol6/@appdata/fnos-emby-bridge/bridge.env",
-		"/vol5/@appdata/fnos-emby-bridge/bridge-config.json",
-		"/vol1/@appdata/fnos-emby-bridge/bridge-config.json",
-		"/vol2/@appdata/fnos-emby-bridge/bridge-config.json",
-		"/vol3/@appdata/fnos-emby-bridge/bridge-config.json",
-		"/vol4/@appdata/fnos-emby-bridge/bridge-config.json",
-		"/vol6/@appdata/fnos-emby-bridge/bridge-config.json",
-	} {
-		if _, err := os.Stat(p); err == nil {
+	if p := configFromProcess(); p != "" {
+		return p
+	}
+	for _, vol := range []string{"/vol1", "/vol2", "/vol3", "/vol4", "/vol5", "/vol6"} {
+		root := vol + "/@appdata/fnos-emby-bridge"
+		if p := findConfigFile(root, 0); p != "" {
 			return p
 		}
 	}
-	return "bridge-config.json"
+	return "bridge.config.json"
+}
+
+var configNames = []string{"bridge.env", "bridge-config.json"}
+
+// configFromProcess 从运行中的桥接进程环境变量里取配置目录：
+//
+//	CONFIG_PATH 直接是配置文件；否则 TRIM_PKGETC 下找 bridge.env / bridge-config.json。
+//
+// 需要 root（读别的用户的 /proc/<pid>/environ）。
+func configFromProcess() string {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		pid := e.Name()
+		if pid == "" || pid[0] < '0' || pid[0] > '9' {
+			continue
+		}
+		cmdline, err := os.ReadFile("/proc/" + pid + "/cmdline")
+		if err != nil || !strings.Contains(string(cmdline), "fnos-emby-bridge/server") {
+			continue
+		}
+		raw, err := os.ReadFile("/proc/" + pid + "/environ")
+		if err != nil {
+			continue
+		}
+		env := map[string]string{}
+		for _, kv := range strings.Split(string(raw), "\x00") {
+			if k, v, ok := strings.Cut(kv, "="); ok {
+				env[k] = v
+			}
+		}
+		if p := env["CONFIG_PATH"]; p != "" {
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+		}
+		if etc := env["TRIM_PKGETC"]; etc != "" {
+			for _, n := range configNames {
+				p := filepath.Join(etc, n)
+				if _, err := os.Stat(p); err == nil {
+					return p
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// findConfigFile 在 root 下最多 3 层内找配置文件；优先 bridge.env，其次 bridge-config.json。
+// 同一层有多个时取修改时间最新的。
+func findConfigFile(root string, depth int) string {
+	if depth > 3 {
+		return ""
+	}
+	if st, err := os.Stat(root); err != nil || !st.IsDir() {
+		return ""
+	}
+	for _, name := range configNames {
+		p := filepath.Join(root, name)
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p
+		}
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if p := findConfigFile(filepath.Join(root, e.Name()), depth+1); p != "" {
+			return p
+		}
+	}
+	return ""
 }
 
 func login(ctx context.Context, cfgPath, base, user, pass string) (*fn.Client, error) {
