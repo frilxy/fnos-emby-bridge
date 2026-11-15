@@ -20,15 +20,21 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	xdraw "golang.org/x/image/draw"
+	_ "golang.org/x/image/webp"
 
 	"fnos-emby-bridge/internal/admin"
 	"fnos-emby-bridge/internal/fn"
@@ -72,6 +78,7 @@ func main() {
 		backupTo = flag.String("backup", "", "备份文件路径（默认 actorart-backup-<时间>.json）")
 		restore  = flag.String("restore", "", "回滚：从备份文件恢复 profile_path")
 		verbose  = flag.Bool("v", false, "打印详细过程")
+		maxDim   = flag.Int("maxdim", 1024, "上传前把图片缩到最长边不超过该像素（0 = 不缩放）")
 	)
 	flag.Parse()
 
@@ -129,7 +136,7 @@ func main() {
 	backup := map[string]backupEntry{}
 	ok, failed := 0, 0
 	for i, c := range cands {
-		if err := applyOne(ctx, client, c, backup); err != nil {
+		if err := applyOne(ctx, client, c, backup, *maxDim); err != nil {
 			failed++
 			fmt.Printf("[%d/%d] ✗ %s: %v\n", i+1, len(cands), c.Name, err)
 			continue
@@ -429,12 +436,12 @@ func mediaDir(ctx context.Context, client *fn.Client, guid string, verbose bool)
 }
 
 // applyOne 上传图片并写回 profile_path；原值记进 backup。
-func applyOne(ctx context.Context, client *fn.Client, c candidate, backup map[string]backupEntry) error {
-	data, err := os.ReadFile(c.ImagePath)
+func applyOne(ctx context.Context, client *fn.Client, c candidate, backup map[string]backupEntry, maxDim int) error {
+	data, name, err := prepareImage(c.ImagePath, maxDim)
 	if err != nil {
 		return fmt.Errorf("读图失败（需要 root？）: %w", err)
 	}
-	hash, err := client.UploadImage(ctx, filepath.Base(c.ImagePath), "poster", data)
+	hash, err := client.UploadImage(ctx, name, "poster", data)
 	if err != nil {
 		return err
 	}
@@ -494,6 +501,46 @@ func runRestore(ctx context.Context, backupPath, cfgPath, base, user, pass strin
 	}
 	fmt.Printf("回滚完成：成功 %d，失败 %d\n", ok, failed)
 	return nil
+}
+
+// prepareImage 读图并在必要时缩到最长边 maxDim（JPEG q88）。
+//
+// 飞牛上传接口对大图直接回 code=-1 Invalid Params（实测 6~8MB 的海报全部失败，
+// ≤3MB 的正常），所以先在本地压到合适尺寸；本来就是小图则原样上传，
+// 解码失败也不阻断（交给服务端判断）。
+func prepareImage(path string, maxDim int) ([]byte, string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", err
+	}
+	if maxDim <= 0 {
+		return raw, filepath.Base(path), nil
+	}
+	img, _, err := image.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return raw, filepath.Base(path), nil
+	}
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if w <= maxDim && h <= maxDim {
+		return raw, filepath.Base(path), nil
+	}
+	scale := float64(maxDim) / float64(max(w, h))
+	nw, nh := int(float64(w)*scale), int(float64(h)*scale)
+	if nw < 1 {
+		nw = 1
+	}
+	if nh < 1 {
+		nh = 1
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, nw, nh))
+	xdraw.CatmullRom.Scale(dst, dst.Bounds(), img, b, xdraw.Src, nil)
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 88}); err != nil {
+		return raw, filepath.Base(path), nil
+	}
+	name := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)) + ".jpg"
+	return buf.Bytes(), name, nil
 }
 
 // ---- 名字与图片匹配 ----
