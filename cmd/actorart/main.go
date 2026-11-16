@@ -20,15 +20,21 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	xdraw "golang.org/x/image/draw"
+	_ "golang.org/x/image/webp"
 
 	"fnos-emby-bridge/internal/admin"
 	"fnos-emby-bridge/internal/fn"
@@ -72,6 +78,7 @@ func main() {
 		backupTo = flag.String("backup", "", "备份文件路径（默认 actorart-backup-<时间>.json）")
 		restore  = flag.String("restore", "", "回滚：从备份文件恢复 profile_path")
 		verbose  = flag.Bool("v", false, "打印详细过程")
+		maxDim   = flag.Int("maxdim", 1024, "上传前把图片缩到最长边不超过该像素（0 = 不缩放）")
 	)
 	flag.Parse()
 
@@ -84,6 +91,20 @@ func main() {
 		return
 	}
 
+	if *cfgPath == "bridge.config.json" {
+		// 没找到：把应用数据目录的内容打出来，方便定位真实路径
+		for _, vol := range []string{"/vol1", "/vol2", "/vol3", "/vol4", "/vol5", "/vol6"} {
+			root := vol + "/@appdata/fnos-emby-bridge"
+			if entries, err := os.ReadDir(root); err == nil {
+				names := make([]string, 0, len(entries))
+				for _, e := range entries {
+					names = append(names, e.Name())
+				}
+				fmt.Fprintf(os.Stderr, "[诊断] %s 下有: %s\n", root, strings.Join(names, ", "))
+			}
+		}
+	}
+	fmt.Fprintf(os.Stderr, "使用配置：%s\n", *cfgPath)
 	client, err := login(ctx, *cfgPath, *base, *user, *pass)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "登录飞牛失败:", err)
@@ -115,7 +136,7 @@ func main() {
 	backup := map[string]backupEntry{}
 	ok, failed := 0, 0
 	for i, c := range cands {
-		if err := applyOne(ctx, client, c, backup); err != nil {
+		if err := applyOne(ctx, client, c, backup, *maxDim); err != nil {
 			failed++
 			fmt.Printf("[%d/%d] ✗ %s: %v\n", i+1, len(cands), c.Name, err)
 			continue
@@ -129,42 +150,158 @@ func main() {
 	fmt.Printf("\n完成：成功 %d，失败 %d。备份：%s\n", ok, failed, *backupTo)
 }
 
+// readEnvFile 读 KEY=VALUE 形式的 env 文件（bridge.env），忽略注释与空行，
+// 去掉值两侧的单/双引号。文件不存在时返回空 map。
+func readEnvFile(path string) map[string]string {
+	out := map[string]string{}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return out
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		v = strings.TrimSpace(strings.Trim(v, `"'`))
+		out[strings.TrimSpace(k)] = v
+	}
+	return out
+}
+
 // defaultConfigPath 猜测桥接配置位置（fnOS 应用数据目录）。
+// fnOS 的 TRIM_PKGETC 可能是 @appdata/<app> 下的任意子目录，所以找不到就直接
+// 在应用数据目录里浅递归找 bridge.env / bridge-config.json（工具本身以 root 跑）。
 func defaultConfigPath() string {
 	if p := os.Getenv("CONFIG_PATH"); p != "" {
 		return p
 	}
-	for _, p := range []string{
-		"/vol5/@appdata/fnos-emby-bridge/bridge-config.json",
-		"/vol1/@appdata/fnos-emby-bridge/bridge-config.json",
-		"/vol2/@appdata/fnos-emby-bridge/bridge-config.json",
-		"/vol3/@appdata/fnos-emby-bridge/bridge-config.json",
-		"/vol4/@appdata/fnos-emby-bridge/bridge-config.json",
-		"/vol6/@appdata/fnos-emby-bridge/bridge-config.json",
-	} {
-		if _, err := os.Stat(p); err == nil {
+	if p := configFromProcess(); p != "" {
+		return p
+	}
+	for _, vol := range []string{"/vol1", "/vol2", "/vol3", "/vol4", "/vol5", "/vol6"} {
+		// 不同 fnOS 版本把应用配置放在 @appconf 或 @appdata 下，两个都找
+		for _, base := range []string{"/@appconf/fnos-emby-bridge", "/@appdata/fnos-emby-bridge"} {
+			if p := findConfigFile(vol+base, 0); p != "" {
+				return p
+			}
+		}
+	}
+	return "bridge.config.json"
+}
+
+var configNames = []string{"bridge.env", "bridge-config.json"}
+
+// configFromProcess 从运行中的桥接进程环境变量里取配置目录：
+//
+//	CONFIG_PATH 直接是配置文件；否则 TRIM_PKGETC 下找 bridge.env / bridge-config.json。
+//
+// 需要 root（读别的用户的 /proc/<pid>/environ）。
+func configFromProcess() string {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		pid := e.Name()
+		if pid == "" || pid[0] < '0' || pid[0] > '9' {
+			continue
+		}
+		cmdline, err := os.ReadFile("/proc/" + pid + "/cmdline")
+		if err != nil || !strings.Contains(string(cmdline), "fnos-emby-bridge/server") {
+			continue
+		}
+		raw, err := os.ReadFile("/proc/" + pid + "/environ")
+		if err != nil {
+			continue
+		}
+		env := map[string]string{}
+		for _, kv := range strings.Split(string(raw), "\x00") {
+			if k, v, ok := strings.Cut(kv, "="); ok {
+				env[k] = v
+			}
+		}
+		if p := env["CONFIG_PATH"]; p != "" {
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+		}
+		if etc := env["TRIM_PKGETC"]; etc != "" {
+			for _, n := range configNames {
+				p := filepath.Join(etc, n)
+				if _, err := os.Stat(p); err == nil {
+					return p
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// findConfigFile 在 root 下最多 3 层内找配置文件；优先 bridge.env，其次 bridge-config.json。
+// 同一层有多个时取修改时间最新的。
+func findConfigFile(root string, depth int) string {
+	if depth > 3 {
+		return ""
+	}
+	if st, err := os.Stat(root); err != nil || !st.IsDir() {
+		return ""
+	}
+	for _, name := range configNames {
+		p := filepath.Join(root, name)
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
 			return p
 		}
 	}
-	return "bridge-config.json"
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if p := findConfigFile(filepath.Join(root, e.Name()), depth+1); p != "" {
+			return p
+		}
+	}
+	return ""
 }
 
 func login(ctx context.Context, cfgPath, base, user, pass string) (*fn.Client, error) {
 	if base == "" || user == "" || pass == "" {
-		st := admin.LoadStore(cfgPath)
-		cc := st.Connection()
-		if cc == nil {
-			return nil, fmt.Errorf("配置文件 %s 里没有连接信息，用 -base/-user/-pass 指定", cfgPath)
-		}
+		// 桥接的凭据有两处可能：bridge.env（向导写入，键 FNOS_*）
+		// 或 bridge-config.json（后台页面改过的连接）。两个都试。
+		env := readEnvFile(cfgPath)
 		if base == "" {
-			base = cc.Base
+			base = env["FNOS_BASE"]
 		}
 		if user == "" {
-			user = cc.User
+			user = env["FNOS_USER"]
 		}
 		if pass == "" {
-			pass = cc.Pass
+			pass = env["FNOS_PASS"]
 		}
+	}
+	if base == "" || user == "" || pass == "" {
+		if cc := admin.LoadStore(cfgPath).Connection(); cc != nil {
+			if base == "" {
+				base = cc.Base
+			}
+			if user == "" {
+				user = cc.User
+			}
+			if pass == "" {
+				pass = cc.Pass
+			}
+		}
+	}
+	if base == "" || user == "" || pass == "" {
+		return nil, fmt.Errorf("在 %s 里没找到连接信息：bridge.env 需含 FNOS_BASE/FNOS_USER/FNOS_PASS，或 bridge-config.json 需含 connection；也可用 -base/-user/-pass 直接指定", cfgPath)
 	}
 	c := fn.NewClient(base)
 	if err := c.Login(ctx, user, fn.SHA256Hex(pass)); err != nil {
@@ -299,12 +436,12 @@ func mediaDir(ctx context.Context, client *fn.Client, guid string, verbose bool)
 }
 
 // applyOne 上传图片并写回 profile_path；原值记进 backup。
-func applyOne(ctx context.Context, client *fn.Client, c candidate, backup map[string]backupEntry) error {
-	data, err := os.ReadFile(c.ImagePath)
+func applyOne(ctx context.Context, client *fn.Client, c candidate, backup map[string]backupEntry, maxDim int) error {
+	data, name, err := prepareImage(c.ImagePath, maxDim)
 	if err != nil {
 		return fmt.Errorf("读图失败（需要 root？）: %w", err)
 	}
-	hash, err := client.UploadImage(ctx, filepath.Base(c.ImagePath), data)
+	hash, err := client.UploadImage(ctx, name, "poster", data)
 	if err != nil {
 		return err
 	}
@@ -364,6 +501,46 @@ func runRestore(ctx context.Context, backupPath, cfgPath, base, user, pass strin
 	}
 	fmt.Printf("回滚完成：成功 %d，失败 %d\n", ok, failed)
 	return nil
+}
+
+// prepareImage 读图并在必要时缩到最长边 maxDim（JPEG q88）。
+//
+// 飞牛上传接口对大图直接回 code=-1 Invalid Params（实测 6~8MB 的海报全部失败，
+// ≤3MB 的正常），所以先在本地压到合适尺寸；本来就是小图则原样上传，
+// 解码失败也不阻断（交给服务端判断）。
+func prepareImage(path string, maxDim int) ([]byte, string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", err
+	}
+	if maxDim <= 0 {
+		return raw, filepath.Base(path), nil
+	}
+	img, _, err := image.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return raw, filepath.Base(path), nil
+	}
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if w <= maxDim && h <= maxDim {
+		return raw, filepath.Base(path), nil
+	}
+	scale := float64(maxDim) / float64(max(w, h))
+	nw, nh := int(float64(w)*scale), int(float64(h)*scale)
+	if nw < 1 {
+		nw = 1
+	}
+	if nh < 1 {
+		nh = 1
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, nw, nh))
+	xdraw.CatmullRom.Scale(dst, dst.Bounds(), img, b, xdraw.Src, nil)
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 88}); err != nil {
+		return raw, filepath.Base(path), nil
+	}
+	name := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)) + ".jpg"
+	return buf.Bytes(), name, nil
 }
 
 // ---- 名字与图片匹配 ----

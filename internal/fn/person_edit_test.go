@@ -16,7 +16,7 @@ func TestPersonEditAndUpload(t *testing.T) {
 	}
 
 	// 1. 上传图片拿 hash_path
-	hash, err := c.UploadImage(t.Context(), "演员乙.jpg", []byte("fake-jpeg-bytes"))
+	hash, err := c.UploadImage(t.Context(), "演员乙.jpg", "poster", []byte("fake-jpeg-bytes"))
 	if err != nil {
 		t.Fatalf("上传: %v", err)
 	}

@@ -32,29 +32,61 @@ const (
 	// 只做轻微居中裁剪，避免黑边和之前的极端放大。
 	collageWidth         = 1200
 	collageHeight        = 720
-	collageLayoutVersion = "v4"
-	collageTTL           = 30 * time.Minute
+	collageLayoutVersion = "v5"
+	// collageTTL 只是内存里缓存的兜底有效期：真正的「要不要重生」由内容签名决定，
+	// 内容不变就一直复用同一张封面。
+	collageTTL = 6 * time.Hour
+	// collageSigTTL 内容签名（条目数 + 最新入库时间）的缓存时长。
+	collageSigTTL = 5 * time.Minute
 )
 
-func collageBucket() int64 { return time.Now().Unix() / int64(collageTTL/time.Second) }
+// collageSig 库内容签名：条目总数 + 最新入库时间。
+//
+// 以前用的是「30 分钟时间桶」——没新片也会每半小时重做一次封面，客户端每半小时
+// 重下一次图。改成内容签名后，只有库里的条目增减才会换图。
+// 签名本身缓存 5 分钟，避免每次 /UserViews 都去列一遍库。
+func (h *Handler) collageSig(ctx context.Context, client *fn.Client, libID string) string {
+	key := "collagesig:" + client.Token + ":" + libID
+	v, err := h.cache.Do(key, collageSigTTL, func() (any, error) {
+		list, total, err := client.ItemListPage(ctx, "ancestor_guid", libID, 1, 1)
+		if err != nil {
+			return "", err
+		}
+		var latest int64
+		for _, it := range list {
+			if t := it.CreatedAt(); t > latest {
+				latest = t
+			}
+		}
+		return fmt.Sprintf("%d-%d", total, latest), nil
+	})
+	if err != nil {
+		return collageLayoutVersion
+	}
+	if s, _ := v.(string); s != "" {
+		return s
+	}
+	return collageLayoutVersion
+}
 
-// collageTag 给 MediaDB 的 PrimaryImageTag：同一个 30 分钟桶内稳定，过期后变化。
-func collageTag(guid string) string {
+// collageTag 给 MediaDB 的 PrimaryImageTag：由「库 guid + 内容签名 + 布局版本」决定，
+// 库内容不变就恒定，客户端不会重复下载。
+func collageTag(guid, sig string) string {
 	h := fnv.New64a()
-	_, _ = fmt.Fprintf(h, "%s|%d|%s", guid, collageBucket(), collageLayoutVersion)
+	_, _ = fmt.Fprintf(h, "%s|%s|%s", guid, sig, collageLayoutVersion)
 	return fmt.Sprintf("c%x", h.Sum64())
 }
 
 // libraryCollage 生成/缓存库封面。
 func (h *Handler) libraryCollage(ctx context.Context, client *fn.Client, libID string) ([]byte, error) {
-	bucket := collageBucket()
-	key := fmt.Sprintf("collage:%s:%s:%d", client.Token, libID, bucket)
+	sig := h.collageSig(ctx, client, libID)
+	key := fmt.Sprintf("collage:%s:%s:%s", client.Token, libID, sig)
 	v, err := h.cache.Do(key, collageTTL, func() (any, error) {
 		list, err := h.typedItems(ctx, client, libID, []string{"Movie", "TV", "Video", "Directory"}, 0)
 		if err != nil {
 			return nil, err
 		}
-		picks := pickCollageItems(list, libID, bucket)
+		picks := pickCollageItems(list, libID, seedFromSig(sig))
 		if len(picks) == 0 {
 			return nil, fmt.Errorf("库 %s 没有可用的海报", libID)
 		}
@@ -94,12 +126,19 @@ type collagePick struct {
 	path string
 }
 
-// pickCollageItems 用库 guid + 时间桶做种子，稳定随机挑最多 3 张**互不相同**的海报。
+// seedFromSig 把内容签名折成一个稳定的随机种子（内容变了才换海报组合）。
+func seedFromSig(sig string) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(sig))
+	return int64(h.Sum64())
+}
+
+// pickCollageItems 用库 guid + 内容签名做种子，稳定随机挑最多 3 张**互不相同**的海报。
 //
 // 只按条目去重不够：同一次刮削经常让多个条目（剧集与它的季、同一部的多个版本、
 // 目录容器与里面的视频）共用同一个 poster 路径，按条目挑 3 个会拼出 3 张一模一样的图。
 // 这里按「实际取图路径」去重，保证三栏是三张不同的海报。
-func pickCollageItems(list []fn.MediaItem, libID string, bucket int64) []collagePick {
+func pickCollageItems(list []fn.MediaItem, libID string, seed int64) []collagePick {
 	seenPath := make(map[string]struct{}, len(list))
 	seenItem := make(map[string]struct{}, len(list))
 	candidates := make([]collagePick, 0, len(list))
@@ -125,7 +164,7 @@ func pickCollageItems(list []fn.MediaItem, libID string, bucket int64) []collage
 		return nil
 	}
 	h := fnv.New64a()
-	_, _ = fmt.Fprintf(h, "%s|%d", libID, bucket)
+	_, _ = fmt.Fprintf(h, "%s|%d", libID, seed)
 	rnd := rand.New(rand.NewSource(int64(h.Sum64())))
 	rnd.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
 	if len(candidates) > 3 {

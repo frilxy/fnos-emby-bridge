@@ -26,7 +26,7 @@
 | 官方分级 / OfficialRating | ✅ 来自 `content_ratings` |
 | 年份 / 国家 / 工作室 | 年份按飞牛习惯合并为**年代**（`2000s`，同时兼容单年筛选）；国家支持；工作室飞牛无数据 |
 | 人物 / Persons | ✅ 演员/导演等；点开演员可看作品列表（含 Other/AV 库的 `Video` 条目，归入「电影」分区） |
-| 媒体库封面 | ✅ 默认用库内 3 张海报拼接（30 分钟轮换） |
+| 媒体库封面 | ✅ 用库内 3 张不同海报拼接，**库内容变化时**才重新生成 |
 
 ## 版本号约定
 
@@ -156,10 +156,10 @@ GitHub Actions：
 
 ```bash
 # 1) 只列清单（dry-run）
-sudo ./actorart -config /vol5/@appdata/fnos-emby-bridge/bridge-config.json
+sudo ./actorart                       # 自动找配置（@appconf / @appdata、bridge.env / bridge-config.json）
 
 # 2) 确认后写入（自动生成备份 json）
-sudo ./actorart -config /vol5/@appdata/fnos-emby-bridge/bridge-config.json -apply
+sudo ./actorart -apply
 
 # 3) 需要时回滚
 sudo ./actorart -restore actorart-backup-<时间>.json

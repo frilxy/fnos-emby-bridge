@@ -1,5 +1,5 @@
 appname               = fnos-emby-bridge
-version               = 1.1.31
+version               = 1.1.32
 display_name          = 飞牛影视 Emby 桥接
 desc                  = 把飞牛影视（fnOS）媒体库以 Emby 协议暴露出来，供 Infuse、VidHub、Yamby、小幻影视、爆米花等第三方客户端直接连接与播放。社区维护版，已修复一批客户端兼容问题。不做转码，播放取决于客户端解码能力。
 platform              = x86
@@ -11,4 +11,4 @@ desktop_uidir         = ui
 desktop_applaunchname = fnos-emby-bridge.Application
 service_port          = 8096
 ctl_stop              = true
-changelog             = 1.1.31：修复点开演员看不到其他作品（Other/AV 库的 Video 条目被 IncludeItemTypes=Movie 过滤干净，现在电影分区放行）；新增人物详情 /Persons/{id} 与人物头像端点；人物作品查询改为单次 job 取全，空结果才回退逐个查；修复库封面拼出三张相同海报（按取图路径去重，不足 3 张不再复制）。
+changelog             = 1.1.32：库封面改为按内容签名更换（条目数 + 最新入库时间），没新片不再每 30 分钟重做，客户端也不会周期性重复下载封面。
