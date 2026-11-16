@@ -6,6 +6,7 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"strings"
 	"testing"
 
 	"fnos-emby-bridge/internal/fn"
@@ -126,5 +127,24 @@ func TestComposeCollageNoRepeat(t *testing.T) {
 	}
 	if !near(img3.At(1000, 360), blue, 12) {
 		t.Errorf("第三栏应为蓝色，实际 %v", img3.At(1000, 360))
+	}
+}
+
+// TestCollageTagByContent 封面 tag 由「库 guid + 内容签名」决定：
+// 内容不变则恒定（客户端不会重复下载），内容变化才换 tag。
+func TestCollageTagByContent(t *testing.T) {
+	a1 := collageTag("lib_001", "6-1700000000")
+	a2 := collageTag("lib_001", "6-1700000000")
+	if a1 != a2 {
+		t.Fatalf("同一内容签名下 tag 应稳定：%q vs %q", a1, a2)
+	}
+	if !strings.HasPrefix(a1, "c") {
+		t.Fatalf("封面 tag 应以 c 开头，实际 %q", a1)
+	}
+	if b := collageTag("lib_001", "7-1700000000"); b == a1 {
+		t.Fatalf("条目数变化后 tag 应不同，实际都为 %q", b)
+	}
+	if c := collageTag("lib_001", "6-1700000001"); c == a1 {
+		t.Fatalf("最新入库时间变化后 tag 应不同，实际都为 %q", c)
 	}
 }

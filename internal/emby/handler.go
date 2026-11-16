@@ -2628,7 +2628,7 @@ func (h *Handler) handleSearchHints(w http.ResponseWriter, r *http.Request) {
 		if primary != "" {
 			hint["PrimaryImageTag"] = imageTagFor(primary)
 		}
-		if tags := imageTags(m); len(tags) > 0 {
+		if tags := h.imageTags(r.Context(), m); len(tags) > 0 {
 			hint["ImageTags"] = tags
 		}
 		if backdrops := backdropImageTags(m); len(backdrops) > 0 {
@@ -3265,7 +3265,7 @@ func (h *Handler) handleViews(w http.ResponseWriter, r *http.Request) {
 			"IsFolder":                true,
 			"CanDelete":               false,
 			"ServerId":                h.ServerID,
-			"ImageTags":               map[string]any{"Primary": collageTag(db.Guid)},
+			"ImageTags":               map[string]any{"Primary": collageTag(db.Guid, h.collageSig(r.Context(), h.fnOf(r.Context()), db.Guid))},
 			"PrimaryImageAspectRatio": 1200.0 / 720.0,
 		}
 		if cat := collectionType(db.Category); cat != "" {
@@ -4679,7 +4679,7 @@ func (h *Handler) handleItemImages(w http.ResponseWriter, r *http.Request) {
 	out := []map[string]any{}
 	it, err := h.itemDetailAnywhere(r.Context(), h.imageClient(r), id)
 	if err == nil && it != nil {
-		tags := imageTags(*it)
+		tags := h.imageTags(r.Context(), *it)
 		for _, t := range []string{"Primary", "Logo", "Thumb", "Backdrop", "Banner", "Art"} {
 			if _, ok := tags[t]; ok {
 				out = append(out, map[string]any{"ImageType": t, "ImageIndex": 0})
@@ -5129,7 +5129,7 @@ func imageTagFor(p string) string {
 // （此前只填 Primary，Logo/Thumb 请求根本不会发出——Yamby "logo 没有了" 的根因）。
 // Primary=海报；Logo 用飞牛 logos 资源；Thumb/Backdrop/Art/Banner 用 backdrops
 // （集 poster 本身即 1920×1080 横版剧照，回退海报裁剪显示）。
-func imageTags(m fn.MediaItem) map[string]any {
+func (h *Handler) imageTags(ctx context.Context, m fn.MediaItem) map[string]any {
 	tags := map[string]any{}
 	// Primary 必须始终声明：TV 剧条目经常只有 backdrop、没有 poster，若这里不声明，
 	// 客户端根本不会请求封面（表现为电视库全空白，而电影有 poster 正常）。
@@ -5141,9 +5141,10 @@ func imageTags(m fn.MediaItem) map[string]any {
 		primary = "primary" // 交给 handleItemImage 再做季/parent 兜底
 	}
 	tags["Primary"] = imageTagFor(primary)
-	// 媒体库（MediaDB）使用桥接生成的 3 张海报拼接封面；tag 跟时间桶变化。
+	// 媒体库（MediaDB）使用桥接生成的 3 张海报拼接封面；
+	// tag 由「库内容签名」决定，内容不变就恒定，客户端不会重复下载。
 	if m.Type == "MediaDB" {
-		tags["Primary"] = collageTag(m.Guid)
+		tags["Primary"] = collageTag(m.Guid, h.collageSig(ctx, h.fnOf(ctx), m.Guid))
 	}
 	if p := m.LogoPath(); p != "" {
 		tags["Logo"] = imageTagFor(p)
@@ -5368,7 +5369,7 @@ func toEmbyItemWithSeries(r *http.Request, m fn.MediaItem, seriesID string, h *H
 		"PremiereDate":            nullableDate(premiere),
 		"DateCreated":             nullableDate(dateCreated),
 		"ProductionYear":          yearOf(m.AirDate, m.ReleaseDate, m.FirstAirDate),
-		"ImageTags":               imageTags(m),
+		"ImageTags":               h.imageTags(r.Context(), m),
 		"BackdropImageTags":       backdropImageTags(m),
 	}
 	// 通用空集合字段：Flutter 客户端对列表字段常用 ! 强解包，缺失即
