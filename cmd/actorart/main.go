@@ -79,6 +79,7 @@ func main() {
 		restore  = flag.String("restore", "", "回滚：从备份文件恢复 profile_path")
 		verbose  = flag.Bool("v", false, "打印详细过程")
 		maxDim   = flag.Int("maxdim", 1024, "上传前把图片缩到最长边不超过该像素（0 = 不缩放）")
+		why      = flag.String("why", "", "诊断：按名字片段查某个演员为什么没被补上头像")
 	)
 	flag.Parse()
 
@@ -109,6 +110,14 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "登录飞牛失败:", err)
 		os.Exit(1)
+	}
+
+	if *why != "" {
+		if err := runWhy(ctx, client, *why, *maxDim, *verbose); err != nil {
+			fmt.Fprintln(os.Stderr, "诊断失败:", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	cands, err := collect(ctx, client, *only, *limit, *verbose)
@@ -308,6 +317,89 @@ func login(ctx context.Context, cfgPath, base, user, pass string) (*fn.Client, e
 		return nil, err
 	}
 	return c, nil
+}
+
+// runWhy 按名字片段诊断某个演员为什么没被补上头像：
+// 打印 person guid、当前 profile、所在作品目录、目录里的 .actors 文件名、是否匹配成功。
+func runWhy(ctx context.Context, client *fn.Client, query string, maxDim int, verbose bool) error {
+	q := normActorName(query)
+	if q == "" {
+		return fmt.Errorf("名字不能为空")
+	}
+	libs, err := client.MediaDBList(ctx)
+	if err != nil {
+		return err
+	}
+	found := 0
+	for _, lib := range libs {
+		items, err := client.ItemList(ctx, lib.Guid)
+		if err != nil {
+			continue
+		}
+		for _, it := range items {
+			persons, err := client.PersonList(ctx, it.Guid)
+			if err != nil || len(persons) == 0 {
+				if it.Type == "TV" {
+					persons = peopleOfSeasons(ctx, client, it, verbose)
+				}
+			}
+			for _, p := range persons {
+				hit := strings.Contains(normActorName(p.Name), q) || strings.Contains(normActorName(p.OriginalName), q)
+				if !hit {
+					continue
+				}
+				found++
+				pd, _ := client.PersonDetail(ctx, p.PersonGuid)
+				profile := ""
+				if pd != nil {
+					profile = pd.Profile
+				}
+				dir := mediaDir(ctx, client, it.Guid, verbose)
+				names := actorNames(p.Name, p.OriginalName)
+				img := matchActorArt(dir, names)
+				if img == "" && dir != "" {
+					img = matchActorArt(filepath.Dir(dir), names)
+				}
+				fmt.Printf("演员：%s（原名 %q）\n", p.Name, p.OriginalName)
+				fmt.Printf("  person guid : %s\n", p.PersonGuid)
+				if profile == "" {
+					fmt.Printf("  飞牛 profile: （空，可补）\n")
+				} else {
+					fmt.Printf("  飞牛 profile: %s  ← 已有头像，工具默认跳过\n", profile)
+				}
+				fmt.Printf("  所在作品    : %s（%s）\n", it.Title, it.Type)
+				fmt.Printf("  作品目录    : %s\n", dir)
+				if dir != "" {
+					for _, d := range actorArtDirs {
+						base := filepath.Join(dir, d)
+						if entries, err := os.ReadDir(base); err == nil {
+							fs := make([]string, 0, len(entries))
+							for _, e := range entries {
+								fs = append(fs, e.Name())
+							}
+							fmt.Printf("  %-8s  : %v\n", d, fs)
+						} else {
+							fmt.Printf("  %-8s  : （%v）\n", d, err)
+						}
+					}
+				}
+				if img == "" {
+					fmt.Printf("  匹配结果    : 未找到同名图片（要找的名字键：%v）\n\n", names)
+				} else {
+					st, _ := os.Stat(img)
+					size := int64(0)
+					if st != nil {
+						size = st.Size()
+					}
+					fmt.Printf("  匹配结果    : %s（%d B）\n\n", img, size)
+				}
+			}
+		}
+	}
+	if found == 0 {
+		fmt.Printf("没找到名字包含 %q 的演员（可能在未遍历到的库/作品里，或名字写法不同）\n", query)
+	}
+	return nil
 }
 
 // collect 遍历媒体库 → 作品 → 人物，找出「没有头像、但目录里有本地图」的演员。
