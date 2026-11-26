@@ -113,8 +113,20 @@
 ## 构建与发布
 
 ```bash
-./build.sh      # vet + test + 编译 + 打 fpk，产物在 dist/
+./build.sh      # vet + test + 编译桥接 + 编译 actorart + 打 fpk，产物都在 dist/
 ```
+
+一次产出三样东西，全部落在 `dist/`：
+
+| 文件 | 用途 |
+|---|---|
+| `fnos-emby-bridge-<版本>.fpk` | 装到 fnOS 的应用包 |
+| `actorart` | 演员图灌注工具（需 root 运行，见下） |
+| `fnos-emby-bridge-patched` | 裸二进制，排障用 |
+
+本地工具链和构建缓存统一收在仓库内的 `.local/`（已 gitignore）：`.local/go` 是 Go 工具链，
+`.local/gocache`、`.local/gopath` 是编译/模块缓存。`build.sh` 会自动优先使用 `.local/go`，
+所以整个仓库拷走即可离线构建，不会往工作区根目录或系统分区散落文件。
 
 打包**不依赖飞牛官方 fnpack**：`fpk/pack.sh` 优先用它，没装则用标准 `tar` 复刻同样的结构
 （fpk 本质就是一个 ustar tar.gz），因此 CI 无需额外下载任何打包工具。

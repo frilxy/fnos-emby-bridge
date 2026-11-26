@@ -14,7 +14,7 @@ DIST="${ROOT}/dist"
 BIN_OUT="${DIST}/${APPNAME}-patched"
 
 # 仓库内 / 与仓库同级的 toolchain/ 里有 Go 就优先使用（CI 走 setup-go，不影响）
-for candidate in "${ROOT}/toolchain/go" "$(cd "${ROOT}/.." && pwd)/toolchain/go"; do
+for candidate in "${ROOT}/.local/go" "${ROOT}/toolchain/go" "$(cd "${ROOT}/.." && pwd)/toolchain/go"; do
     if [ -x "${candidate}/bin/go" ]; then
         export GOROOT="${candidate}"
         export PATH="${GOROOT}/bin:${PATH}"
@@ -26,13 +26,14 @@ export GOFLAGS="${GOFLAGS:--mod=mod}"
 # 受限环境（如 NAS 上 HOME 不可写）时，把构建缓存与模块缓存退到仓库同级目录；
 # CI 里 HOME 可写，不会触发这段。
 writable() { mkdir -p "$1" 2>/dev/null && [ -w "$1" ]; }
-SIDE="$(cd "${ROOT}/.." && pwd)"
+# 缓存默认放仓库内（gocache/、gopath/ 已在 .gitignore），保证所有构建产物
+# 和工具链都集中在这一个目录里，不散落到 ../ 或系统分区。
 if [ -z "${GOCACHE:-}" ] && ! writable "${HOME:-/tmp}/.cache/go-build"; then
-    export GOCACHE="${SIDE}/gocache"
+    export GOCACHE="${ROOT}/.local/gocache"
     writable "${GOCACHE}"
 fi
 if [ -z "${GOPATH:-}" ] && ! writable "${HOME:-/tmp}/go"; then
-    export GOPATH="${SIDE}/gopath"
+    export GOPATH="${ROOT}/.local/gopath"
     writable "${GOPATH}"
 fi
 
@@ -60,6 +61,11 @@ echo "==> 放入打包工程"
 mkdir -p "${FPK_DIR}/app/server"
 cp -f "${BIN_OUT}" "${FPK_DIR}/app/server/${APPNAME}"
 chmod 755 "${FPK_DIR}/app/server/${APPNAME}"
+
+echo "==> 编译 actorart 工具"
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -ldflags="-s -w" -o "${DIST}/actorart" "./cmd/actorart"
+echo "    产物：${DIST}/actorart（$(stat -c%s "${DIST}/actorart") 字节）"
 
 echo "==> 生成 fpk"
 # 只产出带版本号的那一个：文件本身就表明版本，Release 里也只放这一个

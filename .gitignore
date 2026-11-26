@@ -3,7 +3,8 @@ dist/
 fpk/*.fpk
 fpk/fnos-emby-bridge/app/server/fnos-emby-bridge
 
-# 本地工具链 / 构建缓存（若放在仓库内）
+# 本地工具链 / 构建缓存（仓库内，统一收在 .local/）
+.local/
 gocache/
 gopath/
 toolchain/
