@@ -5,8 +5,8 @@
 # 都用它派生出来的文件；换图标时替换源图后重跑本脚本即可（生成的 PNG 已入库，
 # CI 不需要 ffmpeg）。
 #
-# 源图由 fpk/图标.jpg 经 tools/iconalpha 抠白生成（保留图形内部的白色）：
-#   go run ./tools/iconalpha -in fpk/图标.jpg -out fpk/图标.png
+# 源图由 fpk/图标.jpg 经 tools/iconalpha 抠白生成（背景与桥形均透明）：
+#   go run ./tools/iconalpha -in fpk/图标.jpg -out fpk/图标.png -all
 #
 # 依赖：ffmpeg（生成）——只有需要重新生成时才要装。
 set -euo pipefail
