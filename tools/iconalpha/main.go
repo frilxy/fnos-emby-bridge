@@ -28,6 +28,7 @@ func main() {
 	bg := flag.String("bg", "", "可选：把结果合成到某个底色上预览，如 #202020")
 	defringe := flag.Int("defringe", 2, "去白边轮数：把紧贴透明区、仍偏白的像素也去掉，消除 JPEG 白晕")
 	smooth := flag.Bool("smooth", false, "对 alpha 做 3x3 平滑（默认关，硬边更干净）")
+	allWhite := flag.Bool("all", false, "把所有接近白色的像素都变透明（连图形内部的白色一起抠，做镂空）")
 	flag.Parse()
 	if *in == "" || *out == "" {
 		fmt.Fprintln(os.Stderr, "需要 -in 和 -out")
@@ -77,19 +78,30 @@ func main() {
 		push(x, y+1)
 	}
 
-	// 2. 外部白底 → alpha 0；其余保持不透明
+	// 2. 外部白底 → alpha 0；-all 时连内部白色一起抠（做成镂空）
 	alpha := make([]uint8, w*h)
 	for i := range alpha {
-		if outer[i] {
-			alpha[i] = 0
-		} else {
-			alpha[i] = 255
+		alpha[i] = 255
+	}
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			i := y*w + x
+			if outer[i] {
+				alpha[i] = 0
+				continue
+			}
+			if *allWhite {
+				r, g, b, _ := rgba.At(x, y).RGBA()
+				if r>>8 >= uint32(*thr) && g>>8 >= uint32(*thr) && b>>8 >= uint32(*thr) {
+					alpha[i] = 0
+				}
+			}
 		}
 	}
 
 	// 3. 去白边：贴着透明区、且明显偏白的像素也一齐去掉。
 	// JPEG 会把白底和图形边缘混成浅灰，不去掉就会在深色背景上留一圈白晕。
-	for pass := 0; pass < *defringe; pass++ {
+	for pass := 0; pass < *defringe && !*allWhite; pass++ {
 		var next []int
 		for y := 0; y < h; y++ {
 			for x := 0; x < w; x++ {
