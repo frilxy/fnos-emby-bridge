@@ -154,7 +154,7 @@ GitHub Actions：
 | `internal/admin/` | 后台界面（图标内嵌，无外部静态资源依赖） |
 | `fpk/` | 飞牛应用包工程：`manifest`、生命周期脚本、wizard、图标源 |
 | `fpk/fnos-emby-bridge/cmd/` | 生命周期脚本：配置在 `TRIM_PKGETC`，运行数据在 `TRIM_PKGVAR` |
-| `fpk/图标.jpg` | **唯一图标源**；`fpk/make-icons.sh` 由它派生各尺寸 PNG |
+| `fpk/图标.png` | **唯一图标源**（已抠白底、带 alpha）；`fpk/make-icons.sh` 由它派生各尺寸 PNG，`fpk/图标.jpg` 是原始素材 |
 | `docs/` | 由图标源派生的图片，供本说明使用 |
 | `fixes.patch` | 相对上游的全部源码与 CI 改动，可 `patch -p1` 应用（不含二进制资源） |
 
